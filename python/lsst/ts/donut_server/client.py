@@ -389,7 +389,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--collections",
-        default=None,
+        default="LSSTCam/defaults",
         help="comma-separated collections to search for raw; required with --butler",
     )
     parser.add_argument("--instrument", default="LSSTCam", help="instrument, with --butler")
