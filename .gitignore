@@ -1,0 +1,24 @@
+# Large data trees, deliberately untracked. Anchored with a leading slash so a
+# future python/lsst/ts/donut_server/raw/ is not caught by the same rule.
+/calib/
+/raw/
+/ref_cat/
+
+# Dumped eups environment: 113 lines of machine-absolute paths, and the obvious
+# place someone later parks DONUT_SERVER_TOKEN. A fresh clone has none; see README.
+/.env
+
+# Runtime log: appended to by a running coordinator, never rotated.
+/donut_server.log
+
+# Build products (sconsUtils writes bin/ from bin.src/)
+/bin/
+.sconsign.dblite
+tests/.tests/
+version.py
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.claude/settings.local.json
+.DS_Store

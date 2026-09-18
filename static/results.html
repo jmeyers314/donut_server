@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<!--
+  Wavefront results viewer. Opened in a second tab from the dashboard's job table,
+  as /results/<job_id>; the job id is read out of this page's own URL.
+
+  Same rules as dashboard.html, for the same reasons: the token comes from
+  localStorage (shared origin, so pasting it once on the dashboard is enough), and
+  every dynamic string goes in via textContent because the log-panel lesson applies
+  here too -- these strings are pipeline output.
+
+  Two server-side conversions this page depends on, both handled in table_view.py:
+  NaN arrives as null (every row of a real result has some), and int64 columns too
+  wide for a double arrive as strings (donut_id is ~6.76e18, so JS would round it).
+  A null in a float column therefore means "not a number", not "missing" -- shown
+  as "nan" rather than as an empty cell.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>results</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b; --ink: #d8dde5;
+    --dim: #8b93a1; --ok: #4ba36b; --warn: #c99a3d; --bad: #c2564f;
+    --live: #4a86c7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 var(--mono); }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 6;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  .dim { color: var(--dim); }
+  .spacer { flex: 1 1 auto; }
+  button, select, input[type=search] {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 3px; padding: 4px 9px; font: inherit; cursor: pointer;
+  }
+  input[type=search] { cursor: text; width: 20ch; }
+  button:hover, select:hover { border-color: var(--dim); }
+  button.on { border-color: var(--live); color: var(--live); }
+  .banner { padding: 8px 14px; background: #3a2320; color: #f0c9c4; display: none; }
+  .banner.on { display: block; }
+  .bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 14px; border-bottom: 1px solid var(--line);
+  }
+  .meta { padding: 8px 14px; color: var(--dim); border-bottom: 1px solid var(--line); }
+  .meta b { color: var(--ink); font-weight: 600; }
+  .wrap { overflow: auto; max-height: calc(100vh - 190px); }
+  table { border-collapse: collapse; }
+  th, td { padding: 3px 8px; white-space: nowrap; border-bottom: 1px solid #232730; }
+  thead th {
+    position: sticky; top: 0; background: var(--panel); color: var(--dim);
+    text-align: left; font-weight: 600; cursor: pointer; z-index: 2;
+    border-bottom: 1px solid var(--line);
+  }
+  thead th:hover { color: var(--ink); }
+  thead th.sorted { color: var(--live); }
+  tbody tr:hover td { background: #21252d; }
+  td.num { text-align: right; }
+  td.nan { color: #6a5330; }
+  td.t { color: var(--ok); }
+  td.f { color: var(--bad); }
+  td.arr { color: var(--dim); cursor: pointer; }
+  td.arr:hover { color: var(--ink); }
+  tr.detail td { background: #10131a; color: #c3cad6; padding: 8px; }
+  /* Pinned to the viewport, not to the table: colSpan across 58 columns would
+     stretch the vectors to the full scroll width and off the right edge. */
+  tr.detail .pin {
+    position: sticky; left: 0;
+    /* A fixed viewport-relative width, not max-content: the grid needs a definite
+       basis to lay its columns out against, and the cell it sits in is as wide as
+       all 58 table columns. */
+    width: calc(100vw - 44px);
+  }
+  tr.detail .name { color: var(--warn); margin: 6px 0 2px; }
+  .vec {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(13ch, 13ch));
+    gap: 1px 12px;
+  }
+  .vec span { color: var(--dim); white-space: nowrap; }
+  .vec b { color: var(--ink); font-weight: 400; }
+  #picker {
+    display: none; position: absolute; right: 14px; top: 46px; z-index: 8;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 10px; max-height: 70vh; overflow: auto; column-count: 3; column-gap: 18px;
+  }
+  #picker.on { display: block; }
+  #picker label { display: block; color: var(--dim); white-space: nowrap; cursor: pointer; }
+  #picker label:hover { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>results</h1>
+  <span class="dim" id="jid"></span>
+  <span class="spacer"></span>
+  <button id="cols">columns ▾</button>
+  <button id="fails">only failed fits</button>
+  <input type="search" id="find" placeholder="filter rows…">
+  <button id="dl">download .parquet</button>
+  <a href="/dashboard" class="dim">← dashboard</a>
+</header>
+
+<div id="picker"></div>
+<div class="banner" id="banner"></div>
+<div class="meta" id="meta"></div>
+<div class="bar">
+  <span class="dim" id="page"></span>
+  <button id="prev">← prev</button>
+  <button id="next">next →</button>
+  <span class="dim">rows/page</span>
+  <select id="limit">
+    <option>100</option><option selected>200</option><option>500</option><option>2000</option>
+  </select>
+  <span class="dim" id="note"></span>
+</div>
+
+<div class="wrap"><table>
+  <thead><tr id="head"></tr></thead>
+  <tbody id="body"></tbody>
+</table></div>
+
+<script>
+"use strict";
+
+const el = (id) => document.getElementById(id);
+// The dashboard and this page share an origin, so the token pasted there is here.
+const token = localStorage.getItem("donut_server_token") || "";
+const JOB = decodeURIComponent(location.pathname.replace(/^\/results\//, ""));
+el("jid").textContent = JOB;
+document.title = "results " + JOB.slice(0, 8);
+
+function banner(msg) {
+  el("banner").textContent = msg || "";
+  el("banner").classList.toggle("on", !!msg);
+}
+
+async function api(path) {
+  const r = await fetch(path, {
+    cache: "no-store",
+    headers: token ? {Authorization: "Bearer " + token} : {},
+  });
+  if (r.status === 401) {
+    banner("401 unauthorized — open /dashboard, paste the token and press save, then reload.");
+    return null;
+  }
+  if (!r.ok) {
+    let detail = "";
+    try { detail = (await r.json()).detail || ""; } catch (e) { /* not json */ }
+    banner(r.status + " — " + (detail || r.statusText));
+    return null;
+  }
+  banner("");
+  return r.json();
+}
+
+// ------------------------------------------------------------------ state
+
+let d = null;            // last payload
+let offset = 0;
+let sortCol = null, sortDir = 1;
+let hidden = new Set();  // column names the picker has unchecked
+let failsOnly = false;
+let needle = "";
+let openRows = new Set();
+
+const num = (v) => (typeof v === "number");
+const fmt = (v, kind) => {
+  if (v === null || v === undefined) return kind === "float" ? "nan" : "–";
+  if (typeof v === "number" && !Number.isInteger(v)) {
+    const a = Math.abs(v);
+    return (a !== 0 && (a < 1e-3 || a >= 1e6)) ? v.toExponential(3) : v.toFixed(4);
+  }
+  return String(v);
+};
+
+// A failed fit is the thing you come here to look at, and the table says so in a
+// dedicated column rather than by NaN-spotting.
+function isFail(i) {
+  const c = d.data.group_fit_success;
+  return c ? c[i] === false : false;
+}
+
+function rowIndices() {
+  const n = d.returned;
+  let idx = [...Array(n).keys()];
+  if (failsOnly) idx = idx.filter(isFail);
+  if (needle) {
+    const q = needle.toLowerCase();
+    idx = idx.filter((i) => shown().some((c) => {
+      const v = d.data[c.name] ? d.data[c.name][i] : null;
+      return v !== null && v !== undefined && String(v).toLowerCase().includes(q);
+    }));
+  }
+  if (sortCol && d.data[sortCol]) {
+    const col = d.data[sortCol];
+    idx.sort((a, b) => {
+      const x = col[a], y = col[b];
+      if (x === null || x === undefined) return 1;      // nulls last, both ways
+      if (y === null || y === undefined) return -1;
+      if (Array.isArray(x)) return 0;
+      return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+    });
+  }
+  return idx;
+}
+
+const shown = () => d.schema.filter((c) => !hidden.has(c.name));
+
+// ------------------------------------------------------------------ render
+
+function put(parent, tag, text, cls) {
+  const n = document.createElement(tag);
+  if (text !== undefined && text !== null) n.textContent = text;
+  if (cls) n.className = cls;
+  parent.appendChild(n);
+  return n;
+}
+
+function renderMeta() {
+  const m = el("meta");
+  m.textContent = "";
+  const s = d.summary, q = d.quantum;
+  const bits = [];
+  if (s) {
+    bits.push(s.n_rows + " donuts", s.n_detectors + " detectors",
+              s.n_groups_succeeded + "/" + s.n_groups + " groups fit",
+              d.schema.length + " columns");
+    if (s.dropped_columns && s.dropped_columns.length) {
+      bits.push("dropped " + s.dropped_columns.join(", "));
+    }
+  }
+  if (q) bits.push("visit " + q.visit, "band " + q.band, q.physical_filter);
+  put(m, "div", bits.join("  ·  "));
+  const nanCols = Object.keys(d.nan_counts || {}).length;
+  const extra = [];
+  if (nanCols) extra.push(nanCols + " columns contain nan");
+  if (d.stringified && d.stringified.length) {
+    // Say it, because it is surprising: these are numbers rendered as text.
+    extra.push(d.stringified.join(", ") + " sent as text (exceeds JS integer precision)");
+  }
+  if (extra.length) put(m, "div", extra.join("  ·  "), "dim");
+}
+
+function renderHead() {
+  const h = el("head");
+  h.textContent = "";
+  put(h, "th", "");                     // expander column
+  for (const c of shown()) {
+    const label = c.kind === "array" ? c.name + " [" + (c.width ?? "?") + "]" : c.name;
+    const th = put(h, "th", label, sortCol === c.name ? "sorted" : "");
+    th.title = c.type + (d.nan_counts[c.name] ? "  ·  " + d.nan_counts[c.name] + " nan" : "");
+    if (c.kind !== "array") {
+      th.onclick = () => {
+        sortDir = sortCol === c.name ? -sortDir : 1;
+        sortCol = c.name;
+        render();
+      };
+    } else {
+      th.style.cursor = "default";
+    }
+  }
+}
+
+function renderRows() {
+  const body = el("body");
+  body.textContent = "";
+  const idx = rowIndices();
+  const cols = shown();
+  const arrays = cols.filter((c) => c.kind === "array");
+
+  for (const i of idx) {
+    const tr = put(body, "tr");
+    const exp = put(tr, "td", arrays.length ? (openRows.has(i) ? "▾" : "▸") : "", "arr");
+    if (arrays.length) exp.onclick = () => { toggle(i); };
+
+    for (const c of cols) {
+      const v = d.data[c.name] ? d.data[c.name][i] : undefined;
+      if (c.kind === "array") {
+        const td = put(tr, "td", v === null || v === undefined ? "–"
+          : "[" + v.slice(0, 3).map((x) => fmt(x, "float")).join(", ") +
+            (v.length > 3 ? ", …" : "") + "]", "arr");
+        td.onclick = () => { toggle(i); };
+      } else if (c.kind === "bool") {
+        put(tr, "td", v === null ? "–" : (v ? "yes" : "no"), v === null ? "" : (v ? "t" : "f"));
+      } else {
+        const isNan = v === null && c.kind === "float";
+        put(tr, "td", fmt(v, c.kind),
+            (c.kind === "float" || c.kind === "int" ? "num " : "") + (isNan ? "nan" : ""));
+      }
+    }
+
+    if (openRows.has(i) && arrays.length) {
+      const dtr = put(body, "tr", null, "detail");
+      const td = put(dtr, "td", "");
+      td.colSpan = cols.length + 1;
+      const pin = put(td, "div", "", "pin");
+      for (const c of arrays) {
+        const v = d.data[c.name] ? d.data[c.name][i] : null;
+        put(pin, "div", c.name + "  (" + (v ? v.length : 0) + ")", "name");
+        const g = put(pin, "div", "", "vec");
+        (v || []).forEach((x, k) => {
+          const s = put(g, "span");
+          // Plain array index: for the zk_ columns that *is* the Zernike index, so
+          // zk_deviation holds 0-26 and zk_intrinsic 0-66. The first four entries
+          // are identically zero in every row.
+          s.appendChild(document.createTextNode(k + ": "));
+          put(s, "b", fmt(x, "float"));
+        });
+      }
+    }
+  }
+
+  el("page").textContent =
+    "rows " + (d.offset + 1) + "–" + (d.offset + d.returned) + " of " + d.n_rows +
+    (idx.length !== d.returned ? "   (" + idx.length + " shown)" : "");
+  el("prev").disabled = d.offset <= 0;
+  el("next").disabled = d.offset + d.returned >= d.n_rows;
+}
+
+function toggle(i) {
+  if (openRows.has(i)) openRows.delete(i); else openRows.add(i);
+  renderRows();
+}
+
+function render() {
+  if (!d) return;
+  renderMeta();
+  renderHead();
+  renderRows();
+}
+
+function renderPicker() {
+  const p = el("picker");
+  p.textContent = "";
+  for (const c of d.schema) {
+    const lab = put(p, "label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !hidden.has(c.name);
+    box.onchange = () => {
+      if (box.checked) hidden.delete(c.name); else hidden.add(c.name);
+      render();
+    };
+    lab.appendChild(box);
+    lab.appendChild(document.createTextNode(" " + c.name));
+  }
+}
+
+// ------------------------------------------------------------------ load
+
+async function load() {
+  const limit = Number(el("limit").value);
+  const body = await api("/admin/result/" + encodeURIComponent(JOB) +
+                         "/rows?offset=" + offset + "&limit=" + limit);
+  if (!body) return;
+  d = body;
+  openRows.clear();
+  if (!el("picker").textContent) {
+    // Start on the columns an operator reads first; everything else is one click
+    // away in the picker. 58 columns at once is unreadable.
+    const first = new Set(["det_name", "donut_id", "band", "candidate", "x_det", "y_det",
+                           "snr", "flux", "donut_radius", "group_id", "group_size",
+                           "group_fit_success", "group_fit_outcome", "group_fwhm",
+                           "zk_deviation_ccs", "zk_intrinsic_ccs"]);
+    hidden = new Set(d.schema.map((c) => c.name).filter((n) => !first.has(n)));
+    renderPicker();
+  }
+  render();
+}
+
+el("cols").onclick = () => {
+  el("picker").classList.toggle("on");
+  el("cols").classList.toggle("on");
+};
+el("fails").onclick = () => {
+  failsOnly = !failsOnly;
+  el("fails").classList.toggle("on", failsOnly);
+  renderRows();
+};
+el("find").oninput = () => { needle = el("find").value.trim(); renderRows(); };
+el("limit").onchange = () => { offset = 0; load(); };
+el("prev").onclick = () => { offset = Math.max(0, offset - Number(el("limit").value)); load(); };
+el("next").onclick = () => { offset = offset + Number(el("limit").value); load(); };
+
+// A plain href cannot carry the bearer token, so fetch the bytes and save them.
+el("dl").onclick = async () => {
+  const r = await fetch("/result/" + encodeURIComponent(JOB) + "/table",
+                        {headers: token ? {Authorization: "Bearer " + token} : {}});
+  if (!r.ok) { banner("download failed: " + r.status); return; }
+  const url = URL.createObjectURL(await r.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = JOB + ".parquet";
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+if (!token) {
+  banner("No token found. Open /dashboard, paste the DONUT_SERVER_TOKEN and press save, then reload this page.");
+} else {
+  load();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<!--
+  donut_server monitoring dashboard. Served unauthenticated by GET /dashboard; the
+  operator pastes a bearer token which is kept in localStorage and put on every
+  fetch. Self-contained on purpose -- no build step, no CDN, no template engine,
+  because nothing on this page is rendered server-side.
+
+  Two rules here are load-bearing rather than stylistic:
+
+  - Every dynamic string goes in via textContent, never innerHTML. The token is in
+    localStorage, and the log panel renders arbitrary bytes emitted by the LSST
+    stack, so one injection point is enough to hand the token over.
+  - GET /health answers 503 whenever the coordinator is not READY, and the body is
+    fully populated in that case. So a non-OK response is normal here and must
+    still be parsed; only 401 means the token is wrong.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>donut_server</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b; --ink: #d8dde5;
+    --dim: #8b93a1; --ok: #4ba36b; --warn: #c99a3d; --bad: #c2564f;
+    --live: #4a86c7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.45 var(--mono);
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header .host { color: var(--dim); }
+  .spacer { flex: 1 1 auto; }
+  input[type=password], input[type=number] {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 3px; padding: 4px 6px; font: inherit; width: 22ch;
+  }
+  input[type=number] { width: 7ch; }
+  button {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 3px; padding: 4px 9px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button.armed { border-color: var(--bad); color: var(--bad); }
+  button.sel { border-color: var(--live); color: var(--live); }
+  section { border-bottom: 1px solid var(--line); padding: 12px 14px; }
+  h2 {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
+  h2 .note { text-transform: none; letter-spacing: 0; color: var(--ink); margin-left: 10px; }
+  .banner { padding: 8px 14px; background: #3a2320; color: #f0c9c4; display: none; }
+  .banner.on { display: block; }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; color: var(--dim); }
+  .facts b { color: var(--ink); font-weight: 600; }
+  .chip {
+    border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; color: var(--dim);
+  }
+  .chip.on { border-color: var(--ok); color: var(--ok); }
+  .chip.off { border-color: var(--bad); color: var(--bad); }
+  .loss { margin-top: 8px; color: var(--warn); max-width: 110ch; }
+  .loss:empty { display: none; }
+  /* --- state machine diagrams --- */
+  svg { display: block; max-width: 100%; height: auto; }
+  .nbox { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; rx: 4; }
+  .nlabel { fill: var(--dim); font: 600 12px var(--mono); text-anchor: middle; }
+  .node.current .nbox { stroke: var(--live); stroke-width: 2.2; fill: #1b2735; }
+  .node.current .nlabel { fill: #cfe2f7; }
+  .node.term.current .nbox { stroke: var(--ok); fill: #1a2820; }
+  .node.term.current .nlabel { fill: #bfe3cc; }
+  .node.bad.current .nbox { stroke: var(--bad); fill: #2b1d1c; }
+  .node.bad.current .nlabel { fill: #f0c9c4; }
+  .edge { stroke: var(--line); stroke-width: 1.2; fill: none; }
+  .edge.hot { stroke: var(--warn); stroke-width: 2; }
+  .etext { fill: var(--dim); font: 10px var(--mono); }
+  /* --- tables --- */
+  table { border-collapse: collapse; width: 100%; }
+  th {
+    text-align: left; color: var(--dim); font-weight: 600; padding: 3px 8px 6px;
+    border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 3px 8px; border-bottom: 1px solid #232730; white-space: nowrap; }
+  tbody tr:hover td { background: #21252d; }
+  /* The current job, marked rather than selected: it is chosen by what is in
+     flight, not by clicking. */
+  tbody tr.sel td { background: #1b2735; }
+  td.num { text-align: right; }
+  .s-DONE { color: var(--ok); }
+  .s-ERROR { color: var(--bad); }
+  .s-COMPUTING, .s-RECEIVING, .s-PREPARED { color: var(--live); }
+  a { color: var(--live); }
+  /* --- detail --- */
+  #detail { color: var(--dim); }
+  #detail .row { margin-top: 6px; }
+  #detail b { color: var(--ink); font-weight: 600; }
+  .bar { display: flex; height: 16px; width: 100%; border: 1px solid var(--line); margin: 6px 0 2px; }
+  .bar div { overflow: hidden; font-size: 9px; line-height: 16px; text-align: center; color: #10131a; }
+  .err { color: var(--bad); white-space: pre-wrap; }
+  /* --- log --- */
+  #logtext {
+    margin: 0; padding: 8px; background: #10131a; border: 1px solid var(--line);
+    height: 22em; overflow: auto; white-space: pre; font-size: 12px; color: #c3cad6;
+  }
+  .ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .ctl label { color: var(--dim); }
+  .path { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>donut_server</h1>
+  <span class="host" id="host"></span>
+  <span class="spacer"></span>
+  <label for="tok" class="host">token</label>
+  <input type="password" id="tok" placeholder="DONUT_SERVER_TOKEN" autocomplete="off">
+  <button id="tok-save">save</button>
+  <button id="tok-clear">clear</button>
+  <span class="chip" id="poll">idle</span>
+  <button id="restart">restart coordinator</button>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<section>
+  <h2>Coordinator <span class="note" id="coord-note"></span></h2>
+  <svg id="svg-coord" viewBox="0 0 860 200" role="img" aria-label="coordinator state machine">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+              orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#5b616d"/>
+      </marker>
+      <marker id="ar-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+              orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#c99a3d"/>
+      </marker>
+    </defs>
+
+    <!-- starting -> degraded, routed above the row (attempts exhausted) -->
+    <path class="edge" d="M90,40 L90,20 L702,20 L702,40" marker-end="url(#ar)"/>
+    <text class="etext" x="200" y="15">bring-up attempts exhausted</text>
+    <!-- starting -> ready -->
+    <path class="edge" d="M150,60 L214,60" marker-end="url(#ar)"/>
+    <!-- ready -> restarting -->
+    <path id="e-ready-restarting" class="edge" d="M334,54 L438,54" marker-end="url(#ar)"/>
+    <!-- restarting -> ready -->
+    <path class="edge" d="M438,66 L334,66" marker-end="url(#ar)"/>
+    <!-- restarting -> degraded -->
+    <path class="edge" d="M578,60 L678,60" marker-end="url(#ar)"/>
+    <!-- degraded -> restarting (the only way out) -->
+    <path class="edge" d="M726,84 L726,120 L508,120 L508,84" marker-end="url(#ar)"/>
+    <text class="etext" x="560" y="136">POST /admin/restart</text>
+    <!-- any -> stopping -->
+    <path class="edge" d="M274,84 L274,150" marker-end="url(#ar)"/>
+    <text class="etext" x="284" y="116">aclose()</text>
+
+    <g class="node" id="c-starting">
+      <rect class="nbox" x="30" y="40" width="120" height="40"/>
+      <text class="nlabel" x="90" y="65">starting</text>
+    </g>
+    <g class="node term" id="c-ready">
+      <rect class="nbox" x="214" y="40" width="120" height="40"/>
+      <text class="nlabel" x="274" y="65">ready</text>
+    </g>
+    <g class="node" id="c-restarting">
+      <rect class="nbox" x="438" y="40" width="140" height="40"/>
+      <text class="nlabel" x="508" y="65">restarting</text>
+    </g>
+    <g class="node bad" id="c-degraded">
+      <rect class="nbox" x="678" y="40" width="120" height="40"/>
+      <text class="nlabel" x="738" y="65">degraded</text>
+    </g>
+    <g class="node" id="c-stopping">
+      <rect class="nbox" x="214" y="150" width="120" height="36"/>
+      <text class="nlabel" x="274" y="173">stopping</text>
+    </g>
+  </svg>
+  <div class="facts" id="coord-facts"></div>
+  <div class="loss" id="coord-loss"></div>
+</section>
+
+<section>
+  <h2>Current job <span class="note" id="job-note"></span></h2>
+  <svg id="svg-job" viewBox="0 0 860 190" role="img" aria-label="job state machine">
+    <path class="edge" d="M94,10 L94,24" marker-end="url(#ar)"/>
+    <text class="etext" x="30" y="9">POST /prepare</text>
+    <path class="edge" d="M158,44 L206,44" marker-end="url(#ar)"/>
+    <path class="edge" d="M346,44 L394,44" marker-end="url(#ar)"/>
+    <path class="edge" d="M534,44 L582,44" marker-end="url(#ar)"/>
+    <!-- Only RECEIVING and COMPUTING reach ERROR. A prepare that fails creates the
+         record already in ERROR (server.py:736) -- it is never PREPARED -- so that
+         is an entry edge, and DONE is terminal. -->
+    <path class="edge" d="M276,74 L276,98 L360,98" />
+    <path class="edge" d="M464,74 L464,98 L360,98" />
+    <path class="edge" d="M360,98 L360,112" marker-end="url(#ar)"/>
+    <path class="edge" d="M200,135 L300,135" marker-end="url(#ar)"/>
+    <text class="etext" x="112" y="131">prepare failed</text>
+    <text class="etext" x="440" y="130">bad layout · coordinator lost · task raised</text>
+    <text class="etext" x="440" y="146">DONE and ERROR are terminal</text>
+
+    <g class="node" id="j-PREPARED">
+      <rect class="nbox" x="30" y="24" width="128" height="44"/>
+      <text class="nlabel" x="94" y="51">PREPARED</text>
+    </g>
+    <g class="node" id="j-RECEIVING">
+      <rect class="nbox" x="206" y="24" width="140" height="44"/>
+      <text class="nlabel" x="276" y="51">RECEIVING</text>
+    </g>
+    <g class="node" id="j-COMPUTING">
+      <rect class="nbox" x="394" y="24" width="140" height="44"/>
+      <text class="nlabel" x="464" y="51">COMPUTING</text>
+    </g>
+    <g class="node term" id="j-DONE">
+      <rect class="nbox" x="582" y="24" width="120" height="44"/>
+      <text class="nlabel" x="642" y="51">DONE</text>
+    </g>
+    <g class="node bad" id="j-ERROR">
+      <rect class="nbox" x="300" y="112" width="120" height="44"/>
+      <text class="nlabel" x="360" y="139">ERROR</text>
+    </g>
+  </svg>
+</section>
+
+<section>
+  <h2>Jobs <span class="note" id="jobs-note"></span></h2>
+  <div class="ctl">
+    <label for="limit">limit</label>
+    <input type="number" id="limit" value="50" min="1" max="500">
+  </div>
+  <table>
+    <thead><tr>
+      <th>job</th><th>state</th><th>created</th><th class="num">age</th>
+      <th class="num">runQuantum</th><th class="num">coord total</th><th class="num">blob</th>
+      <th class="num">rows</th><th class="num">dets</th><th class="num">groups</th>
+      <th class="num">parquet</th><th>results</th>
+    </tr></thead>
+    <tbody id="jobs-body"></tbody>
+  </table>
+  <div id="detail"></div>
+</section>
+
+<section>
+  <h2>Log</h2>
+  <div class="ctl">
+    <button id="tab-tail" class="sel">live tail</button>
+    <button id="tab-job">current job</button>
+    <label><input type="checkbox" id="log-auto" checked> auto</label>
+    <label for="log-bytes">bytes</label>
+    <input type="number" id="log-bytes" value="65536" min="4096" max="1048576" step="4096">
+    <span class="path" id="log-path"></span>
+  </div>
+  <pre id="logtext"></pre>
+</section>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- token + fetch
+
+const TOK_KEY = "donut_server_token";
+const el = (id) => document.getElementById(id);
+let token = localStorage.getItem(TOK_KEY) || "";
+// Declared up here rather than beside the log panel because saveToken resets it,
+// and a `let` read before its declaration is a ReferenceError, not a hoist.
+let logSize = -1;
+el("tok").value = token;
+el("host").textContent = location.host;
+
+function saveToken() {
+  token = el("tok").value.trim();
+  localStorage.setItem(TOK_KEY, token);
+  // Drop the stale verdict and re-poll now, so a corrected token is confirmed or
+  // rejected immediately rather than at the next tick.
+  banner("auth", null);
+  logSize = -1;
+  pollHealth();
+  pollJobs();
+  pollLog(true);
+}
+
+el("tok-save").onclick = saveToken;
+// Enter in the field is what people actually press.
+el("tok").addEventListener("keydown", (e) => { if (e.key === "Enter") saveToken(); });
+el("tok-clear").onclick = () => {
+  token = "";
+  el("tok").value = "";
+  localStorage.removeItem(TOK_KEY);
+  banner("auth", null);
+};
+
+// Keyed rather than a single slot, and only ever cleared by the same key that set
+// it. A shared banner is worse than none: /health accepts a wrong token and 200s
+// with its minimal public body (server.py:916), so it would clear an /admin/jobs
+// 401 a fraction of a second after it appeared, leaving a dashboard that looks
+// healthy while being locked out of every endpoint that carries job data.
+const problems = new Map();
+
+function banner(key, msg) {
+  if (msg) problems.set(key, msg); else problems.delete(key);
+  const b = el("banner");
+  b.textContent = [...problems.values()].join("   •   ");
+  b.classList.toggle("on", problems.size > 0);
+}
+
+// /health answers 503 whenever the coordinator is not READY, with a full body, so
+// a non-OK status is normal and still has to be parsed. 401 is a token problem;
+// 500 means the server itself has no DONUT_SERVER_TOKEN set.
+async function api(path, opts) {
+  const init = Object.assign({cache: "no-store"}, opts || {});
+  init.headers = Object.assign({}, init.headers, token ? {Authorization: "Bearer " + token} : {});
+  const key = path.split("?")[0];
+  let r;
+  try {
+    r = await fetch(path, init);
+  } catch (e) {
+    banner(key, "cannot reach " + key + " — is the server up?");
+    throw e;
+  }
+  if (r.status === 401) {
+    banner("auth", "401 unauthorized on " + key +
+      " — this token does not match the server's DONUT_SERVER_TOKEN. " +
+      "Paste the one run_server.sh printed, then press save.");
+    return null;
+  }
+  if (r.status === 500) {
+    banner("auth", "500 on " + key +
+      " — the server has no DONUT_SERVER_TOKEN set in its environment.");
+    return null;
+  }
+  banner(key, null);
+  if (key !== "/health") banner("auth", null);
+  return r.json();
+}
+
+// ------------------------------------------------------------------ formatting
+
+const fmt = {
+  secs: (s) => (s === null || s === undefined) ? "–" : s.toFixed(s < 10 ? 2 : 1) + "s",
+  age: (s) => {
+    if (s === null || s === undefined) return "–";
+    if (s < 90) return s.toFixed(1) + "s";
+    if (s < 5400) return Math.floor(s / 60) + "m " + Math.round(s % 60) + "s";
+    return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m";
+  },
+  bytes: (n) => {
+    if (n === null || n === undefined) return "–";
+    if (n < 1024) return n + "B";
+    if (n < 1048576) return (n / 1024).toFixed(0) + "KB";
+    return (n / 1048576).toFixed(0) + "MB";
+  },
+  num: (n) => (n === null || n === undefined) ? "–" : String(n),
+  clock: (epoch) => epoch ? new Date(epoch * 1000).toTimeString().slice(0, 8) : "–",
+};
+
+// The comment at server.py:929 calls exitcode the highest-value field in /health;
+// don't make the operator look up what -11 means.
+function exitcodeText(code) {
+  if (code === null || code === undefined) return "";
+  const known = {
+    "-11": "SEGFAULT — a fork-safety regression",
+    "-9": "SIGKILL — on a service that oscillates 4-6 GB RSS, read this as macOS jetsam",
+    "-6": "SIGABRT — an assertion or C++ throw in the stack",
+    "-15": "SIGTERM — reaped after a graceful exit timed out",
+    "1": "Python exception — the traceback is in the log",
+    "3": "died before hello — bad env or an import failure",
+    "0": "clean exit",
+  };
+  return known[String(code)] ? code + " (" + known[String(code)] + ")" : String(code);
+}
+
+// textContent everywhere: the token is in localStorage and some of these strings
+// come from the LSST stack.
+function put(parent, tag, text, cls) {
+  const n = document.createElement(tag);
+  if (text !== undefined && text !== null) n.textContent = text;
+  if (cls) n.className = cls;
+  parent.appendChild(n);
+  return n;
+}
+
+// ------------------------------------------------------- state machine painting
+
+// `activeState` rather than `current`, which is the module-level current job. Each
+// diagram means exactly one thing: which state its subject is in right now. History
+// tallies live in the JOBS header.
+function paint(svgPrefix, nodeIds, activeState) {
+  for (const name of nodeIds) {
+    const g = el(svgPrefix + name);
+    if (g) g.classList.toggle("current", name === activeState);
+  }
+}
+
+const COORD_STATES = ["starting", "ready", "restarting", "degraded", "stopping"];
+const JOB_STATES = ["PREPARED", "RECEIVING", "COMPUTING", "DONE", "ERROR"];
+
+function renderCoord(h) {
+  paint("c-", COORD_STATES, h.status);
+  el("coord-note").textContent = h.ready ? "ready" : h.status;
+
+  const facts = el("coord-facts");
+  facts.textContent = "";
+  // alive and ready are shown separately on purpose: is_alive() is true both for a
+  // child 15 s into importing afw and for one whose fork pool is wedged
+  // (server.py:265). alive + !ready + in_flight>0, sustained, is that wedge.
+  put(facts, "span", "alive", "chip " + (h.alive ? "on" : "off"));
+  put(facts, "span", "ready", "chip " + (h.ready ? "on" : "off"));
+  put(facts, "span", h.primed ? "primed" : "unprimed", "chip " + (h.primed ? "on" : "off"));
+  const pairs = [
+    ["gen", fmt.num(h.generation)], ["spawns", fmt.num(h.spawns)],
+    ["attempts", fmt.num(h.restart_attempts)], ["pid", fmt.num(h.pid)],
+    ["up", fmt.age(h.child_uptime_s)], ["in-flight", fmt.num(h.in_flight)],
+  ];
+  if (h.primed_args) {
+    const a = h.primed_args;
+    pairs.push(["primed", a.band + " / " + a.calib_selector + " / ra " +
+                Number(a.boresight_ra).toFixed(3) + " dec " + Number(a.boresight_dec).toFixed(3)]);
+  }
+  for (const [k, v] of pairs) {
+    const s = put(facts, "span", k + " ");
+    put(s, "b", v);
+  }
+
+  const loss = el("coord-loss");
+  loss.textContent = "";
+  const hot = h.status === "restarting" || h.status === "degraded";
+  el("e-ready-restarting").classList.toggle("hot", hot);
+  if (h.degraded_reason) {
+    put(loss, "div", "degraded: " + h.degraded_reason);
+  }
+  if (h.last_loss) {
+    const L = h.last_loss;
+    const parts = ["last loss @ " + fmt.clock(L.at), "gen " + fmt.num(L.generation),
+                   "pid " + fmt.num(L.pid)];
+    if (L.provoked_by) parts.push("provoked by " + L.provoked_by);
+    put(loss, "div", parts.join("  ·  "));
+    const ec = exitcodeText(L.exitcode);
+    if (ec) put(loss, "div", "exitcode " + ec);
+    if (L.reason) put(loss, "div", L.reason);
+  }
+}
+
+// ------------------------------------------------------------------- jobs table
+
+let jobs = [];
+// The job every "this job" view follows: the one in flight, or the most recent.
+// Not user-selectable -- see currentJob().
+let current = null;
+
+function renderJobs(d) {
+  jobs = d.jobs;
+  const was = current;
+  current = currentJob(d);
+  paint("j-", JOB_STATES, current ? current.state : null);
+
+  const note = [d.total + " total"];
+  // The per-state tallies, which used to sit inside the diagram's nodes. They belong
+  // here: they describe the history in the table below, not the current job above.
+  for (const state of JOB_STATES) {
+    if (d.counts[state]) note.push(d.counts[state] + " " + state);
+  }
+  if (d.returned < d.total) note.push("showing newest " + d.returned);
+  el("jobs-note").textContent = note.join("  ·  ");
+  // The diagram's subtitle names the job it is about, and whether that job is still
+  // running or is simply the last one to have finished.
+  el("job-note").textContent = current
+    ? short(current.job_id) + "  " + current.state + "  " +
+      (d.active_job_id ? "in flight " + fmt.secs(current.age_s)
+                       : "(most recent, " + fmt.age(current.age_s) + " ago)")
+    : "no jobs yet";
+
+  // The per-job log follows the current job, so it has to reload when that changes.
+  if (logMode === "job" && current && (!was || was.job_id !== current.job_id)) {
+    logSize = -1;
+    pollLog(true);
+  }
+
+  const body = el("jobs-body");
+  body.textContent = "";
+  for (const j of jobs) {
+    const tr = put(body, "tr");
+    if (current && j.job_id === current.job_id) tr.className = "sel";
+    const t = j.push_timings || {};
+    const s = j.summary || {};
+    put(tr, "td", short(j.job_id));
+    put(tr, "td", j.state, "s-" + j.state);
+    put(tr, "td", fmt.clock(j.created_wall));
+    put(tr, "td", fmt.age(j.age_s), "num");
+    put(tr, "td", fmt.secs(t.run_quantum_s), "num");
+    put(tr, "td", fmt.secs(t.coordinator_total_s), "num");
+    put(tr, "td", fmt.bytes(t.blob_bytes), "num");
+    put(tr, "td", fmt.num(s.n_rows), "num");
+    put(tr, "td", fmt.num(s.n_detectors), "num");
+    put(tr, "td", s.n_groups === undefined ? "–" : s.n_groups_succeeded + "/" + s.n_groups, "num");
+    put(tr, "td", fmt.bytes(j.parquet_bytes), "num");
+    const td = put(tr, "td");
+    if (j.has_table) {
+      // A real href to /results/<id>, so middle-click and cmd-click open a tab the
+      // way they should. Its data fetch carries the token; this navigation needs no
+      // header of its own.
+      const view = put(td, "a", "view");
+      view.href = "/results/" + encodeURIComponent(j.job_id);
+      view.target = "_blank";
+      view.rel = "noopener";
+      view.onclick = (ev) => ev.stopPropagation();
+      td.appendChild(document.createTextNode("  "));
+      // Not an href: a browser navigation cannot send Authorization, so linking
+      // straight to /result/<id>/table just 401s. Fetch, then save the blob.
+      const dl = put(td, "a", ".parquet");
+      dl.href = "#";
+      dl.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); download(j); };
+    } else {
+      td.textContent = "–";
+    }
+  }
+  renderDetail();
+}
+
+async function download(j) {
+  const r = await fetch(j.table_url,
+                        {headers: token ? {Authorization: "Bearer " + token} : {}});
+  if (!r.ok) { banner("download", "download failed: " + r.status + " " + j.table_url); return; }
+  banner("download", null);
+  const url = URL.createObjectURL(await r.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = j.job_id + ".parquet";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+const short = (id) => id.slice(0, 8) + "…";
+
+// The one job the diagram is about: whatever is in flight, else the most recent, so
+// between jobs the last outcome stays lit rather than the diagram going blank. At
+// most one job is non-terminal at a time (push_lock plus the coordinator's serial
+// command loop), so "in flight" is unambiguous and this is never a choice between
+// two candidates. Past jobs live in the table below; the diagram does not track
+// them.
+function currentJob(d) {
+  const active = d.active_job_id
+    ? jobs.find((x) => x.job_id === d.active_job_id) : null;
+  return active || jobs[0] || null;
+}
+
+const PHASES = [
+  ["receive_s", "recv", "#4a86c7"], ["layout_s", "layout", "#5b7fa8"],
+  ["decode_s", "decode", "#4ba36b"], ["butler_put_s", "put", "#5f9e78"],
+  ["dataset_refs_s", "refs", "#6f9a84"], ["run_quantum_s", "runQuantum", "#c99a3d"],
+  ["serialize_s", "serialize", "#a8794a"], ["gc_s", "gc", "#8b93a1"],
+];
+
+function renderDetail() {
+  const d = el("detail");
+  d.textContent = "";
+  const j = current;
+  if (!j) return;
+
+  const head = put(d, "div", "", "row");
+  put(head, "b", j.job_id);
+  head.appendChild(document.createTextNode("  " + j.state + "  ·  created " +
+    fmt.clock(j.created_wall) + "  ·  " + fmt.age(j.age_s) + " ago"));
+
+  if (j.error) put(d, "div", j.error, "err");
+
+  const t = j.push_timings;
+  if (t) {
+    const total = PHASES.reduce((a, [k]) => a + (t[k] || 0), 0);
+    const bar = put(d, "div", "", "bar");
+    for (const [k, label, colour] of PHASES) {
+      const v = t[k];
+      if (!v) continue;
+      const seg = put(bar, "div", v / total > 0.09 ? label : "");
+      seg.style.width = (100 * v / total).toFixed(2) + "%";
+      seg.style.background = colour;
+      seg.title = label + " " + v.toFixed(3) + "s";
+    }
+    const line = PHASES.filter(([k]) => t[k] !== undefined)
+      .map(([k, label]) => label + " " + t[k].toFixed(3) + "s").join("  ");
+    put(d, "div", line, "row");
+    const foot = ["blob " + fmt.bytes(t.blob_bytes),
+                  "coordinator total " + fmt.secs(t.coordinator_total_s)];
+    if (t.run_quantum_s && t.coordinator_total_s) {
+      foot.push("runQuantum is " +
+        (100 * t.run_quantum_s / t.coordinator_total_s).toFixed(0) + "% of it");
+    }
+    if (t.gc_collected !== undefined) foot.push("gc reclaimed " + t.gc_collected);
+    put(d, "div", foot.join("  ·  "), "row");
+  }
+
+  const p = j.prepare_timings;
+  if (p) {
+    const bits = [];
+    if (p.calib) {
+      bits.push("calib " + (p.calib.reused ? "reused" : "loaded") +
+                " " + fmt.secs(p.calib.elapsed_s));
+    }
+    if (p.refcat) {
+      const r = p.refcat;
+      const parts = [(r.reused ? "reused" : "loaded") + " " + fmt.secs(r.elapsed_s)];
+      if (r.n_level7_shards) {
+        parts.push(r.n_level7_shards + " shards from " + r.n_level5_files + " files");
+      }
+      if (r.n_rows) parts.push(r.n_rows.toLocaleString() + " rows");
+      bits.push("refcat " + parts.join(", "));
+    }
+    put(d, "div", "prepare  " + bits.join("  ·  "), "row");
+  }
+
+  const s = j.summary;
+  if (s) {
+    const bits = [s.n_rows + " rows", s.n_detectors + " detectors",
+                  s.n_groups_succeeded + "/" + s.n_groups + " groups fit"];
+    if (s.columns) bits.push(s.columns.length + " columns");
+    if (s.dropped_columns && s.dropped_columns.length) {
+      bits.push("dropped " + s.dropped_columns.join(", "));
+    }
+    put(d, "div", "summary  " + bits.join("  ·  "), "row");
+    if (s.rows_per_detector) {
+      put(d, "div", "per detector  " + Object.entries(s.rows_per_detector)
+        .map(([k, v]) => k + " " + v).join("  "), "row");
+    }
+  }
+  if (j.quantum) {
+    put(d, "div", "quantum  " + Object.entries(j.quantum)
+      .map(([k, v]) => k + " " + v).join("  ·  "), "row");
+  }
+}
+
+// -------------------------------------------------------------------- log panel
+
+let logMode = "tail";
+
+el("tab-tail").onclick = () => setLogMode("tail");
+el("tab-job").onclick = () => setLogMode("job");
+function setLogMode(mode) {
+  logMode = mode;
+  logSize = -1;
+  el("tab-tail").classList.toggle("sel", mode === "tail");
+  el("tab-job").classList.toggle("sel", mode === "job");
+  pollLog(true);
+}
+
+function showLog(d, force) {
+  if (!d) return;
+  // The unchanged short-circuit carries no path, so don't blank the label with it.
+  if (d.path) el("log-path").textContent = d.path;
+  if (d.unchanged) return;
+  if (d.exists === false) {
+    el("logtext").textContent =
+      "(log not created yet — the coordinator configures logging after its hello)";
+    return;
+  }
+  if (d.found === false) {
+    el("logtext").textContent =
+      "(no lines for this job in the last " + fmt.bytes(d.searched_bytes) + " of the log)";
+    return;
+  }
+  const pre = el("logtext");
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 24;
+  let text = d.text;
+  if (d.truncated) text = "… truncated, showing " + fmt.bytes(d.returned_bytes) + " …\n" + text;
+  pre.textContent = text;
+  if (atBottom || force) pre.scrollTop = pre.scrollHeight;
+}
+
+// ----------------------------------------------------------------- poll loops
+// setTimeout chains, not setInterval, so exactly one request per panel is ever in
+// flight; and paused while the tab is hidden, so a page left open overnight does
+// not spend the night polling.
+
+let health = null;
+
+function visible() { return document.visibilityState === "visible"; }
+
+function loop(fn, everyMs) {
+  const tick = async () => {
+    if (visible() && token) {
+      try { await fn(); } catch (e) { /* transport hiccup; next tick retries */ }
+    }
+    setTimeout(tick, everyMs);
+  };
+  tick();
+}
+
+// Driven by /admin/jobs, not /health: /health 200s with a wrong token, so keying
+// liveness off it would report "polling" on a dashboard that cannot read a job.
+let lastOk = 0;
+
+async function pollHealth() {
+  const h = await api("/health");
+  if (!h) return;
+  health = h;
+  renderCoord(h);
+}
+
+async function pollJobs() {
+  const limit = Math.max(1, Math.min(500, Number(el("limit").value) || 50));
+  const d = await api("/admin/jobs?limit=" + limit);
+  if (!d) return;
+  lastOk = Date.now();
+  renderJobs(d);
+}
+
+async function pollLog(force) {
+  if (!token) return;
+  let d;
+  if (logMode === "job") {
+    if (!current) {
+      el("logtext").textContent = "(no jobs yet)";
+      return;
+    }
+    d = await api("/admin/log/" + encodeURIComponent(current.job_id));
+  } else {
+    const n = Math.max(4096, Math.min(1048576, Number(el("log-bytes").value) || 65536));
+    const since = force ? "" : "&since_size=" + logSize;
+    d = await api("/admin/log?bytes=" + n + since);
+  }
+  if (d && d.size !== undefined) logSize = d.size;
+  showLog(d, force);
+}
+
+setInterval(() => {
+  const chip = el("poll");
+  if (!token) { chip.textContent = "no token"; chip.className = "chip off"; return; }
+  if (!visible()) { chip.textContent = "paused"; chip.className = "chip"; return; }
+  if (problems.has("auth")) { chip.textContent = "unauthorized"; chip.className = "chip off"; return; }
+  const age = (Date.now() - lastOk) / 1000;
+  chip.textContent = lastOk ? "polling  " + age.toFixed(1) + "s ago" : "connecting";
+  chip.className = "chip " + (lastOk && age < 5 ? "on" : "off");
+}, 250);
+
+document.addEventListener("visibilitychange", () => { if (visible()) { pollHealth(); pollJobs(); } });
+
+loop(pollHealth, 1000);
+loop(pollJobs, 1000);
+loop(() => { if (el("log-auto").checked) return pollLog(false); }, 2000);
+
+// ------------------------------------------------------------- restart control
+// The only non-read-only control here, and it SIGKILLs the child's process group
+// (server.py:534), so anything COMPUTING dies with it. Two-step, and it says which
+// job it is about to kill.
+
+let armed = null;
+const btn = el("restart");
+btn.onclick = async () => {
+  if (!armed) {
+    const active = health && health.in_flight > 0;
+    const j = jobs.find((x) => ["PREPARED", "RECEIVING", "COMPUTING"].includes(x.state));
+    btn.textContent = j
+      ? "confirm — this KILLS job " + short(j.job_id) + " (" + j.state + ")"
+      : (active ? "confirm — a job is in flight and will be killed" : "confirm restart?");
+    btn.classList.add("armed");
+    armed = setTimeout(disarm, 5000);
+    return;
+  }
+  disarm();
+  const d = await api("/admin/restart", {method: "POST"});
+  if (d) {
+    banner("restart", "restart requested — killed pid " + d.killed_pid +
+                      ", state " + d.state);
+    setTimeout(() => banner("restart", null), 8000);
+  }
+  pollHealth();
+};
+function disarm() {
+  clearTimeout(armed);
+  armed = null;
+  btn.textContent = "restart coordinator";
+  btn.classList.remove("armed");
+}
+
+if (!token) {
+  banner("auth", "Paste the DONUT_SERVER_TOKEN printed by run_server.sh, then press save.");
+}
+</script>
+</body>
+</html>
