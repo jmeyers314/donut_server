@@ -336,6 +336,7 @@ def run_once(
 def print_blitz_table(parquet_bytes: bytes, columns: list) -> None:
     """Deserialize the parquet body back into the astropy Table the task produced."""
     import io
+    import math
 
     import pyarrow.parquet
     from lsst.daf.butler.formatters.parquet import arrow_to_astropy
@@ -347,9 +348,14 @@ def print_blitz_table(parquet_bytes: bytes, columns: list) -> None:
     table["det_name", "donut_id", "group_id", "group_fit_success", "snr"][:5].pprint()
     zk = table["zk_deviation_ccs"]
     print(f"  zk_deviation_ccs: shape={zk.shape} unit={zk.unit}")
-    for i, row in enumerate(zk):
-        print(f"  donut {i}, Noll 4-11: {[round(float(v), 4) for v in row[4:12]]}")
+    header = "" + " ".join(f"{n:>8d}" for n in range(4, 12))
+    print(f"  donut     Noll: {header}")
 
+    for i, row in enumerate(zk):
+        if math.isnan(float(row[4])):
+            continue
+        vals = " ".join(f"{float(v):+8.3f}" for v in row[4:12])
+        print(f"  donut {i:3d}:      {vals}")
 
 def report_transient_or_raise(exc: requests.HTTPError) -> None:
     """Print and swallow a 409/503; re-raise anything else."""
@@ -418,8 +424,6 @@ def main() -> None:
             f"--token is required for a remote --host ({args.host}); "
             "or set DONUT_SERVER_TOKEN"
         )
-    if args.collections and not args.butler:
-        parser.error("--collections only applies with --butler")
 
     # Resolved once, up front: --visit pins the exposure, so there is nothing to
     # re-resolve per cycle, and a bad visit fails before --loop starts rather
