@@ -15,42 +15,55 @@ The service imports `lsst.afw`, `lsst.ip.isr`, `lsst.daf.butler`, `lsst.pipe.bas
 ```zsh
 source /Users/jmeyers3/src/lsstinstall/loadLSST.zsh
 setup lsst_distrib
-setup -kr ~/src/ts_wep      # a working copy; ts_wep is not eups-installed
+setup -kr ~/src/ts_wep      # required, and must come first -- see below
+setup -kr .
+scons                       # builds bin/ from bin.src/; required for the launchers
 ```
 
 `ts_wep` is set up from a checkout deliberately: the service tracks unreleased blitz-task changes.
+It is declared `setupRequired`, so if it is not already set up, `setup -kr .` stops with
+`Product ts_wep not found` — set up `ts_wep` first and re-run.
 
-### `.env` is not in the repo
+`scons` is not optional if you want the launchers: `bin/` is a build product and a fresh checkout has
+none. On macOS, SIP strips `DYLD_LIBRARY_PATH` from any child of a system-volume binary — which
+includes `/bin/sh` and `/usr/bin/env`, even named by absolute path — so `import lsst.afw.image` would
+fail with `Library not loaded: libbase.dylib`. `scons` rewrites the `#!/usr/bin/env python` shebang in
+`bin.src/` to the absolute conda interpreter, which is not SIP-protected, and that is what makes the
+built launchers work. Running the `bin.src/` copies directly will fail for exactly this reason.
 
-A dumped-environment `.env` is git-ignored, so a fresh clone has none and `run_server.sh` /
-`run_client.sh` will fail on `source .env` until you regenerate one from an eups-setup shell:
+`LD_LIBRARY_PATH` does survive SIP. If you wrap these in a shell script of your own, re-export it:
 
 ```zsh
-env > .env
+export DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
 ```
-
-It is a shortcut for skipping the `setup` calls above, not a supported entry point. Note that
-`/usr/bin/env` is SIP-protected on macOS and strips `DYLD_LIBRARY_PATH` from child processes, which
-is why the launcher scripts remap `LD_LIBRARY_PATH` onto it — without that, `import lsst.afw.image`
-fails with `Library not loaded: libbase.dylib`.
 
 ## Data
 
-Not in the repo (33 GB, git-ignored), found relative to the source tree:
+Not in the repo (33 GB, git-ignored). Locate it yourself — each directory is found through its own
+environment variable, so the data need not live in the checkout:
 
-| dir | size | contents |
+| variable | size | contents |
 |---|---|---|
-| `raw/` | 5.1 G | real corner-sensor raws, overscan present, ISR-ready |
-| `calib/` | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per band |
-| `ref_cat/` | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
+| `DONUT_SERVER_RAW_DIR` | 5.1 G | real corner-sensor raws, overscan present, ISR-ready |
+| `DONUT_SERVER_CALIB_DIR` | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per band |
+| `DONUT_SERVER_REFCAT_DIR` | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
+
+```zsh
+export DONUT_SERVER_CALIB_DIR=$PWD/calib
+export DONUT_SERVER_REFCAT_DIR=$PWD/ref_cat
+export DONUT_SERVER_RAW_DIR=$PWD/raw
+```
+
+Unset is a loud `RuntimeError` naming the variable, not a silent empty result. The data-dependent
+tests skip when unset, so `scons`/`pytest` still pass without the data — check the skip count.
 
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q          # 53 tests
-python coordinator.py               # full prepare -> push, no FastAPI
-./run_server.sh                     # then, in another shell:
-./run_client.sh --token <tok> --visit 2026071300478 --wait 60
+python -m pytest tests/ -q                      # 85 tests
+python -m lsst.ts.donut_server.coordinator      # full prepare -> push, no FastAPI
+bin/donutServer.py                              # then, in another shell:
+bin/donutClient.py --token <tok> --visit 2026071300478 --wait 60
 ```
 
 Acceptance criteria for the r-band exposure — a packaging or refactoring change touches no compute

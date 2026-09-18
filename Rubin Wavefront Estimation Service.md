@@ -201,6 +201,10 @@ but costs +3 GB CoW, monkeypatching a pipe_base test class, and a safety propert
 
 ## Component map
 
+The modules live in `python/lsst/ts/donut_server/` and are imported as
+`from lsst.ts.donut_server import protocol`; they are named bare below for brevity. `tests/` stays at
+the repo root, and the three data trees are located by `DONUT_SERVER_{CALIB,REFCAT,RAW}_DIR`.
+
 - `protocol.py` — blob pack/unpack, `parse_layout` (framing only, no payload copies), `split_parts`.
   Stdlib-only on purpose, so it stays cheap for the web process.
 - `exposure_codec.py` — `ExposureF` <-> wire bytes. Imported by `client.py` and `coordinator.py`, never by
@@ -216,7 +220,8 @@ but costs +3 GB CoW, monkeypatching a pipe_base test class, and a safety propert
   bounded background restart, re-priming, and the terminal `DEGRADED` state).
 - `client.py` — test producer: exposure discovery/selection, boresight read, encoding, parquet decode.
 - `tests/` — protocol framing/layout, codec round trip, client discovery, result serialization and summary,
-  refcat geometry/schema/reshard. Data-dependent parts skip without `raw/` or `ref_cat/`.
+  refcat geometry/schema/reshard. Data-dependent parts skip when `DONUT_SERVER_RAW_DIR` or
+  `DONUT_SERVER_REFCAT_DIR` is unset or empty.
   `test_coord_lifecycle.py` drives `Coord` against `tests/fake_coordinator.py` through its ctor seams
   (`target`, `target_args`, `shm_size`, `max_restart_attempts`, `backoff`, `on_restart`), so it imports no
   LSST code and needs no calibs. The fake's `target` must stay a module-level function — spawn pickles by
@@ -326,12 +331,13 @@ but costs +3 GB CoW, monkeypatching a pipe_base test class, and a safety propert
 
 ## Verification
 
-```bash
-set -a; source .env; set +a; export DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
-python -m pytest tests/ -q          # 53 tests
-python coordinator.py               # full prepare -> push, no FastAPI
-./run_server.sh                     # then, in another shell:
-./run_client.sh --token <tok> --visit 2026071300478 --wait 60
+See README.md for the eups setup and the three `DONUT_SERVER_*_DIR` variables this assumes.
+
+```zsh
+python -m pytest tests/ -q                      # 85 tests
+python -m lsst.ts.donut_server.coordinator      # full prepare -> push, no FastAPI
+bin/donutServer.py                              # then, in another shell:
+bin/donutClient.py --token <tok> --visit 2026071300478 --wait 60
 ```
 
 The client prints the boresight, per-stage timings, the result summary, and real Zernikes

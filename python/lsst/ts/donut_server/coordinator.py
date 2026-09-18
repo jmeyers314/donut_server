@@ -24,9 +24,10 @@ from __future__ import annotations
 import os
 
 # Must happen before numpy import: keep BLAS/OpenMP single-threaded so 8
-# fork workers don't each fork with a live thread pool. run_server.sh exports
-# the same vars, which is what makes this order-independent in the real service;
-# this block is the fallback for anything that imports coordinator directly.
+# fork workers don't each fork with a live thread pool. bin.src/donutServer.py
+# sets the same vars before importing anything that pulls numpy, which is what
+# makes this order-independent in the real service; this block is the fallback
+# for anything that imports coordinator directly.
 # Verified at startup by _assert_single_threaded_blas.
 for _var in (
     "OMP_NUM_THREADS",
@@ -587,7 +588,7 @@ def _assert_single_threaded_blas() -> None:
         raise RuntimeError(
             f"thread pools not clamped: {hot}. Something imported numpy before "
             "coordinator, so the thread-limit env vars never bound. Export them "
-            "before starting the process (see run_server.sh)."
+            "before starting the process (see bin.src/donutServer.py)."
         )
 
 

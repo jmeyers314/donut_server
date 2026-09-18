@@ -1,0 +1,18 @@
+# -*- python -*-
+import os
+
+from lsst.sconsUtils import env, scripts
+
+# sconsUtils builds the test environment from an allowlist (state.py's
+# preserveVars), so these do not reach pytest on their own. Without them the
+# data-dependent refcat and codec tests skip rather than fail, and `scons`
+# reports success having never touched a shard.
+for var in (
+    "DONUT_SERVER_CALIB_DIR",
+    "DONUT_SERVER_REFCAT_DIR",
+    "DONUT_SERVER_RAW_DIR",
+):
+    if var in os.environ:
+        env["ENV"][var] = os.environ[var]
+
+scripts.BasicSConscript.tests(pyList=[])

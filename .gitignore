@@ -16,6 +16,10 @@
 .sconsign.dblite
 tests/.tests/
 version.py
+config.log
+.sconf_temp/
+python/*.dist-info/
+.coverage*
 
 __pycache__/
 *.py[cod]

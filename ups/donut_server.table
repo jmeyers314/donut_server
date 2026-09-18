@@ -1,0 +1,20 @@
+# List EUPS dependencies of this package here.
+# - Any package whose API is used directly should be listed explicitly.
+# - Common third-party packages (numpy, astropy, pyarrow, esutil, fastapi,
+#   uvicorn, requests) can be assumed to be recursively included by the
+#   "sconsUtils" package.
+setupRequired(sconsUtils)
+setupRequired(utils)
+setupRequired(afw)
+setupRequired(geom)
+setupRequired(sphgeom)
+setupRequired(daf_butler)
+setupRequired(ip_isr)
+setupRequired(pipe_base)
+setupRequired(meas_algorithms)
+setupRequired(ts_wep)
+
+# The following is boilerplate for all packages.
+# See https://dmtn-001.lsst.io for details on LSST_LIBRARY_PATH.
+envPrepend(PYTHONPATH, ${PRODUCT_DIR}/python)
+envPrepend(PATH, ${PRODUCT_DIR}/bin)
