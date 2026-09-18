@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import io
 
-import server
 from fastapi.testclient import TestClient
-from server import JobRecord, JobState
 
-import logtail
-import table_view
+from lsst.ts.donut_server import logtail
+from lsst.ts.donut_server import server
+from lsst.ts.donut_server import table_view
+from lsst.ts.donut_server.server import JobRecord, JobState
 
 TOKEN = "test-token"
 

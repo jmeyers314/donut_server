@@ -13,7 +13,7 @@ from astropy import units as u
 from astropy.table import Table
 from lsst.daf.butler.formatters.parquet import arrow_to_astropy
 
-import coordinator
+from lsst.ts.donut_server import coordinator
 
 
 @pytest.fixture

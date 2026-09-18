@@ -30,9 +30,9 @@ from typing import Any, Callable, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
-import logtail
-import protocol
-import table_view
+from lsst.ts.donut_server import logtail
+from lsst.ts.donut_server import protocol
+from lsst.ts.donut_server import table_view
 
 MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 
@@ -367,7 +367,7 @@ class Coord:
         # `coordinator` again itself; deferring the import to here rather than
         # module scope only moves when the front-end pays for it, it does not
         # avoid it.
-        import coordinator
+        from lsst.ts.donut_server import coordinator
 
         self._target = coordinator.coordinator_main
         return self._target

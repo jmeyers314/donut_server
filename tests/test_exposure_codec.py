@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pytest
 
-import exposure_codec
+from lsst.ts.donut_server import exposure_codec
 
 RAW_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raw")
 RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*.fits")))

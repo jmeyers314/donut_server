@@ -21,9 +21,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import fake_coordinator
-import protocol
-import server
-from server import Coord, CoordinatorLost, CoordinatorUnavailable, CoordState
+from lsst.ts.donut_server import protocol
+from lsst.ts.donut_server import server
+from lsst.ts.donut_server.server import (
+    Coord,
+    CoordinatorLost,
+    CoordinatorUnavailable,
+    CoordState,
+)
 
 # Small enough that a test never touches the 513 MB production block.
 TEST_SHM_SIZE = 4096

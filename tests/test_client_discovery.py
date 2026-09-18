@@ -1,7 +1,7 @@
 """Exposure selection is pure string logic -- no afw, no I/O, no raw files needed."""
 import pytest
 
-import client
+from lsst.ts.donut_server import client
 
 VISITS = {
     2026060700680: "y",

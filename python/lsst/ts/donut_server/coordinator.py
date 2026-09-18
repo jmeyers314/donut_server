@@ -57,10 +57,10 @@ import lsst.ip.isr as ipIsr
 
 # Imported at module scope, never lazily inside a worker: every one of these
 # must be fully resident before the first fork.
-import protocol
-import exposure_codec
-import logtail
-import refcat_store
+from lsst.ts.donut_server import protocol
+from lsst.ts.donut_server import exposure_codec
+from lsst.ts.donut_server import logtail
+from lsst.ts.donut_server import refcat_store
 from lsst.daf.butler import (
     DataCoordinate,
     DatasetRef,
@@ -700,7 +700,7 @@ if __name__ == "__main__":
     # Standalone smoke test: drives the coordinator through prepare -> push
     # with real raws and no FastAPI involved, to validate fork/CoW mechanics and
     # the butler build in isolation.
-    import client
+    from lsst.ts.donut_server import client
 
     VISIT = 2026071300478  # the r-band exposure
     source = client.resolve_from_files(client.RAW_DIR, VISIT)

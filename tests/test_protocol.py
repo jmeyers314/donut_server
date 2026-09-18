@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-import protocol
+from lsst.ts.donut_server import protocol
 
 
 def test_pack_unpack_round_trip():

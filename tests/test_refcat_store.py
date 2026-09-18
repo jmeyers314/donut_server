@@ -9,7 +9,7 @@ import os
 import numpy as np
 import pytest
 
-import refcat_store
+from lsst.ts.donut_server import refcat_store
 from lsst.meas.algorithms.loadReferenceObjects import getRefFluxField
 from lsst.sphgeom import HtmPixelization, UnitVector3d
 
