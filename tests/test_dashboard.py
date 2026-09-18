@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 
+import pytest
 from fastapi.testclient import TestClient
 
 from lsst.ts.donut_server import logtail
@@ -26,22 +27,87 @@ def auth():
     return {"Authorization": f"Bearer {TOKEN}"}
 
 
-def make_client(monkeypatch, jobs=None):
+def make_client(monkeypatch, jobs=None, peer=None):
+    """A client whose peer is *not* loopback unless asked.
+
+    TestClient's default peer is ("testclient", 50000), which is not an IP address at
+    all, so server._is_loopback rejects it and every test here exercises the remote
+    path -- the one where the token is still required. `peer` opts into the local
+    path, which needs no token.
+    """
     monkeypatch.setenv("DONUT_SERVER_TOKEN", TOKEN)
     monkeypatch.setattr(server, "JOBS", jobs if jobs is not None else {})
-    return TestClient(server.app)
+    return TestClient(server.app, client=peer) if peer else TestClient(server.app)
 
 
-def test_dashboard_page_is_served_without_a_token(monkeypatch):
-    """A wrong DASHBOARD_HTML path fails at request time, not import time, so
-    nothing else would catch a typo or a static/ missing from an install."""
-    client = make_client(monkeypatch)
+def test_the_dashboard_page_is_localhost_only(monkeypatch):
+    """Two failures at once: a wrong DASHBOARD_HTML path fails at request time rather
+    than import time, so nothing else would catch a typo or a static/ missing from an
+    install; and the page must not be served to a remote browser, which would render a
+    dashboard whose every fetch then fails."""
+    client = make_client(monkeypatch, peer=("127.0.0.1", 40000))
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
     # Both state machines must actually be in the page the route serves.
     assert 'id="c-degraded"' in resp.text
     assert 'id="j-COMPUTING"' in resp.text
+    # No credential input survives: a masked field here is captured by password
+    # managers, which is why the token was removed from this page.
+    assert "type=\"password\"" not in resp.text
+
+    # A remote caller is refused outright, with or without a valid token.
+    remote = make_client(monkeypatch, peer=("10.0.0.4", 40000))
+    assert remote.get("/dashboard").status_code == 403
+    assert remote.get("/dashboard", headers=auth()).status_code == 403
+    assert remote.get("/results/j1").status_code == 403
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.5", "::1"])
+def test_a_loopback_caller_needs_no_token(monkeypatch, host):
+    """The point of the change: an operator on the server's own host, or through an
+    ssh tunnel (which reconnects from 127.0.0.1), is authorized by being local.
+
+    Parametrized because the loopback block is all of 127/8 plus ::1, and a string
+    compare against "127.0.0.1" would pass the first case and fail the others.
+    """
+    client = make_client(monkeypatch, {"j1": JobRecord(job_id="j1", state=JobState.DONE)},
+                         peer=(host, 40000))
+
+    resp = client.get("/admin/jobs")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["jobs"][0]["job_id"] == "j1"
+
+    # /health gives a local caller the full detail, not the minimal public body.
+    body = client.get("/health").json()
+    assert {"pid", "in_flight", "last_loss", "jobs"} <= set(body)
+
+
+def test_a_remote_caller_still_needs_the_token(monkeypatch):
+    """The regression that matters most: exempting loopback must not open the producer
+    API, which is reached over the network.
+
+    The X-Forwarded-For case is the whole security argument. uvicorn only honours that
+    header when the immediate peer is already within forwarded_allow_ips (127.0.0.1 by
+    default), so a remote caller cannot use it to promote itself to loopback. Asserted
+    here because nothing else would notice if a future change trusted the header --
+    the result would be an unauthenticated /push open to anyone who can route to it.
+    """
+    client = make_client(monkeypatch, {"j1": JobRecord(job_id="j1", state=JobState.DONE)},
+                         peer=("10.0.0.4", 40000))
+    spoof = {"X-Forwarded-For": "127.0.0.1"}
+
+    for path in ("/admin/jobs", "/status/j1", "/result/j1", "/result/j1/table"):
+        assert client.get(path).status_code == 401, path
+        assert client.get(path, headers=spoof).status_code == 401, path
+
+    assert client.post("/prepare", json={}).status_code == 401
+    assert client.post("/prepare", json={}, headers=spoof).status_code == 401
+    assert client.post("/push/j1", content=b"").status_code == 401
+    assert client.post("/push/j1", content=b"", headers=spoof).status_code == 401
+
+    # And the token still works from a remote peer -- this is not a lockout.
+    assert client.get("/admin/jobs", headers=auth()).status_code == 200
 
 
 def test_admin_jobs_requires_a_token_and_never_returns_parquet(monkeypatch):
@@ -74,7 +140,7 @@ def test_a_wrong_token_401s_the_data_routes_while_health_still_200s(monkeypatch)
     """The asymmetry that made a locked-out dashboard look healthy.
 
     /health deliberately never 401s: a wrong token just downgrades it to the
-    minimal public body (server.py:916). Its status code carries the *coordinator*
+    minimal public body (server.py:985). Its status code carries the *coordinator*
     verdict, never an auth verdict -- so it cannot be used as proof of
     authorization, which is what the page's liveness indicator got wrong.
     """
@@ -331,8 +397,10 @@ def test_results_rows_and_page_reject_the_unviewable(monkeypatch):
     assert failed.status_code == 409
     assert "boom" in failed.text
 
-    # The page itself is the unauthenticated shell, like /dashboard.
-    page = client.get("/results/done")
+    # The page itself is the credential-free shell, like /dashboard: served on
+    # loopback, refused elsewhere (which this client's peer is).
+    local = make_client(monkeypatch, jobs, peer=("127.0.0.1", 40000))
+    page = local.get("/results/done")
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
     assert "/admin/result/" in page.text

@@ -60,11 +60,16 @@ tests skip when unset, so `scons`/`pytest` still pass without the data — check
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 85 tests
+python -m pytest tests/ -q                      # 89 tests
 python -m lsst.ts.donut_server.coordinator      # full prepare -> push, no FastAPI
 bin/donutServer.py                              # then, in another shell:
-bin/donutClient.py --token <tok> --visit 2026071300478 --wait 60
+bin/donutClient.py --visit 2026071300478 --wait 60
 ```
+
+The dashboard is at <http://127.0.0.1:8000/dashboard> and needs no credential: the server exempts
+loopback callers and serves the page to nobody else, so reaching it from another machine means an
+`ssh -L 8000:localhost:8000` tunnel. `DONUT_SERVER_TOKEN` is still what protects `/prepare` and
+`/push` from the network, so a producer on a *different* host does need `--token`.
 
 Acceptance criteria for the r-band exposure — a packaging or refactoring change touches no compute
 path, so any movement here means import order or thread clamping regressed:

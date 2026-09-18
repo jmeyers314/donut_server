@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import glob
+import ipaddress
 import os
 import re
+import socket
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +37,30 @@ def raw_dir() -> str:
             "raw_*.fits, or pass --raw-dir (see README)."
         )
     return d
+
+def host_is_loopback(host: str) -> bool:
+    """Whether --host points at this machine, which needs no token.
+
+    Resolves a name rather than only matching literals, because "localhost" is at
+    least as likely to be typed as "127.0.0.1". Anything unresolvable counts as
+    remote: the wrong answer there is only a token requirement, whereas the wrong
+    answer the other way is a confusing 401 from the server.
+    """
+    name = urllib.parse.urlsplit(host).hostname
+    if not name:
+        return False
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(name, None)
+    except socket.gaierror:
+        return False
+    return bool(infos) and all(
+        ipaddress.ip_address(info[4][0]).is_loopback for info in infos
+    )
+
 
 _RAW_RE = re.compile(r"raw_(\d+)_(\d+)_([a-z]+)\.fits")
 
@@ -223,7 +250,9 @@ def run_once(
     source: RawSource,
     wait: float,
 ) -> None:
-    headers = {"Authorization": f"Bearer {token}"}
+    # Omitted entirely rather than sent empty when there is no token: this client
+    # needs none against a server on the same host, which exempts loopback.
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     print(
         f"exposure -> visit={source.visit} band={source.band} "
@@ -380,8 +409,15 @@ def main() -> None:
 
     if args.once and args.loop:
         parser.error("--once and --loop are mutually exclusive")
-    if not args.token:
-        parser.error("--token is required (or set DONUT_SERVER_TOKEN)")
+    # Only remote runs need one: the server exempts loopback callers, so a client on
+    # the server's own host is already authorized. Checked here rather than left to
+    # the server so a genuinely remote run without a token fails now, with a reason,
+    # instead of as a 401 after the raws have been read.
+    if not args.token and not host_is_loopback(args.host):
+        parser.error(
+            f"--token is required for a remote --host ({args.host}); "
+            "or set DONUT_SERVER_TOKEN"
+        )
     if args.collections and not args.butler:
         parser.error("--collections only applies with --butler")
 

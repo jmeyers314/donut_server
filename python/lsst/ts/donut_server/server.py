@@ -11,6 +11,7 @@ reusable shared-memory block and only the part layout crosses the Pipe.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import itertools
 import math
 import multiprocessing as mp
@@ -710,12 +711,60 @@ app.add_exception_handler(CoordinatorLost, _coordinator_error)
 app.add_exception_handler(CoordinatorUnavailable, _coordinator_error)
 
 
-def check_auth(authorization: str = Header(None)) -> None:
+def _is_loopback(request: Request) -> bool:
+    """Whether the peer is on this machine.
+
+    Safe to trust rather than spoofable. uvicorn rewrites scope["client"] from
+    X-Forwarded-For only when the immediate peer is already within
+    forwarded_allow_ips, which defaults to 127.0.0.1 -- so a remote caller sending
+    that header keeps its own address and stays remote (verified against uvicorn
+    1.6.0). A loopback reverse proxy forwarding a real remote client correctly
+    yields *that* client's address, which then needs a token.
+
+    ipaddress rather than a compare against "127.0.0.1": the loopback block is all
+    of 127/8, and ::1 and ::ffff:127.0.0.1 are the same machine too. A peer that is
+    not an address at all (a unix socket has none) raises, which is not local.
+    """
+    host = request.client.host if request.client else None
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_auth(request: Request, authorization: str = Header(None)) -> None:
+    """Bearer token, except from this machine.
+
+    A caller on loopback is already past the only boundary that matters: the
+    dashboard is reached either on the server box or through an ssh tunnel, and a
+    tunnel terminates here and reconnects to 127.0.0.1, so both are loopback. What
+    this deliberately does not defend against is another user with shell access on
+    this host -- accepted, because such a user can read DONUT_SERVER_TOKEN out of
+    the environment anyway.
+
+    Remote callers are unaffected: the producers pushing pixels to /prepare and
+    /push still need the token.
+    """
+    if _is_loopback(request):
+        return
     token = os.environ.get("DONUT_SERVER_TOKEN")
     if not token:
         raise HTTPException(500, "server missing DONUT_SERVER_TOKEN")
     if authorization != f"Bearer {token}":
         raise HTTPException(401, "unauthorized")
+
+
+def require_local(request: Request) -> None:
+    """Loopback or nothing -- no token fallback, unlike check_auth.
+
+    For the two HTML pages. They hold no data themselves, but serving them to a
+    remote browser would render a dashboard whose every fetch then fails, which
+    reads as a broken page rather than a closed door.
+    """
+    if not _is_loopback(request):
+        raise HTTPException(403, "the dashboard is available from localhost only")
 
 
 def _required_float(body: dict, key: str) -> float:
@@ -918,21 +967,22 @@ def _job_counts() -> dict:
 
 
 @app.get("/health")
-async def health(response: Response, authorization: str = Header(None)):
+async def health(request: Request, response: Response, authorization: str = Header(None)):
     """The status *code* carries the verdict: 200 only when READY, else 503.
 
     Nothing can supervise an endpoint that always returns 200. Auth is optional
-    rather than absent -- a bare probe has no bearer token, so no token gets the
-    verdict plus a minimal body, while a valid token gets the full detail.
+    rather than absent -- a bare remote probe gets the verdict plus a minimal body,
+    while a local caller or a valid token gets the full detail.
     """
     ready = coord.state is CoordState.READY
     response.status_code = 200 if ready else 503
     response.headers["Cache-Control"] = "no-store"
 
     body: dict[str, Any] = {"status": coord.state.value, "ready": ready}
-    token = os.environ.get("DONUT_SERVER_TOKEN")
-    if not token or authorization != f"Bearer {token}":
-        return body
+    if not _is_loopback(request):
+        token = os.environ.get("DONUT_SERVER_TOKEN")
+        if not token or authorization != f"Bearer {token}":
+            return body
 
     body.update(
         {
@@ -980,26 +1030,26 @@ _NO_STORE = {"Cache-Control": "no-store"}
 _ACTIVE_STATES = (JobState.PREPARED, JobState.RECEIVING, JobState.COMPUTING)
 
 
-@app.get("/dashboard", include_in_schema=False)
+@app.get("/dashboard", include_in_schema=False, dependencies=[Depends(require_local)])
 async def dashboard():
-    """The monitoring page. Unauthenticated, because it carries no state.
+    """The monitoring page. Localhost only, and carries no token of its own.
 
-    Every byte the page displays arrives via the authed endpoints below, using a
-    token the operator pastes in. FileResponse rather than reading the file
-    inline, so an edit to the page is picked up without restarting uvicorn --
-    which matters because restarting uvicorn here costs a fresh 15 s coordinator
+    Every byte the page displays arrives via the endpoints below, which exempt
+    loopback for the same reason this route does. FileResponse rather than reading
+    the file inline, so an edit to the page is picked up without restarting uvicorn
+    -- which matters because restarting uvicorn here costs a fresh 15 s coordinator
     bring-up and the whole job history.
     """
     return FileResponse(DASHBOARD_HTML, media_type="text/html")
 
 
-@app.get("/results/{job_id}", include_in_schema=False)
+@app.get("/results/{job_id}", include_in_schema=False, dependencies=[Depends(require_local)])
 async def results_page(job_id: str):
     """The results viewer, opened in a second tab from the dashboard's job table.
 
-    Same shape as /dashboard: an unauthenticated static shell that fetches its rows
-    from the authed endpoint below. `job_id` is not used here -- the page reads it
-    out of its own URL -- and deliberately never reaches the filesystem.
+    Same shape as /dashboard: a static shell, localhost only, that fetches its rows
+    from the endpoint below. `job_id` is not used here -- the page reads it out of
+    its own URL -- and deliberately never reaches the filesystem.
     """
     return FileResponse(RESULTS_HTML, media_type="text/html")
 

@@ -3,10 +3,9 @@
   Wavefront results viewer. Opened in a second tab from the dashboard's job table,
   as /results/<job_id>; the job id is read out of this page's own URL.
 
-  Same rules as dashboard.html, for the same reasons: the token comes from
-  localStorage (shared origin, so pasting it once on the dashboard is enough), and
-  every dynamic string goes in via textContent because the log-panel lesson applies
-  here too -- these strings are pipeline output.
+  Same rules as dashboard.html, for the same reasons: served to localhost only, so it
+  carries no credential, and every dynamic string goes in via textContent because the
+  log-panel lesson applies here too -- these strings are pipeline output.
 
   Two server-side conversions this page depends on, both handled in table_view.py:
   NaN arrives as null (every row of a real result has some), and int64 columns too
@@ -129,8 +128,6 @@
 "use strict";
 
 const el = (id) => document.getElementById(id);
-// The dashboard and this page share an origin, so the token pasted there is here.
-const token = localStorage.getItem("donut_server_token") || "";
 const JOB = decodeURIComponent(location.pathname.replace(/^\/results\//, ""));
 el("jid").textContent = JOB;
 document.title = "results " + JOB.slice(0, 8);
@@ -141,12 +138,10 @@ function banner(msg) {
 }
 
 async function api(path) {
-  const r = await fetch(path, {
-    cache: "no-store",
-    headers: token ? {Authorization: "Bearer " + token} : {},
-  });
-  if (r.status === 401) {
-    banner("401 unauthorized — open /dashboard, paste the token and press save, then reload.");
+  const r = await fetch(path, {cache: "no-store"});
+  if (r.status === 401 || r.status === 403) {
+    banner(r.status + " — the server serves this page to localhost only. Open it on " +
+           "the server host, or forward the port with ssh -L 8000:localhost:8000.");
     return null;
   }
   if (!r.ok) {
@@ -388,10 +383,10 @@ el("limit").onchange = () => { offset = 0; load(); };
 el("prev").onclick = () => { offset = Math.max(0, offset - Number(el("limit").value)); load(); };
 el("next").onclick = () => { offset = offset + Number(el("limit").value); load(); };
 
-// A plain href cannot carry the bearer token, so fetch the bytes and save them.
+// Fetched and saved as a blob rather than a plain href, so the file lands named
+// after its job id instead of "table".
 el("dl").onclick = async () => {
-  const r = await fetch("/result/" + encodeURIComponent(JOB) + "/table",
-                        {headers: token ? {Authorization: "Bearer " + token} : {}});
+  const r = await fetch("/result/" + encodeURIComponent(JOB) + "/table");
   if (!r.ok) { banner("download failed: " + r.status); return; }
   const url = URL.createObjectURL(await r.blob());
   const a = document.createElement("a");
@@ -401,11 +396,7 @@ el("dl").onclick = async () => {
   URL.revokeObjectURL(url);
 };
 
-if (!token) {
-  banner("No token found. Open /dashboard, paste the DONUT_SERVER_TOKEN and press save, then reload this page.");
-} else {
-  load();
-}
+load();
 </script>
 </body>
 </html>

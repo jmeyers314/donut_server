@@ -1,18 +1,19 @@
 <!DOCTYPE html>
 <!--
-  donut_server monitoring dashboard. Served unauthenticated by GET /dashboard; the
-  operator pastes a bearer token which is kept in localStorage and put on every
-  fetch. Self-contained on purpose -- no build step, no CDN, no template engine,
-  because nothing on this page is rendered server-side.
+  donut_server monitoring dashboard, served by GET /dashboard to localhost callers
+  only -- so there is no token here, and no credential of any kind. Self-contained
+  on purpose -- no build step, no CDN, no template engine, because nothing on this
+  page is rendered server-side.
 
   Two rules here are load-bearing rather than stylistic:
 
-  - Every dynamic string goes in via textContent, never innerHTML. The token is in
-    localStorage, and the log panel renders arbitrary bytes emitted by the LSST
-    stack, so one injection point is enough to hand the token over.
+  - Every dynamic string goes in via textContent, never innerHTML. The log panel
+    renders arbitrary bytes emitted by the LSST stack, which is by itself enough to
+    need this.
   - GET /health answers 503 whenever the coordinator is not READY, and the body is
     fully populated in that case. So a non-OK response is normal here and must
-    still be parsed; only 401 means the token is wrong.
+    still be parsed; 401/403 is the separate case of this page having been loaded
+    from somewhere other than localhost.
 -->
 <html lang="en">
 <head>
@@ -37,11 +38,10 @@
   header h1 { font-size: 14px; margin: 0; font-weight: 600; }
   header .host { color: var(--dim); }
   .spacer { flex: 1 1 auto; }
-  input[type=password], input[type=number] {
+  input[type=number] {
     background: var(--bg); color: var(--ink); border: 1px solid var(--line);
-    border-radius: 3px; padding: 4px 6px; font: inherit; width: 22ch;
+    border-radius: 3px; padding: 4px 6px; font: inherit; width: 7ch;
   }
-  input[type=number] { width: 7ch; }
   button {
     background: var(--bg); color: var(--ink); border: 1px solid var(--line);
     border-radius: 3px; padding: 4px 9px; font: inherit; cursor: pointer;
@@ -118,10 +118,6 @@
   <h1>donut_server</h1>
   <span class="host" id="host"></span>
   <span class="spacer"></span>
-  <label for="tok" class="host">token</label>
-  <input type="password" id="tok" placeholder="DONUT_SERVER_TOKEN" autocomplete="off">
-  <button id="tok-save">save</button>
-  <button id="tok-clear">clear</button>
   <span class="chip" id="poll">idle</span>
   <button id="restart">restart coordinator</button>
 </header>
@@ -194,7 +190,7 @@
     <path class="edge" d="M346,44 L394,44" marker-end="url(#ar)"/>
     <path class="edge" d="M534,44 L582,44" marker-end="url(#ar)"/>
     <!-- Only RECEIVING and COMPUTING reach ERROR. A prepare that fails creates the
-         record already in ERROR (server.py:736) -- it is never PREPARED -- so that
+         record already in ERROR (server.py:803) -- it is never PREPARED -- so that
          is an entry edge, and DONE is terminal. -->
     <path class="edge" d="M276,74 L276,98 L360,98" />
     <path class="edge" d="M464,74 L464,98 L360,98" />
@@ -261,44 +257,18 @@
 <script>
 "use strict";
 
-// ---------------------------------------------------------------- token + fetch
+// ----------------------------------------------------------------------- fetch
 
-const TOK_KEY = "donut_server_token";
 const el = (id) => document.getElementById(id);
-let token = localStorage.getItem(TOK_KEY) || "";
-// Declared up here rather than beside the log panel because saveToken resets it,
-// and a `let` read before its declaration is a ReferenceError, not a hoist.
 let logSize = -1;
-el("tok").value = token;
 el("host").textContent = location.host;
 
-function saveToken() {
-  token = el("tok").value.trim();
-  localStorage.setItem(TOK_KEY, token);
-  // Drop the stale verdict and re-poll now, so a corrected token is confirmed or
-  // rejected immediately rather than at the next tick.
-  banner("auth", null);
-  logSize = -1;
-  pollHealth();
-  pollJobs();
-  pollLog(true);
-}
-
-el("tok-save").onclick = saveToken;
-// Enter in the field is what people actually press.
-el("tok").addEventListener("keydown", (e) => { if (e.key === "Enter") saveToken(); });
-el("tok-clear").onclick = () => {
-  token = "";
-  el("tok").value = "";
-  localStorage.removeItem(TOK_KEY);
-  banner("auth", null);
-};
-
 // Keyed rather than a single slot, and only ever cleared by the same key that set
-// it. A shared banner is worse than none: /health accepts a wrong token and 200s
-// with its minimal public body (server.py:916), so it would clear an /admin/jobs
-// 401 a fraction of a second after it appeared, leaving a dashboard that looks
-// healthy while being locked out of every endpoint that carries job data.
+// it. A shared banner is worse than none: /health never refuses a caller, it just
+// downgrades to its minimal public body (server.py:985), so a success there would
+// clear an /admin/jobs denial a fraction of a second after it appeared, leaving a
+// dashboard that looks healthy while being locked out of every endpoint that
+// carries job data.
 const problems = new Map();
 
 function banner(key, msg) {
@@ -309,11 +279,12 @@ function banner(key, msg) {
 }
 
 // /health answers 503 whenever the coordinator is not READY, with a full body, so
-// a non-OK status is normal and still has to be parsed. 401 is a token problem;
-// 500 means the server itself has no DONUT_SERVER_TOKEN set.
+// a non-OK status is normal and still has to be parsed. The auth branches are not
+// dead code even though this page carries no credential: reaching the server from
+// anything but localhost is refused, and that is worth saying rather than showing
+// empty panels.
 async function api(path, opts) {
   const init = Object.assign({cache: "no-store"}, opts || {});
-  init.headers = Object.assign({}, init.headers, token ? {Authorization: "Bearer " + token} : {});
   const key = path.split("?")[0];
   let r;
   try {
@@ -322,15 +293,10 @@ async function api(path, opts) {
     banner(key, "cannot reach " + key + " — is the server up?");
     throw e;
   }
-  if (r.status === 401) {
-    banner("auth", "401 unauthorized on " + key +
-      " — this token does not match the server's DONUT_SERVER_TOKEN. " +
-      "Paste the one run_server.sh printed, then press save.");
-    return null;
-  }
-  if (r.status === 500) {
-    banner("auth", "500 on " + key +
-      " — the server has no DONUT_SERVER_TOKEN set in its environment.");
+  if (r.status === 401 || r.status === 403) {
+    banner("auth", r.status + " on " + key +
+      " — the server only serves this page to localhost. Open it on the server " +
+      "host itself, or forward the port with ssh -L 8000:localhost:8000.");
     return null;
   }
   banner(key, null);
@@ -358,7 +324,7 @@ const fmt = {
   clock: (epoch) => epoch ? new Date(epoch * 1000).toTimeString().slice(0, 8) : "–",
 };
 
-// The comment at server.py:929 calls exitcode the highest-value field in /health;
+// The comment at server.py:997 calls exitcode the highest-value field in /health;
 // don't make the operator look up what -11 means.
 function exitcodeText(code) {
   if (code === null || code === undefined) return "";
@@ -374,8 +340,7 @@ function exitcodeText(code) {
   return known[String(code)] ? code + " (" + known[String(code)] + ")" : String(code);
 }
 
-// textContent everywhere: the token is in localStorage and some of these strings
-// come from the LSST stack.
+// textContent everywhere: some of these strings come from the LSST stack.
 function put(parent, tag, text, cls) {
   const n = document.createElement(tag);
   if (text !== undefined && text !== null) n.textContent = text;
@@ -407,7 +372,7 @@ function renderCoord(h) {
   facts.textContent = "";
   // alive and ready are shown separately on purpose: is_alive() is true both for a
   // child 15 s into importing afw and for one whose fork pool is wedged
-  // (server.py:265). alive + !ready + in_flight>0, sustained, is that wedge.
+  // (server.py:283). alive + !ready + in_flight>0, sustained, is that wedge.
   put(facts, "span", "alive", "chip " + (h.alive ? "on" : "off"));
   put(facts, "span", "ready", "chip " + (h.ready ? "on" : "off"));
   put(facts, "span", h.primed ? "primed" : "unprimed", "chip " + (h.primed ? "on" : "off"));
@@ -501,16 +466,15 @@ function renderJobs(d) {
     const td = put(tr, "td");
     if (j.has_table) {
       // A real href to /results/<id>, so middle-click and cmd-click open a tab the
-      // way they should. Its data fetch carries the token; this navigation needs no
-      // header of its own.
+      // way they should.
       const view = put(td, "a", "view");
       view.href = "/results/" + encodeURIComponent(j.job_id);
       view.target = "_blank";
       view.rel = "noopener";
       view.onclick = (ev) => ev.stopPropagation();
       td.appendChild(document.createTextNode("  "));
-      // Not an href: a browser navigation cannot send Authorization, so linking
-      // straight to /result/<id>/table just 401s. Fetch, then save the blob.
+      // Fetched and saved as a blob rather than a plain href, so the file lands
+      // named after its job id instead of "table".
       const dl = put(td, "a", ".parquet");
       dl.href = "#";
       dl.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); download(j); };
@@ -522,8 +486,7 @@ function renderJobs(d) {
 }
 
 async function download(j) {
-  const r = await fetch(j.table_url,
-                        {headers: token ? {Authorization: "Bearer " + token} : {}});
+  const r = await fetch(j.table_url);
   if (!r.ok) { banner("download", "download failed: " + r.status + " " + j.table_url); return; }
   banner("download", null);
   const url = URL.createObjectURL(await r.blob());
@@ -680,7 +643,7 @@ function visible() { return document.visibilityState === "visible"; }
 
 function loop(fn, everyMs) {
   const tick = async () => {
-    if (visible() && token) {
+    if (visible()) {
       try { await fn(); } catch (e) { /* transport hiccup; next tick retries */ }
     }
     setTimeout(tick, everyMs);
@@ -688,8 +651,9 @@ function loop(fn, everyMs) {
   tick();
 }
 
-// Driven by /admin/jobs, not /health: /health 200s with a wrong token, so keying
-// liveness off it would report "polling" on a dashboard that cannot read a job.
+// Driven by /admin/jobs, not /health: /health answers even a caller it refuses
+// detail to, so keying liveness off it would report "polling" on a dashboard that
+// cannot read a job.
 let lastOk = 0;
 
 async function pollHealth() {
@@ -708,7 +672,6 @@ async function pollJobs() {
 }
 
 async function pollLog(force) {
-  if (!token) return;
   let d;
   if (logMode === "job") {
     if (!current) {
@@ -727,7 +690,6 @@ async function pollLog(force) {
 
 setInterval(() => {
   const chip = el("poll");
-  if (!token) { chip.textContent = "no token"; chip.className = "chip off"; return; }
   if (!visible()) { chip.textContent = "paused"; chip.className = "chip"; return; }
   if (problems.has("auth")) { chip.textContent = "unauthorized"; chip.className = "chip off"; return; }
   const age = (Date.now() - lastOk) / 1000;
@@ -743,7 +705,7 @@ loop(() => { if (el("log-auto").checked) return pollLog(false); }, 2000);
 
 // ------------------------------------------------------------- restart control
 // The only non-read-only control here, and it SIGKILLs the child's process group
-// (server.py:534), so anything COMPUTING dies with it. Two-step, and it says which
+// (server.py:553), so anything COMPUTING dies with it. Two-step, and it says which
 // job it is about to kill.
 
 let armed = null;
@@ -773,10 +735,6 @@ function disarm() {
   armed = null;
   btn.textContent = "restart coordinator";
   btn.classList.remove("armed");
-}
-
-if (!token) {
-  banner("auth", "Paste the DONUT_SERVER_TOKEN printed by run_server.sh, then press save.");
 }
 </script>
 </body>

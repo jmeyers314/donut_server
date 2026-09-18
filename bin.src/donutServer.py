@@ -51,13 +51,16 @@ def main() -> None:
     print(f"Pipeline logs (INFO and above) -> {log}")
     print(f"  tail -f {log}")
 
+    # Still generated even though the dashboard no longer asks for one: the token is
+    # what protects /prepare and /push from the network. Callers on this host are
+    # exempt, so it is only needed by a producer running somewhere else.
     if not os.environ.get("DONUT_SERVER_TOKEN"):
         token = secrets.token_hex(16)
         os.environ["DONUT_SERVER_TOKEN"] = token
         print("DONUT_SERVER_TOKEN not set; generated one for this run:")
         print(f"  {token}")
-        print("Use it from the client, e.g.:")
-        print(f"  donutClient.py --token {token} --visit <visit>")
+        print("Only remote clients need it; on this host nothing does:")
+        print(f"  donutClient.py --host http://{args.host}:{args.port} --token {token} --visit <visit>")
 
     import uvicorn
 

@@ -121,7 +121,7 @@ def job_slice(job_id: str) -> dict:
     }
 
     needle = b"job " + job_id.encode() + _MARKER_SUFFIX
-    # The last occurrence: job ids are uuid4 (server.py:725), so this is
+    # The last occurrence: job ids are uuid4 (server.py:792), so this is
     # unambiguous even across runs appended to the same file.
     i = data.rfind(needle)
     if i < 0:
