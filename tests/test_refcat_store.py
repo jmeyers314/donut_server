@@ -14,13 +14,14 @@ from lsst.meas.algorithms.loadReferenceObjects import getRefFluxField
 from lsst.sphgeom import HtmPixelization, UnitVector3d
 
 # Unset is a skip, not an error: these tests are data-dependent by design, and
-# the directory is the user's to locate. os.environ directly rather than
-# refcat_store.refcat_dir(), which raises when unset.
+# the directories are the user's to locate. os.environ directly rather than
+# refcat_store.refcat_dir() / client.raw_dir(), which raise when unset.
 SHARD_DIR = os.environ.get("DONUT_SERVER_REFCAT_DIR", "")
 SHARD_PATHS = sorted(glob.glob(os.path.join(SHARD_DIR, "*.fits"))) if SHARD_DIR else []
 NO_SHARDS = f"no shards in {SHARD_DIR or '$DONUT_SERVER_REFCAT_DIR (unset)'}"
-RAW_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raw")
-RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*_r.fits")))
+RAW_DIR = os.environ.get("DONUT_SERVER_RAW_DIR", "")
+RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*_r.fits"))) if RAW_DIR else []
+NO_RAWS = f"no raw_*.fits in {RAW_DIR or '$DONUT_SERVER_RAW_DIR (unset)'}"
 
 # The r-band exposure's boresight, and the level-5 shards a FIELD_RADIUS_DEG
 # circle about it covers. Recorded from a measurement, not derived, so that a
@@ -40,7 +41,7 @@ def test_field_radius_reaches_past_the_corner_sensors():
     -- the margin the loader queries drifting away from COVERAGE_MARGIN_PX.
     """
     if not RAW_PATHS:
-        pytest.skip(f"no raw_*.fits in {RAW_DIR}")
+        pytest.skip(NO_RAWS)
 
     import lsst.afw.image as afwImage
     import lsst.geom as geom

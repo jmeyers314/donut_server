@@ -1,6 +1,7 @@
 """Round-trip a real raw through the wire codec.
 
-Skipped when `raw/` is empty, since the raws are large and not in version control.
+Skipped when DONUT_SERVER_RAW_DIR is unset or empty, since the raws are large and
+not in version control.
 """
 import glob
 import os
@@ -10,10 +11,15 @@ import pytest
 
 from lsst.ts.donut_server import exposure_codec
 
-RAW_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raw")
-RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*.fits")))
+# Unset is a skip, not an error: read the variable directly rather than calling
+# client.raw_dir(), which raises.
+RAW_DIR = os.environ.get("DONUT_SERVER_RAW_DIR", "")
+RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*.fits"))) if RAW_DIR else []
 
-pytestmark = pytest.mark.skipif(not RAW_PATHS, reason=f"no raw_*.fits in {RAW_DIR}")
+pytestmark = pytest.mark.skipif(
+    not RAW_PATHS,
+    reason=f"no raw_*.fits in {RAW_DIR or '$DONUT_SERVER_RAW_DIR (unset)'}",
+)
 
 
 @pytest.fixture(scope="module")
