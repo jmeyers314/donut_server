@@ -21,7 +21,19 @@ import requests
 from lsst.ts.donut_server import exposure_codec
 from lsst.ts.donut_server import protocol
 
-RAW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw")
+def raw_dir() -> str:
+    """The raw exposure directory, located by the caller's environment.
+
+    Only the default for --raw-dir, so it is resolved when the CLI is built
+    rather than at import.
+    """
+    d = os.environ.get("DONUT_SERVER_RAW_DIR")
+    if not d:
+        raise RuntimeError(
+            "DONUT_SERVER_RAW_DIR is not set; point it at the directory holding "
+            "raw_*.fits, or pass --raw-dir (see README)."
+        )
+    return d
 
 _RAW_RE = re.compile(r"raw_(\d+)_(\d+)_([a-z]+)\.fits")
 
@@ -336,7 +348,11 @@ def main() -> None:
     parser.add_argument("--host", default="http://127.0.0.1:8000")
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
     parser.add_argument("--calib-selector", default="default")
-    parser.add_argument("--raw-dir", default=RAW_DIR, help="directory of raw_*.fits files")
+    # Defaults to None, not raw_dir(): resolving here would demand
+    # DONUT_SERVER_RAW_DIR even from a --butler run that never reads files.
+    parser.add_argument(
+        "--raw-dir", default=None, help="directory of raw_*.fits files"
+    )
     parser.add_argument(
         "--butler",
         default=None,
@@ -382,7 +398,7 @@ def main() -> None:
         collections = [c.strip() for c in args.collections.split(",") if c.strip()]
         source = resolve_from_butler(butler, args.instrument, collections, args.visit)
     else:
-        source = resolve_from_files(args.raw_dir, args.visit)
+        source = resolve_from_files(args.raw_dir or raw_dir(), args.visit)
 
     if args.loop:
         print(f"looping every {args.interval}s, Ctrl-C to stop")

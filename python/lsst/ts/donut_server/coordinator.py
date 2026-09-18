@@ -81,7 +81,20 @@ _log = logging.getLogger(__name__)
 
 NUM_WORKERS = 8
 
-CALIB_DIR = os.path.join(os.path.dirname(__file__), "calib")
+def calib_dir() -> str:
+    """The calib directory, located by the caller's environment.
+
+    Resolved per call rather than at import so that importing this module needs
+    no data -- test_result_serialization drives the parquet path with a synthetic
+    table and no calibs at all.
+    """
+    d = os.environ.get("DONUT_SERVER_CALIB_DIR")
+    if not d:
+        raise RuntimeError(
+            "DONUT_SERVER_CALIB_DIR is not set; point it at the directory "
+            "holding ptc_*.fits, linearizer_*.fits, flat_*.fits (see README)."
+        )
+    return d
 
 # Per-donut postage stamps: 18.5 + 4.6 + 4.6 MB of the result table's 28 MB.
 # Dropped before the result leaves this process -- the remaining 58 columns,
@@ -205,7 +218,8 @@ def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
     if _CALIB_STORE.get("config_key") == config_key:
         return {"reused": True, "elapsed_s": time.monotonic() - t0}
 
-    detector_ids = _discover_detector_ids(CALIB_DIR)
+    calibs = calib_dir()
+    detector_ids = _discover_detector_ids(calibs)
 
     ptc_by_name: dict = {}
     linearizer_by_name: dict = {}
@@ -217,19 +231,19 @@ def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
         # Band-independent, required. Detector name comes off the calib
         # object itself (._detectorName) -- no separate id->name table needed.
         ptc = ipIsr.PhotonTransferCurveDataset.readFits(
-            os.path.join(CALIB_DIR, f"ptc_{det_id}.fits")
+            os.path.join(calibs, f"ptc_{det_id}.fits")
         )
         name = ptc._detectorName
         ptc_by_name[name] = ptc
         linearizer_by_name[name] = ipIsr.Linearizer.readFits(
-            os.path.join(CALIB_DIR, f"linearizer_{det_id}.fits")
+            os.path.join(calibs, f"linearizer_{det_id}.fits")
         )
         crosstalk_by_name[name] = ipIsr.CrosstalkCalib.readFits(
-            os.path.join(CALIB_DIR, f"crosstalk_{det_id}.fits")
+            os.path.join(calibs, f"crosstalk_{det_id}.fits")
         )
 
         # Band-dependent, required.
-        flat_path = os.path.join(CALIB_DIR, f"flat_{det_id}_{band}.fits")
+        flat_path = os.path.join(calibs, f"flat_{det_id}_{band}.fits")
         if not os.path.exists(flat_path):
             raise RuntimeError(
                 f"Missing required flat calib for detector {name} ({det_id}), "
@@ -239,7 +253,7 @@ def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
 
         # Band-dependent, optional (mirrors the real Butler connection's
         # minimum=0): missing file just means no entry for this detector.
-        iz_path = os.path.join(CALIB_DIR, f"intrinsicZernikes_{det_id}_{band}.fits")
+        iz_path = os.path.join(calibs, f"intrinsicZernikes_{det_id}_{band}.fits")
         if os.path.exists(iz_path):
             intrinsic_zernikes_by_name[name] = ipIsr.IsrCalib.readFits(iz_path)
 
@@ -703,7 +717,7 @@ if __name__ == "__main__":
     from lsst.ts.donut_server import client
 
     VISIT = 2026071300478  # the r-band exposure
-    source = client.resolve_from_files(client.RAW_DIR, VISIT)
+    source = client.resolve_from_files(client.raw_dir(), VISIT)
     band = source.band
     print(
         f"exposure -> visit={source.visit} band={band} "

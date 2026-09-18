@@ -13,7 +13,12 @@ from lsst.ts.donut_server import refcat_store
 from lsst.meas.algorithms.loadReferenceObjects import getRefFluxField
 from lsst.sphgeom import HtmPixelization, UnitVector3d
 
-SHARD_PATHS = sorted(glob.glob(os.path.join(refcat_store.REFCAT_DIR, "*.fits")))
+# Unset is a skip, not an error: these tests are data-dependent by design, and
+# the directory is the user's to locate. os.environ directly rather than
+# refcat_store.refcat_dir(), which raises when unset.
+SHARD_DIR = os.environ.get("DONUT_SERVER_REFCAT_DIR", "")
+SHARD_PATHS = sorted(glob.glob(os.path.join(SHARD_DIR, "*.fits"))) if SHARD_DIR else []
+NO_SHARDS = f"no shards in {SHARD_DIR or '$DONUT_SERVER_REFCAT_DIR (unset)'}"
 RAW_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "raw")
 RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*_r.fits")))
 
@@ -171,7 +176,7 @@ RESHARD_SHARD_ID = 12345
 @pytest.fixture(scope="module")
 def shards():
     if not SHARD_PATHS:
-        pytest.skip(f"no shards in {refcat_store.REFCAT_DIR}")
+        pytest.skip(NO_SHARDS)
     return refcat_store.load_and_reshard([RESHARD_SHARD_ID])
 
 
@@ -183,7 +188,7 @@ def test_children_are_exactly_the_16_of_the_parent(shards):
 def test_no_rows_are_lost(shards):
     from astropy.io import fits
 
-    source = fits.getdata(os.path.join(refcat_store.REFCAT_DIR, f"{RESHARD_SHARD_ID}.fits"))
+    source = fits.getdata(os.path.join(SHARD_DIR, f"{RESHARD_SHARD_ID}.fits"))
     assert sum(len(catalog) for catalog in shards.values()) == len(source)
 
 
@@ -209,7 +214,7 @@ def test_catalogs_carry_a_refcat_format_version(shards):
     assert getFormatVersionFromRefCat(max(shards.values(), key=len)) == 2
 
 
-@pytest.mark.skipif(not SHARD_PATHS, reason=f"no shards in {refcat_store.REFCAT_DIR}")
+@pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
 def test_store_reuses_on_a_repeat_pointing():
     store = refcat_store.RefCatStore()
     first = store.ensure(*BORESIGHT)
@@ -222,7 +227,7 @@ def test_store_reuses_on_a_repeat_pointing():
     assert store.shards is shards
 
 
-@pytest.mark.skipif(not SHARD_PATHS, reason=f"no shards in {refcat_store.REFCAT_DIR}")
+@pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
 def test_store_reports_uncovered_shards():
     store = refcat_store.RefCatStore()
     store.ensure(*BORESIGHT)

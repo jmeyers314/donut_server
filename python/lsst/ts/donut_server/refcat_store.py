@@ -43,9 +43,22 @@ from lsst.daf.butler import DataCoordinate
 from lsst.meas.algorithms.convertReferenceCatalog import addRefCatMetadata
 from lsst.sphgeom import Angle, Circle, ConvexPolygon, HtmPixelization, LonLat, UnitVector3d
 
-REFCAT_DIR = os.path.join(os.path.dirname(__file__), "ref_cat")
-
 SHARD_LEVEL = 5
+
+
+def refcat_dir() -> str:
+    """The level-5 shard directory, located by the caller's environment.
+
+    Resolved per call rather than at import so that importing this module costs
+    nothing and needs no data -- the geometry and schema tests rely on that.
+    """
+    d = os.environ.get("DONUT_SERVER_REFCAT_DIR")
+    if not d:
+        raise RuntimeError(
+            "DONUT_SERVER_REFCAT_DIR is not set; point it at the directory "
+            f"holding the level-{SHARD_LEVEL} <htmid>.fits shards (see README)."
+        )
+    return d
 
 # What we reshard to before handing shards to the loader. Must equal the level in
 # the refCat connection's declared dimensions -- guarded by a test, since a
@@ -195,15 +208,16 @@ def load_and_reshard(shard_ids: list[int]) -> dict[int, Any]:
     It takes degrees, hence the rad2deg -- the stored values are radians.
     """
     indexer = esutil.htm.HTM(LOAD_LEVEL)
+    directory = refcat_dir()
     shards: dict[int, Any] = {}
     for shard_id in shard_ids:
-        path = os.path.join(REFCAT_DIR, f"{shard_id}.fits")
+        path = os.path.join(directory, f"{shard_id}.fits")
         if not os.path.exists(path):
             # The whole sky is covered when the directory is complete, so a miss
             # means the local copy is partial -- say that rather than letting a
             # bare FileNotFoundError imply the pointing was wrong.
             raise RuntimeError(
-                f"{REFCAT_DIR} is incomplete: no shard {shard_id} at {path}. "
+                f"{directory} is incomplete: no shard {shard_id} at {path}. "
                 f"Expected all 8192 level-{SHARD_LEVEL} files, ids 8192..16383."
             )
         record = fits.getdata(path)

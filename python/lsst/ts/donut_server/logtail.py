@@ -40,10 +40,15 @@ def log_path() -> str:
     """Where the coordinator writes, and where the dashboard reads.
 
     `or` rather than a dict default, so an explicitly empty DONUT_SERVER_LOG
-    still falls back rather than resolving to the cwd.
+    still falls back rather than resolving to a bare "donut_server.log".
+
+    The fallback is the cwd, not this file's directory: the module now lives
+    four levels deep inside the package, which is no place to write a log. Both
+    launchers set DONUT_SERVER_LOG explicitly, so this only fires for direct
+    imports and coordinator's own smoke test.
     """
     return os.environ.get("DONUT_SERVER_LOG") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "donut_server.log"
+        os.getcwd(), "donut_server.log"
     )
 
 
