@@ -466,9 +466,15 @@ def _summarize(table) -> dict:
     for name in det_names:
         per_detector[name] = per_detector.get(name, 0) + 1
 
+    # Rows the task never grouped carry group_id "", which is not a group: it
+    # would otherwise show up as one permanently-failed group and drag the
+    # succeeded/total ratio to (n-1)/n on every job.
     groups: dict[Any, bool] = {}
     for group_id, success in zip(table["group_id"], table["group_fit_success"]):
-        groups[str(group_id)] = bool(success)
+        group_id = str(group_id)
+        if not group_id.strip():
+            continue
+        groups[group_id] = bool(success)
 
     return {
         "n_rows": len(table),

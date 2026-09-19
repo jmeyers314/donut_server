@@ -90,7 +90,7 @@
   /* The current job, marked rather than selected: it is chosen by what is in
      flight, not by clicking. */
   tbody tr.sel td { background: #1b2735; }
-  td.num { text-align: right; }
+  td.num, th.num { text-align: right; }
   .s-DONE { color: var(--ok); }
   .s-ERROR { color: var(--bad); }
   .s-COMPUTING, .s-RECEIVING, .s-PREPARED { color: var(--live); }
@@ -196,9 +196,8 @@
     <path class="edge" d="M464,74 L464,98 L360,98" />
     <path class="edge" d="M360,98 L360,112" marker-end="url(#ar)"/>
     <path class="edge" d="M200,135 L300,135" marker-end="url(#ar)"/>
-    <text class="etext" x="112" y="131">prepare failed</text>
-    <text class="etext" x="440" y="130">bad layout · coordinator lost · task raised</text>
-    <text class="etext" x="440" y="146">DONE and ERROR are terminal</text>
+    <text class="etext" x="112" y="136">prepare failed</text>
+    <text class="etext" x="440" y="135">DONE and ERROR are terminal</text>
 
     <g class="node" id="j-PREPARED">
       <rect class="nbox" x="30" y="24" width="128" height="44"/>
