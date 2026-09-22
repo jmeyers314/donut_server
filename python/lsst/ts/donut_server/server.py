@@ -112,6 +112,25 @@ class JobRecord:
 JOBS: dict[str, JobRecord] = {}
 
 
+def _stamp_path(job_id: str) -> Optional[str]:
+    """Where the coordinator's image table for this job would be, or None.
+
+    Reads the environment directly rather than calling coordinator.stamp_dir(),
+    which looks like the obvious reuse but is not available here: importing
+    coordinator pulls the whole LSST stack into the front-end (778 MB, see
+    _resolve_target). The shared contract is the variable, not the function.
+
+    None for unset, not a raise: the coordinator already refuses to prepare a job
+    without this set, so by the time any job exists it is configured. Erroring
+    here would only convert an operator's misconfiguration into a 500 on a job
+    that legitimately has no images.
+    """
+    directory = os.environ.get("DONUT_SERVER_STAMP_DIR")
+    if not directory:
+        return None
+    return os.path.join(directory, f"{job_id}.parquet")
+
+
 def _fail_in_flight_jobs(loss: dict) -> None:
     """Fail every job that was mid-flight when the coordinator died.
 
@@ -935,6 +954,11 @@ async def result(job_id: str, wait: float = 0.0):
         "result": record.result,
         "timings": record.push_timings,
         "table_url": f"/result/{job_id}/table",
+        # Advertised unconditionally rather than gated on the file existing: this
+        # reply is what a client long-polls for, and it can be sent while the
+        # coordinator is still writing the images. The URL is the durable fact;
+        # whether the bytes have landed yet is what GETting it tells you.
+        "images_url": f"/result/{job_id}/images",
     }
 
 
@@ -956,6 +980,34 @@ async def result_table(job_id: str):
         content=record.table_parquet,
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{job_id}.parquet"'},
+    )
+
+
+@app.get("/result/{job_id}/images", dependencies=[Depends(check_auth)])
+async def result_images(job_id: str):
+    """The same table *with* the ~17 MB of per-donut stamps, read off disk.
+
+    The coordinator writes this after it has already answered the push, so a 409
+    here is the ordinary state for a few tens of milliseconds after a job reports
+    DONE -- not an error, just early. Retry rather than treat it as missing.
+
+    Served as an opaque file: this process no more knows what a stamp is than it
+    knows what a Zernike is, which is what keeps astropy and the LSST stack out
+    of it. The write is a tmp-plus-os.replace, so a visible path is a complete
+    file and there is no partial-read window to guard against.
+    """
+    record = JOBS.get(job_id)
+    if record is None:
+        raise HTTPException(404, "unknown job_id")
+    if record.state == JobState.ERROR:
+        raise HTTPException(409, record.error or "job failed")
+    path = _stamp_path(job_id)
+    if path is None or not os.path.exists(path):
+        raise HTTPException(409, f"no images yet for job in state {record.state}")
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=f"{job_id}.parquet",
     )
 
 

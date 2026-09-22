@@ -64,6 +64,12 @@ def host_is_loopback(host: str) -> bool:
 
 _RAW_RE = re.compile(r"raw_(\d+)_(\d+)_([a-z]+)\.fits")
 
+# The server writes the image table after answering the push, so --images can
+# outrun it by a few tens of milliseconds and get a 409. Enough tries to cover a
+# slow disk, few enough to still fail fast if the write actually errored.
+IMAGES_ATTEMPTS = 5
+IMAGES_RETRY_S = 0.5
+
 # physical_filter -> band for the six survey filters this service has calibs for.
 # Read off the raws in `raw/` themselves, whose FilterLabel carries both labels;
 # it is the same set `calib/` holds flat_<det>_<band>.fits for. Anything else is
@@ -249,6 +255,7 @@ def run_once(
     calib_selector: str,
     source: RawSource,
     wait: float,
+    images: bool = False,
 ) -> None:
     # Omitted entirely rather than sent empty when there is no token: this client
     # needs none against a server on the same host, which exempts loopback.
@@ -332,6 +339,36 @@ def run_once(
     print(f"  table -> {len(resp.content)} bytes parquet ({time.monotonic() - t0:.3f}s)")
     print_blitz_table(resp.content, columns)
 
+    if images and result_data.get("images_url"):
+        fetch_images(f"{host}{result_data['images_url']}", headers, job_id)
+
+
+def fetch_images(url: str, headers: dict, job_id: str) -> None:
+    """Save the image-bearing table next to wherever the client was run.
+
+    Retried on 409, which is the expected first answer rather than an error: the
+    server writes this file only after answering the push, so a client that asked
+    for the table and came straight here can easily arrive first. Measured at
+    ~0.1 s of work, so this normally succeeds on the first or second try.
+    """
+    t0 = time.monotonic()
+    for attempt in range(IMAGES_ATTEMPTS):
+        resp = requests.get(url, headers=headers, timeout=120)
+        if resp.status_code != 409:
+            break
+        if attempt == 0:
+            print("  images -> not written yet, waiting")
+        time.sleep(IMAGES_RETRY_S)
+    resp.raise_for_status()
+
+    path = os.path.abspath(f"{job_id}.parquet")
+    with open(path, "wb") as f:
+        f.write(resp.content)
+    print(
+        f"  images -> {len(resp.content) / 1e6:.1f} MB -> {path} "
+        f"({time.monotonic() - t0:.3f}s)"
+    )
+
 
 def print_blitz_table(parquet_bytes: bytes, columns: list) -> None:
     """Deserialize the parquet body back into the astropy Table the task produced."""
@@ -410,6 +447,13 @@ def main() -> None:
     parser.add_argument("--wait", type=float, default=10.0, help="seconds to long-poll /result")
     parser.add_argument("--once", action="store_true", help="single prepare/push/result cycle (default)")
     parser.add_argument("--loop", action="store_true", help="repeat every --interval seconds")
+    parser.add_argument(
+        "--images",
+        action="store_true",
+        help="also fetch the ~17 MB table with the per-donut stamps, saving "
+        "<job_id>.parquet in the current directory. Off by default: it is written "
+        "after the push is answered, so fetching it is never on the latency path.",
+    )
     parser.add_argument("--interval", type=float, default=30.0)
     args = parser.parse_args()
 
@@ -445,7 +489,10 @@ def main() -> None:
         while True:
             t0 = time.monotonic()
             try:
-                run_once(args.host, args.token, args.calib_selector, source, args.wait)
+                run_once(
+                    args.host, args.token, args.calib_selector, source, args.wait,
+                    images=args.images,
+                )
             except requests.HTTPError as exc:
                 # Transient by design: a coordinator restart answers 503 with a
                 # `reason` and Retry-After, and a job whose state has moved on
@@ -456,7 +503,10 @@ def main() -> None:
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, args.interval - elapsed))
     else:
-        run_once(args.host, args.token, args.calib_selector, source, args.wait)
+        run_once(
+            args.host, args.token, args.calib_selector, source, args.wait,
+            images=args.images,
+        )
 
 
 if __name__ == "__main__":

@@ -48,22 +48,49 @@ environment variable, so the data need not live in the checkout:
 | `DONUT_SERVER_CALIB_DIR` | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per band |
 | `DONUT_SERVER_REFCAT_DIR` | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
 
+`DONUT_SERVER_STAMP_DIR` is the one output directory, and it is required too. It needs no data up
+front, only somewhere writable: the coordinator puts one `<job_id>.parquet` there per job, holding
+the full result table including the per-donut stamps.
+
 ```zsh
 export DONUT_SERVER_CALIB_DIR=$PWD/calib
 export DONUT_SERVER_REFCAT_DIR=$PWD/ref_cat
 export DONUT_SERVER_RAW_DIR=$PWD/raw
+export DONUT_SERVER_STAMP_DIR=$PWD/stamps
 ```
 
 Unset is a loud `RuntimeError` naming the variable, not a silent empty result. The data-dependent
 tests skip when unset, so `scons`/`pytest` still pass without the data — check the skip count.
 
+**These files are never pruned, and at a 30 s cadence they arrive at ~2.0 GB/hour** (16.7 MB a job,
+measured on the r-band exposure below — the in-memory columns are ~21 MB and parquet compresses).
+Deleting old
+ones is an operator or cron job; nothing in the service does it. They are also safe to delete at any
+time — the Zernikes a client waits for are served from the front-end's memory and never read back
+off disk, so losing a stamp file costs only the stamps. A stray `.parquet.tmp` is the debris of a
+coordinator killed mid-write and can go too.
+
+### Why the stamps are a separate endpoint
+
+The `/push` reply and `/result/<job_id>/table` carry 59 columns and ~214 KB; the stamps are the other
+three columns and ~21 MB in memory (`stamp` is 167×167 a donut, `wf_img` and `model_img` 83×83).
+Serializing and writing them costs ~0.1 s, which would otherwise land on the path a client is blocked
+on, so the coordinator answers first and writes them in the ~20 s before the next exposure. Two
+consequences worth knowing:
+
+- `GET /result/<job_id>/images` answers **409 for a moment after the job reports DONE**. That is the
+  write still in flight, not a failure — retry. `bin/donutClient.py --images` already does.
+- A write that genuinely fails is logged and otherwise ignored, because by then the client has its
+  Zernikes and a 200. `grep 'deferred image write failed' $DONUT_SERVER_LOG` is how you find out.
+
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 89 tests
+python -m pytest tests/ -q                      # 93 tests
 python -m lsst.ts.donut_server.coordinator      # full prepare -> push, no FastAPI
 bin/donutServer.py                              # then, in another shell:
 bin/donutClient.py --visit 2026071300478 --wait 60
+bin/donutClient.py --visit 2026071300478 --wait 60 --images   # also saves the stamps
 ```
 
 The dashboard is at <http://127.0.0.1:8000/dashboard> and needs no credential: the server exempts
@@ -84,3 +111,7 @@ path, so any movement here means import order or thread clamping regressed:
   shards provided" warning
 - **Measure steady state, not the first job:** the first `runQuantum` in a fresh coordinator costs
   7.5–8.9 s; jobs 2 onward settle at 6.1–6.7 s
+- `coordinator_total_s` must not include the image write. The stamps cost ~0.1 s, spent *after* the
+  reply, so they appear in the log as `wrote .../<job_id>.parquet ... in 0.100s` and nowhere in the
+  push timings — on a clean run the phases sum to within ~0.02 s of `coordinator_total_s`, leaving no
+  room for it. If that time shows up in `push_timings`, the write has drifted onto the critical path.

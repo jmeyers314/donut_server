@@ -97,9 +97,32 @@ def calib_dir() -> str:
         )
     return d
 
-# Per-donut postage stamps: 18.5 + 4.6 + 4.6 MB of the result table's 28 MB.
-# Dropped before the result leaves this process -- the remaining 58 columns,
-# including all the Zernikes, are 247 KB as parquet.
+
+def stamp_dir() -> str:
+    """Where the image-bearing result tables are written.
+
+    Required, and resolved per call, for the same two reasons as calib_dir():
+    an unset data directory is a loud error rather than a silent empty result,
+    and importing this module must need no data.
+
+    Unlike the other three directories this one is an *output*, so the failure
+    it guards against is different: the write happens after the push has already
+    been answered, where a raise reaches nobody. load_calibs_for_prepare calls
+    this so the error surfaces on /prepare instead.
+    """
+    d = os.environ.get("DONUT_SERVER_STAMP_DIR")
+    if not d:
+        raise RuntimeError(
+            "DONUT_SERVER_STAMP_DIR is not set; point it at a writable directory "
+            "for the per-job image tables (~17 MB each, unpruned -- see README)."
+        )
+    return d
+
+# Per-donut postage stamps: ~21 MB of the result table (measured on the r-band
+# exposure, 63 donuts -- stamp is 167x167 each, wf_img and model_img 83x83).
+# Held out of the reply, not discarded: the remaining 59 columns, including all
+# the Zernikes, are ~214 KB as parquet and are what the client waits for. The
+# images are written to stamp_dir() after that reply -- see _DEFERRED.
 IMAGE_COLUMNS = ("stamp", "wf_img", "model_img")
 
 # Nothing here validates the instrument against a real Registry, and the blitz
@@ -124,6 +147,20 @@ _REFCAT_STORE = refcat_store.RefCatStore()
 # in coordinator_main and read in place -- raw pixels never cross the Pipe.
 _SHM: Any = None
 _SHM_VIEW: Any = None
+
+# One job's finished result table, handed from run_job to coordinator_main so the
+# work that does not gate the reply can happen after it. run_job sets this; the
+# loop drains it once the reply is on the wire and clears it unconditionally.
+#
+# This holds the *table*, not serialized bytes, because the deferred work is not
+# only serialization: DonutBlitzPlotTask reads the same catalog (its plot subtask
+# is always constructed, and savePlots defaults to False precisely so plots can
+# be generated later from the in-memory results), and it needs the columns, not a
+# parquet blob. One retained handle serves both.
+#
+# The retention is ~21 MB. The ~900 MB of exposures are still freed inside run_job
+# before it returns, which is what the ~30 s cadence actually requires.
+_DEFERRED: dict[str, Any] = {}
 
 # Band-independent and butler-independent, so these survive calib reloads and
 # are deliberately not inside _CALIB_STORE (which gets cleared on reload).
@@ -177,6 +214,29 @@ def to_parquet(table) -> bytes:
     return buf.getvalue()
 
 
+def write_stamp_table(job_id: str, table) -> str:
+    """Write the image-bearing table to stamp_dir(), atomically. Returns the path.
+
+    Via a temp file plus os.replace, so the visible path only ever names a
+    complete file. The front-end serves it with no completion signal from this
+    process, and nothing here can tell it a write was cut short: /admin/restart
+    SIGKILLs this process, and by then the job is already DONE as far as the
+    front-end and the client are concerned. Hence the rule that existence means
+    completeness. An interrupted write leaves an inert .tmp instead.
+    """
+    # No makedirs here: load_calibs_for_prepare already created the directory, and
+    # a push cannot reach this without a prepare having succeeded first.
+    final = os.path.join(stamp_dir(), f"{job_id}.parquet")
+    tmp = f"{final}.tmp"
+    payload = to_parquet(table)
+    with open(tmp, "wb") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, final)
+    return final
+
+
 @dataclass
 class CalibSet:
     """Real calibrations for prepare's band, keyed by detector name.
@@ -215,6 +275,11 @@ def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
     # Pay the DimensionUniverse + task construction + pyarrow init here, not on push.
     _universe_and_task()
     _warm_up_parquet()
+
+    # Ahead of the reuse guard below, so a repeat prepare still checks it: this is
+    # the only place an unset DONUT_SERVER_STAMP_DIR can be reported to a client.
+    # The write itself happens after the push reply, where a raise reaches nobody.
+    os.makedirs(stamp_dir(), exist_ok=True)
 
     if _CALIB_STORE.get("config_key") == config_key:
         return {"reused": True, "elapsed_s": time.monotonic() - t0}
@@ -538,15 +603,23 @@ def run_job(job_id: str, layout: list) -> dict:
     # Summarize the slimmed table, so `columns` describes exactly what the
     # client receives.
     summary = _summarize(table)
-    summary["dropped_columns"] = list(IMAGE_COLUMNS)
+    summary["deferred_columns"] = list(IMAGE_COLUMNS)
     summary["parquet_bytes"] = len(parquet_bytes)
 
     bundle_timings = bundle.timings
     quantum_info = bundle_timings.pop("quantum")
 
+    # Hand the full table to coordinator_main, which picks it up *after* replying.
+    # Anything done to it here would be on the critical path the client is blocked
+    # on; everything it is needed for can wait ~20 s for the next exposure.
+    _DEFERRED["job_id"] = job_id
+    _DEFERRED["table"] = full_table
+
     # Reclaim this job's cycles now rather than whenever the automatic collector
     # next fires: the ~900 MB of exposures should be gone well before the next
-    # exposure arrives (~30 s cadence).
+    # exposure arrives (~30 s cadence). full_table is deliberately not among them
+    # -- dropping the local name leaves _DEFERRED's ~21 MB reference, which is the
+    # point -- but the exposures and the butler holding them still go now.
     del bundle, full_table, table, exposures
     t0 = time.perf_counter()
     collected = gc.collect()
@@ -638,6 +711,42 @@ def configure_logging() -> str:
     return path
 
 
+def _run_deferred() -> None:
+    """Do the finished job's non-urgent work, then drop the table.
+
+    Called by coordinator_main *after* the push reply is on the wire, so none of
+    this is on the latency path the client sees. It does delay the next command,
+    since the loop is serial and does not return to recv() until this finishes --
+    at ~0.1 s against a ~30 s cadence that is noise, and there is deliberately no
+    command timeout on the front-end to misread it as a hang.
+
+    Every failure is logged and swallowed. Raising is not an option that leads
+    anywhere useful: the client already holds a 200 for this job, and letting the
+    exception escape would kill the coordinator over stamps that nobody is
+    blocked on. An unset output directory is caught at prepare time instead,
+    where it can still reach a client.
+    """
+    table = _DEFERRED.pop("table", None)
+    job_id = _DEFERRED.pop("job_id", None)
+    if table is None:
+        return
+    try:
+        t0 = time.perf_counter()
+        path = write_stamp_table(job_id, table)
+        _log.info(
+            "job %s: wrote %s (%.1f MB) in %.3fs",
+            job_id, path, os.path.getsize(path) / 1e6, time.perf_counter() - t0,
+        )
+    except Exception:
+        # exc_info, because this is the only record that will ever exist of it.
+        _log.exception("job %s: deferred image write failed", job_id)
+    finally:
+        # Explicit, so the ~21 MB goes now rather than on the next job's dict
+        # assignment -- which would otherwise hold two tables at once.
+        del table
+        _DEFERRED.clear()
+
+
 def coordinator_main(conn, shm_name: str) -> None:
     """Serial command loop: recv one command, dispatch, send response, repeat."""
     # Become our own process-group leader so the front-end can os.killpg() this
@@ -708,6 +817,11 @@ def coordinator_main(conn, shm_name: str) -> None:
                     conn.send({"ok": True, "result": result})
                 except Exception as exc:
                     conn.send({"ok": False, "error": str(exc)})
+                # After the reply, deliberately: the client is unblocked by the
+                # send above, so everything here is spent against the ~20 s gap
+                # before the next exposure rather than against the push. Also
+                # runs on the failure path, where _DEFERRED is simply empty.
+                _run_deferred()
             else:
                 conn.send({"ok": False, "error": f"unknown cmd {cmd!r}"})
     finally:
@@ -792,9 +906,21 @@ if __name__ == "__main__":
     else:
         print("error:", resp.get("error"))
 
+    # Deliberately checked after the shutdown round-trip, not after the push
+    # reply: the image write happens between the push reply and the next recv, so
+    # right after the reply is exactly when it is still in flight. The shutdown
+    # reply is the first thing that cannot arrive until the write has finished --
+    # which is also the property the whole design rests on, so seeing the file
+    # missing above and present below is the point, not a quirk of the test.
     parent_conn.send({"cmd": "shutdown"})
     print("shutdown ->", parent_conn.recv())
     proc.join(timeout=5)
+
+    stamps = os.path.join(stamp_dir(), "smoke-1.parquet")
+    if os.path.exists(stamps):
+        print(f"images: {stamps} ({os.path.getsize(stamps) / 1e6:.1f} MB)")
+    else:
+        print(f"images: MISSING at {stamps} -- check the log for the write error")
 
     view.release()
     shm.close()

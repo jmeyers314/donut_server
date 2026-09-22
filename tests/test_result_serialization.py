@@ -5,6 +5,7 @@ multidimensional Zernike columns plus units -- so these run in milliseconds
 without the pipeline.
 """
 import io
+import os
 
 import numpy as np
 import pyarrow.parquet
@@ -65,6 +66,58 @@ def test_summary_is_json_safe(table):
     json.dumps(coordinator._summarize(table))
 
 
-def test_image_columns_are_the_ones_that_get_dropped():
-    # Guards against a rename upstream silently re-admitting 28 MB of stamps.
+def test_image_columns_are_the_ones_held_out_of_the_reply():
+    # Guards against a rename upstream silently re-admitting 28 MB of stamps into
+    # the reply the client is blocked on. They are still written, just later.
     assert coordinator.IMAGE_COLUMNS == ("stamp", "wf_img", "model_img")
+
+
+def test_stamp_table_is_written_atomically_and_keeps_the_images(table, tmp_path, monkeypatch):
+    """The deferred write must leave a complete file with the images intact.
+
+    Atomicity is the load-bearing part: the front-end serves this path with no
+    completion signal from the coordinator, so a visible file has to be a whole
+    one. Asserting no .tmp survives is asserting that contract.
+    """
+    monkeypatch.setenv("DONUT_SERVER_STAMP_DIR", str(tmp_path))
+    table["stamp"] = np.zeros((len(table), 4, 4))
+
+    path = coordinator.write_stamp_table("job-1", table)
+
+    assert os.path.basename(path) == "job-1.parquet"
+    assert os.listdir(tmp_path) == ["job-1.parquet"]
+
+    back = arrow_to_astropy(pyarrow.parquet.read_table(path))
+    assert "stamp" in back.colnames
+    assert back["stamp"].shape == (len(table), 4, 4)
+
+
+def test_stamp_dir_unset_is_a_loud_error(monkeypatch):
+    # The write itself happens after the push has been answered, where a raise
+    # reaches nobody -- so prepare calls this while a client can still be told.
+    monkeypatch.delenv("DONUT_SERVER_STAMP_DIR", raising=False)
+    with pytest.raises(RuntimeError, match="DONUT_SERVER_STAMP_DIR"):
+        coordinator.stamp_dir()
+
+
+def test_deferred_drain_clears_state_even_when_the_write_fails(table, monkeypatch):
+    """A failed write must not stall the loop or strand the table.
+
+    _run_deferred swallows its errors by design: the client already holds a 200
+    for this job, so raising would kill the coordinator over stamps nobody is
+    waiting on. What must not happen is the 28 MB surviving into the next job.
+    """
+    monkeypatch.setenv("DONUT_SERVER_STAMP_DIR", "/nonexistent-root/nope")
+    coordinator._DEFERRED["job_id"] = "job-2"
+    coordinator._DEFERRED["table"] = table
+
+    coordinator._run_deferred()
+
+    assert coordinator._DEFERRED == {}
+
+
+def test_deferred_drain_with_nothing_pending_is_a_noop():
+    # The loop calls this after every push, including the ones that raised before
+    # a table existed.
+    coordinator._DEFERRED.clear()
+    coordinator._run_deferred()
