@@ -375,6 +375,11 @@ function renderCoord(h) {
   put(facts, "span", "alive", "chip " + (h.alive ? "on" : "off"));
   put(facts, "span", "ready", "chip " + (h.ready ? "on" : "off"));
   put(facts, "span", h.primed ? "primed" : "unprimed", "chip " + (h.primed ? "on" : "off"));
+  // Only shown when the cached config may not describe the live child, since the
+  // ordinary case is "current" and a permanent chip for that is just noise.
+  if (h.config && h.config.stale) {
+    put(facts, "span", "config stale", "chip off");
+  }
   const pairs = [
     ["gen", fmt.num(h.generation)], ["spawns", fmt.num(h.spawns)],
     ["attempts", fmt.num(h.restart_attempts)], ["pid", fmt.num(h.pid)],
@@ -384,10 +389,28 @@ function renderCoord(h) {
     const a = h.primed_args;
     pairs.push(["primed", a.band + " / " + a.calib_selector + " / ra " +
                 Number(a.boresight_ra).toFixed(3) + " dec " + Number(a.boresight_dec).toFixed(3)]);
+    // The digest form: a -c entry whole, a -C entry as its name plus a line count.
+    // The bodies are never in /health -- /config has the resulting full config.
+    const ov = a.config_overrides || [];
+    if (ov.length) {
+      pairs.push(["overrides", ov.map(o => o.kind === "value"
+        ? o.field + "=" + o.value
+        : "-C " + o.name + " (" + o.lines + "L)").join("  ")]);
+    }
   }
   for (const [k, v] of pairs) {
     const s = put(facts, "span", k + " ");
     put(s, "b", v);
+  }
+  if (h.config) {
+    // A link rather than inlined text: the dump is ~77 KB. No credential needed,
+    // since this page is loopback-only and /config exempts loopback too.
+    const s = put(facts, "span", "config ");
+    const a = put(s, "a", h.config.sha256 + (h.config.n_overrides
+      ? " (" + h.config.n_overrides + " override" + (h.config.n_overrides === 1 ? "" : "s") + ")"
+      : " (defaults)"));
+    a.href = "/config";
+    a.target = "_blank";
   }
 
   const loss = el("coord-loss");

@@ -302,6 +302,51 @@ def test_last_prepare_is_replayed_after_a_restart():
     asyncio.run(body())
 
 
+def test_config_overrides_are_replayed_verbatim_and_refresh_the_snapshot():
+    """The whole reason overrides ride on /prepare rather than their own endpoint.
+
+    Two things must hold after a restart. The override list -- including the full -C
+    body, which no echo ever carries -- has to be replayed, or the replacement child
+    would silently run defaults while /health still claimed it was primed. And the
+    cached config snapshot has to advance to the new generation, which is the part
+    that was structurally easy to get wrong: _reprime talks to the child through
+    _exchange directly, bypassing send_command, so caching done only there would
+    never run on this path.
+    """
+    prepare = {
+        "cmd": "prepare",
+        "band": "r",
+        "config_overrides": [
+            {"kind": "value", "field": "maxFitScatter", "value": "2.0"},
+            {"kind": "python", "name": "/home/op/tweaks.py", "text": "config.savePlots = True\n"},
+        ],
+    }
+
+    async def body():
+        # Command 1 is the prepare (fine); command 2 crashes the child.
+        async with started(make_coord([None, "crash"])) as coord:
+            await wait_ready(coord)
+            await coord.send_command(dict(prepare))
+            first = coord.config_snapshot
+            assert first is not None and first.generation == 1
+
+            with pytest.raises(CoordinatorLost):
+                await coord.send_command({"cmd": "ping"})
+            await wait_generation(coord, 2)
+
+            # Replayed verbatim: the -C body survives the round trip intact.
+            assert coord.primed_args == prepare
+            # ...and the snapshot now describes the *new* child, so /config does not
+            # report stale for a coordinator that is in fact correctly primed.
+            assert coord.config_snapshot.generation == 2
+            assert coord.config_snapshot.dump != first.dump  # fake keys it on pid
+            # The digest is retained for /health, still without the body.
+            assert coord.config_snapshot.overrides[1]["name"] == "/home/op/tweaks.py"
+            assert "text" not in coord.config_snapshot.overrides[1]
+
+    asyncio.run(body())
+
+
 def test_prepare_is_not_replayed_when_a_prepare_provoked_the_crash():
     """Anti-crash-loop: replaying the command that killed the last child would
     very likely kill this one too."""

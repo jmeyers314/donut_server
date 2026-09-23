@@ -83,14 +83,67 @@ consequences worth knowing:
 - A write that genuinely fails is logged and otherwise ignored, because by then the client has its
   Zernikes and a 200. `grep 'deferred image write failed' $DONUT_SERVER_LOG` is how you find out.
 
+## Config overrides (`-c` / `-C`)
+
+The blitz task's config is not hardcoded: `/prepare` accepts an ordered override list, and the client
+exposes it with `pipetask run`'s own flags and semantics — because it is `pipetask`'s own
+implementation (`lsst.pipe.base.configOverrides.ConfigOverrides`) doing the work.
+
+```zsh
+bin/donutClient.py --visit 2026071300478 -c maxFitScatter=2.0 -c donutSelector.magMax=16
+bin/donutClient.py --visit 2026071300478 -C my_overrides.py          # a pipetask-style config file
+bin/donutClient.py --visit 2026071300478 -C base.py -c savePlots=False   # later wins
+```
+
+`-c` and `-C` interleave and apply in **command-line order**, last write wins. `-C` sends the file's
+*contents*, not its path, so the file need not exist on the server — which is also why it is the
+client that reports an unreadable one. Both are validated during `parse_args`, before any raws are
+read.
+
+Overrides ride on `/prepare` rather than a separate endpoint so they survive a coordinator restart:
+the front-end replays the last successful prepare verbatim, override list included. Consequently
+**a prepare states the config in full** — a bare `/prepare` with no `-c`/`-C` resets to defaults, and
+is how you back out of a bad override set.
+
+Two ways to see what is actually installed:
+
+- `GET /config` — the full `DonutBlitzCornerConfig` as loadable Python (~77 KB), from the last
+  prepare. Cached by the front-end, so it answers even while the coordinator is restarting or
+  degraded; `X-Donut-Stale: 1` says the dump may not describe the child running right now. The
+  dashboard links to it.
+- The `/prepare` reply and `/health` echo a **digest** of the list: `-c` entries whole, `-C` entries
+  as a name plus line count and hash. The bodies are deliberately never echoed — `/health` is polled
+  once a second.
+
+A repeat prepare with an unchanged list reports `task: reused: true` and rebuilds nothing. The task,
+calib and refcat guards are independent, so changing an override does **not** trigger a calib reload.
+
+### Three sharp edges
+
+- **`-C` is arbitrary code execution** in the coordinator, pre-fork, as the service user — `exec` is
+  how pipetask config files work. Note this composes with the loopback exemption below: anyone who
+  can reach 127.0.0.1 can run code here without a token. That is a widening of the existing
+  concession that a shell user on this host is already trusted, from "can spend your CPU" to "can run
+  code", so weigh it before exposing the port.
+- **`-c savePlots=True` writes PNGs into the server's working directory** (two per job, unpruned,
+  named only for the visit) and puts plot time on the push critical path. `DonutBlitzPlotTask` is
+  designed to be run later from the retained in-memory table instead; prefer that.
+- **An override can be rejected.** Anything that perturbs the task's *connection set* (notably
+  `-c doZernikesOutput=True`, which adds a second output this service builds no ref for) is a **400
+  at prepare**, not a mysterious `KeyError` mid-push. Likewise a positive `hangTimeout` at or below
+  `unitTimeout`, which would make the watchdog abort the coordinator on every ordinary job. In both
+  cases the previously good config keeps serving.
+
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 93 tests
+python -m pytest tests/ -q                      # 133 tests
 python -m lsst.ts.donut_server.coordinator      # full prepare -> push, no FastAPI
 bin/donutServer.py                              # then, in another shell:
 bin/donutClient.py --visit 2026071300478 --wait 60
 bin/donutClient.py --visit 2026071300478 --wait 60 --images   # also saves the stamps
+bin/donutClient.py --visit 2026071300478 --wait 60 -c maxFitScatter=2.0
+curl -si localhost:8000/config | head -20       # 200, X-Donut-Stale: 0
 ```
 
 The dashboard is at <http://127.0.0.1:8000/dashboard> and needs no credential: the server exempts
@@ -104,6 +157,9 @@ path, so any movement here means import order or thread clamping regressed:
 - boresight `ra=283.6660 dec=-28.1326`
 - prepare: `n_level5_files: 10`, `n_level7_shards: 160`, `n_rows: 1148693`
   (~0.5–0.7 s cold, ~0.0003 s on a repeat)
+- prepare `task`: `reused: false` and ~0.14 s on the first prepare or any changed override list,
+  `reused: true` and ~0 s on a repeat. `calib` must stay `reused: true` across an override-only
+  change — if it reloads, the two guards have been folded together
 - `n_input_datasets: 208`
 - **63 donut rows** across 8 detectors, 28/29 groups fit
 - `donut_id` values are Gaia source ids (e.g. `6761235373898405888`) — the quickest confirmation the

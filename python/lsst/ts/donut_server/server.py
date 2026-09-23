@@ -11,6 +11,7 @@ reusable shared-memory block and only the part layout crosses the Pipe.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import itertools
 import math
@@ -40,6 +41,17 @@ MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 # The block also holds the header and descriptors, which sit ahead of the
 # payload that MAX_PUSH_BYTES caps.
 SHM_SIZE = MAX_PUSH_BYTES + 1024 * 1024
+
+# Caps on a prepare's -c/-C override list. Bounded rather than trusted because an
+# accepted list is retained in _primed_args, replayed verbatim on every coordinator
+# restart, and echoed (in digest form) from /health, which the dashboard polls at
+# 1 Hz -- so an unbounded body would be a permanent cost, not a one-off one.
+MAX_OVERRIDES = 64
+MAX_OVERRIDE_TEXT_BYTES = 256 * 1024
+MAX_OVERRIDE_TOTAL_BYTES = 1024 * 1024
+
+# "value" is -c field=value; "python" is the contents of a -C file.
+OVERRIDE_KINDS = ("value", "python")
 
 # How long the reader thread sleeps between liveness checks. Both wakeup sources
 # in _await_reply are load-bearing; see its docstring.
@@ -142,6 +154,28 @@ def _fail_in_flight_jobs(loss: dict) -> None:
             was = record.state
             record.state = JobState.ERROR
             record.error = f"coordinator lost during {was.value}: {loss.get('reason')}"
+
+
+@dataclass
+class ConfigSnapshot:
+    """The blitz task's full config as of the last successful prepare.
+
+    Cached here rather than fetched on demand for two reasons. The coordinator's
+    command loop is serial and has no command timeout by design, so a `cmd: "config"`
+    round-trip would queue behind an in-flight 6-9 s push plus its deferred stamp
+    write -- turning a metadata GET into a multi-second block. And a cache still
+    answers while the coordinator is RESTARTING or DEGRADED, which is exactly when an
+    operator most wants to know what was running.
+
+    Current by construction: the config can only change at prepare, and the
+    coordinator returns the dump on every prepare reply including reused ones.
+    """
+
+    dump: str
+    generation: int
+    overrides: list  # digest form; never carries -C bodies
+    at: float
+    sha256: str
 
 
 class CoordState(str, Enum):
@@ -250,6 +284,8 @@ class Coord:
         self._primed_args: Optional[dict] = None
         self._loss_provoked_by: Optional[str] = None
         self._reprime_error: Optional[str] = None
+        # One slot, never per-job: the dump is ~77 KB and must not reach a JobRecord.
+        self._config_snapshot: Optional[ConfigSnapshot] = None
 
     # ---------------------------------------------------------------- accessors
 
@@ -288,6 +324,10 @@ class Coord:
     @property
     def primed_args(self) -> Optional[dict]:
         return self._primed_args
+
+    @property
+    def config_snapshot(self) -> Optional[ConfigSnapshot]:
+        return self._config_snapshot
 
     @property
     def in_flight(self) -> int:
@@ -499,6 +539,29 @@ class Coord:
             self._ready_event.set()
             return
 
+    def _note_prepared(self, command: dict, resp: dict) -> None:
+        """Record what a successful prepare installed on the child.
+
+        Called from both places a prepare can succeed -- send_command and _reprime.
+        That second call site is the reason this is a method rather than two lines
+        inline: _reprime talks to the child via _exchange directly, bypassing
+        send_command entirely, so anything cached only in send_command silently would
+        not be refreshed after a restart. Harmless while _primed_args was the only
+        thing at stake (the replayed dict is identical), but the snapshot carries a
+        generation, and a stale one would misreport which child's config is live.
+        """
+        self._primed_args = dict(command)
+        dump = resp.get("config_dump")
+        if dump is None:
+            return
+        self._config_snapshot = ConfigSnapshot(
+            dump=dump,
+            generation=self._generation,
+            overrides=_digest_overrides(command.get("config_overrides")),
+            at=time.time(),
+            sha256=hashlib.sha256(dump.encode()).hexdigest(),
+        )
+
     async def _reprime(self) -> None:
         """Replay the last successful prepare, so the producer does not have to.
 
@@ -514,7 +577,10 @@ class Coord:
         except CoordinatorUnavailable as exc:
             self._reprime_error = str(exc)
             return
-        if not resp.get("ok"):
+        if resp.get("ok"):
+            # Refreshes the snapshot's generation to this new child.
+            self._note_prepared(args, resp)
+        else:
             # Auto-re-priming is an availability optimization, not a correctness
             # requirement: run_job cross-checks the raws' band against the loaded
             # calibs, and the refcat coverage check is equivalent, so an unprimed
@@ -625,7 +691,7 @@ class Coord:
                 # machine has already moved on. 503 and let the producer decide.
                 raise
             if command.get("cmd") == "prepare" and resp.get("ok"):
-                self._primed_args = dict(command)
+                self._note_prepared(command, resp)
             return resp
 
     async def aclose(self) -> None:
@@ -800,6 +866,117 @@ def _required_float(body: dict, key: str) -> float:
     return float(value)
 
 
+def _parse_overrides(body: dict) -> list:
+    """Validate and normalize `config_overrides`. Returns [] when absent.
+
+    Shape only -- never field names or values. Checking whether `maxFitScatter` is a
+    real field would mean importing DonutBlitzCornerConfig, and with it the whole
+    LSST stack, into this process (see _stamp_path). The coordinator owns that check
+    and reports it as a 400 via its `kind` tag.
+
+    Absent, null and [] are deliberately identical: a prepare states the config in
+    full, so a bare /prepare is how an operator resets a bad override set.
+    """
+    spec = body.get("config_overrides")
+    if spec is None:
+        return []
+    if not isinstance(spec, list):
+        raise HTTPException(400, "config_overrides must be a list")
+    if len(spec) > MAX_OVERRIDES:
+        raise HTTPException(400, f"too many config_overrides (max {MAX_OVERRIDES})")
+
+    total = 0
+    out = []
+    for i, entry in enumerate(spec):
+        if not isinstance(entry, dict):
+            raise HTTPException(400, f"config_overrides[{i}] must be an object")
+        kind = entry.get("kind")
+        if kind not in OVERRIDE_KINDS:
+            # Never ignored: a typo'd kind that silently ran with defaults would be
+            # the worst outcome here, since the job still succeeds.
+            raise HTTPException(
+                400,
+                f"config_overrides[{i}].kind must be one of {list(OVERRIDE_KINDS)}, "
+                f"got {kind!r}",
+            )
+
+        if kind == "value":
+            field, value = entry.get("field"), entry.get("value")
+            if not isinstance(field, str) or not field.strip():
+                raise HTTPException(400, f"config_overrides[{i}].field must be a non-empty string")
+            # Must stay a string end to end: the coordinator relies on that to get
+            # pipetask's command-line parsing rather than YAML's. See apply_overrides.
+            if not isinstance(value, str):
+                raise HTTPException(
+                    400,
+                    f"config_overrides[{i}].value must be a string (got "
+                    f"{type(value).__name__}); send \"2.0\", not 2.0",
+                )
+            total += len(field) + len(value)
+            out.append({"kind": "value", "field": field, "value": value})
+        else:
+            text, name = entry.get("text"), entry.get("name")
+            if not isinstance(text, str):
+                raise HTTPException(400, f"config_overrides[{i}].text must be a string")
+            if name is not None and not isinstance(name, str):
+                raise HTTPException(400, f"config_overrides[{i}].name must be a string")
+            size = len(text.encode())
+            if size > MAX_OVERRIDE_TEXT_BYTES:
+                raise HTTPException(
+                    400,
+                    f"config_overrides[{i}].text is {size} bytes, over the "
+                    f"{MAX_OVERRIDE_TEXT_BYTES} byte limit",
+                )
+            total += size
+            out.append({"kind": "python", "name": name or "<override>", "text": text})
+
+        if total > MAX_OVERRIDE_TOTAL_BYTES:
+            raise HTTPException(
+                400, f"config_overrides total exceeds {MAX_OVERRIDE_TOTAL_BYTES} bytes"
+            )
+    return out
+
+
+def _digest_overrides(spec: Optional[list]) -> list:
+    """Echo-safe projection of an override list: no `-C` bodies.
+
+    /health carries this and is polled once a second, so a 50 KB override file echoed
+    verbatim would be 50 KB/s forever. `value` entries are small and are what an
+    operator reads off a dashboard, so they survive whole; a `python` entry becomes
+    its identity plus a fingerprint, and its body is recoverable from GET /config,
+    whose full config dump says strictly more anyway.
+    """
+    digest = []
+    for entry in spec or ():
+        if entry.get("kind") == "value":
+            digest.append(dict(entry))
+        else:
+            text = entry.get("text") or ""
+            digest.append({
+                "kind": "python",
+                "name": entry.get("name") or "<override>",
+                "lines": text.count("\n") + (0 if text.endswith("\n") or not text else 1),
+                "bytes": len(text.encode()),
+                "sha256": hashlib.sha256(text.encode()).hexdigest()[:12],
+            })
+    return digest
+
+
+def _redact_primed_args(args: Optional[dict]) -> Optional[dict]:
+    """primed_args for display. Everything but the override bodies is passed through.
+
+    A projection rather than a redaction in place: _primed_args itself has to keep
+    the full `-C` text, because that dict is what gets replayed to a fresh
+    coordinator after a restart.
+    """
+    if args is None:
+        return None
+    shown = dict(args)
+    if "config_overrides" in shown:
+        shown["config_overrides"] = _digest_overrides(shown["config_overrides"])
+    return shown
+
+
 @app.post("/prepare", dependencies=[Depends(check_auth)])
 async def prepare(body: dict):
     # The boresight is required: it is what lets the coordinator pre-load
@@ -807,6 +984,7 @@ async def prepare(body: dict):
     # keeping ~450 ms of shard resharding off the push critical path.
     boresight_ra = _required_float(body, "boresight_ra")
     boresight_dec = _required_float(body, "boresight_dec")
+    overrides = _parse_overrides(body)
 
     job_id = str(uuid.uuid4())
     resp = await coord.send_command(
@@ -816,20 +994,29 @@ async def prepare(body: dict):
             "calib_selector": body.get("calib_selector"),
             "boresight_ra": boresight_ra,
             "boresight_dec": boresight_dec,
+            # Sent even when empty, so _primed_args is never ambiguous about whether
+            # a replayed prepare had overrides.
+            "config_overrides": overrides,
         }
     )
     if not resp.get("ok"):
         JOBS[job_id] = JobRecord(job_id=job_id, state=JobState.ERROR, error=resp.get("error"))
-        raise HTTPException(500, resp.get("error", "prepare failed"))
+        # 400 for a bad override, because it will fail identically forever; 500 would
+        # tell a producer's retry logic "server broken, come back". The same
+        # transient-vs-permanent distinction _RETRY_AFTER draws for 503s.
+        status = 400 if resp.get("kind") == "config_override" else 500
+        raise HTTPException(status, resp.get("error", "prepare failed"))
 
     JOBS[job_id] = JobRecord(job_id=job_id, state=JobState.PREPARED, prepare_timings=resp.get("timings"))
     # `generation` lets the producer's own logs attribute a latency spike to a
-    # coordinator restart.
+    # coordinator restart. The override digest is echoed so a --loop producer's own
+    # log records the config each cycle actually ran with.
     return {
         "job_id": job_id,
         "state": JobState.PREPARED,
         "timings": resp.get("timings"),
         "generation": coord.generation,
+        "config_overrides": _digest_overrides(overrides),
     }
 
 
@@ -1011,6 +1198,54 @@ async def result_images(job_id: str):
     )
 
 
+def _config_is_stale(snap: ConfigSnapshot) -> bool:
+    """Whether the cached dump might not describe the coordinator running right now.
+
+    Either the snapshot predates the live child (a restart whose re-prime did not
+    succeed), or the coordinator is currently unprimed.
+    """
+    return snap.generation != coord.generation or coord.primed_args is None
+
+
+@app.get("/config", dependencies=[Depends(check_auth)])
+async def config_dump():
+    """The blitz task's full config, as loadable Python, from the last prepare.
+
+    This is the answer to "what did that job actually run with", and the counterpart
+    to /prepare's `config_overrides`: the overrides say what was *asked for*, this
+    says what the task ended up holding -- every field, including the ~28 defaults
+    nobody overrode.
+
+    Served from the front-end's cache, never by asking the coordinator: the command
+    loop is serial, so a round-trip here would block behind an in-flight push, and a
+    cache still answers when the coordinator is RESTARTING or DEGRADED -- which is
+    when this question gets asked. Staleness is reported rather than hidden.
+    """
+    snap = coord.config_snapshot
+    if snap is None:
+        # 409, not 404 (the route exists) and not 503 (the coordinator may be
+        # perfectly healthy, just unprepared). Same "real, but not yet" semantics as
+        # /result/{job_id}/images.
+        raise HTTPException(
+            409, f"no config yet: coordinator is {coord.state.value} and has not prepared"
+        )
+    # Every header goes on this object: mutating an injected `response: Response` has
+    # no effect once a handler returns a Response of its own.
+    return Response(
+        content=snap.dump,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            # A loadable config file, so a saved copy works with Config.load. That is
+            # also why staleness rides in headers rather than a JSON envelope.
+            "Content-Disposition": 'inline; filename="donutBlitzCornerConfig.py"',
+            "X-Donut-Generation": str(snap.generation),
+            "X-Donut-Config-Sha256": snap.sha256,
+            "X-Donut-Stale": "1" if _config_is_stale(snap) else "0",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 def _job_counts() -> dict:
     counts: dict[str, int] = {}
     for record in JOBS.values():
@@ -1036,11 +1271,24 @@ async def health(request: Request, response: Response, authorization: str = Head
         if not token or authorization != f"Bearer {token}":
             return body
 
+    snap = coord.config_snapshot
     body.update(
         {
             "alive": coord.is_alive(),
             "primed": coord.primed_args is not None,
-            "primed_args": coord.primed_args,
+            # Projected, not raw: primed_args retains full -C bodies so it stays
+            # replayable, and this endpoint is polled once a second.
+            "primed_args": _redact_primed_args(coord.primed_args),
+            # A ~200-byte fingerprint of the config, so the dashboard can show that
+            # one is installed (and whether it is stale) without pulling 77 KB.
+            "config": None if snap is None else {
+                "generation": snap.generation,
+                "stale": _config_is_stale(snap),
+                "bytes": len(snap.dump),
+                "sha256": snap.sha256[:12],
+                "n_overrides": len(snap.overrides),
+                "at": snap.at,
+            },
             "generation": coord.generation,
             "spawns": coord.spawns,
             "restart_attempts": coord.restart_attempts,

@@ -92,8 +92,12 @@ def main(conn, shm_name: str, script=()) -> None:
             else:
                 # `seen` counts commands this *child* has handled, which is how a
                 # test observes whether a prepare was replayed after a restart.
+                # config_dump mirrors the real prepare reply, whose presence is what
+                # populates the front-end's config snapshot; the pid makes it
+                # possible to tell one child's dump from another's.
                 conn.send(
-                    {"ok": True, "cmd": cmd, "echo": command.get("echo"), "seen": seen}
+                    {"ok": True, "cmd": cmd, "echo": command.get("echo"), "seen": seen,
+                     "config_dump": f"# fake config from pid {os.getpid()}\n"}
                 )
     finally:
         shm.close()

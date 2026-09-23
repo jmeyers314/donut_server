@@ -256,6 +256,7 @@ def run_once(
     source: RawSource,
     wait: float,
     images: bool = False,
+    config_overrides: list | None = None,
 ) -> None:
     # Omitted entirely rather than sent empty when there is no token: this client
     # needs none against a server on the same host, which exempts loopback.
@@ -277,6 +278,7 @@ def run_once(
             "calib_selector": calib_selector,
             "boresight_ra": boresight_ra,
             "boresight_dec": boresight_dec,
+            "config_overrides": config_overrides or [],
         },
         headers=headers,
         timeout=60,
@@ -288,6 +290,10 @@ def run_once(
         f"prepare -> job_id={job_id} timings={prepare_data.get('timings')} "
         f"({time.monotonic() - t0:.3f}s)"
     )
+    # Echoed back by the server, so a --loop log records the config each cycle ran
+    # with -- and confirms the overrides were understood as sent.
+    if applied := describe_overrides(prepare_data.get("config_overrides")):
+        print(f"  config: {applied}")
 
     t0 = time.monotonic()
     parts = build_raw_parts(source)
@@ -394,6 +400,72 @@ def print_blitz_table(parquet_bytes: bytes, columns: list) -> None:
         vals = " ".join(f"{float(v):+8.3f}" for v in row[4:12])
         print(f"  donut {i:3d}:      {vals}")
 
+# Matches the server's own cap, so an oversized -C file is reported here, naming the
+# file, rather than as a 400 about an anonymous list entry.
+MAX_OVERRIDE_TEXT_BYTES = 256 * 1024
+
+
+class ConfigOverrideAction(argparse.Action):
+    """Collect `-c field=value` and `-C file` into one ordered list.
+
+    Both options share a `dest`, which is what preserves their relative order on the
+    command line: `-c a=1 -C f.py -c a=2` must end with a=2, and the reverse order
+    must end with whatever f.py says. Two separate lists could not express that, and
+    order is exactly what `pipetask`'s semantics rest on.
+
+    Everything is validated here, inside parse_args, rather than in main(): that puts
+    every failure ahead of reading ~900 MB of raws, and ahead even of the --token
+    check below.
+
+    Field names are deliberately *not* checked -- that needs DonutBlitzCornerConfig,
+    and the server owns it. A typo'd field comes back as a 400 naming it.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        spec = getattr(namespace, self.dest, None) or []
+        if option_string in ("-c", "--config"):
+            field, sep, value = values.partition("=")
+            if not sep or not field.strip():
+                parser.error(
+                    f"{option_string} expects FIELD=VALUE, got {values!r} "
+                    "(e.g. -c maxFitScatter=2.0)"
+                )
+            # Split on the first '=' only, so -c foo='a=b' keeps its value intact.
+            # The value stays a *string* all the way to the task: that is what gets
+            # pipetask's command-line parsing rather than YAML's.
+            spec.append({"kind": "value", "field": field, "value": value})
+        else:
+            try:
+                with open(values, encoding="utf-8") as f:
+                    text = f.read()
+            except OSError as exc:
+                parser.error(f"{option_string} cannot read {values!r}: {exc.strerror}")
+            except UnicodeDecodeError:
+                parser.error(f"{option_string}: {values!r} is not UTF-8 text")
+            size = len(text.encode())
+            if size > MAX_OVERRIDE_TEXT_BYTES:
+                parser.error(
+                    f"{option_string}: {values!r} is {size} bytes, over the "
+                    f"{MAX_OVERRIDE_TEXT_BYTES} byte limit"
+                )
+            # Contents, not the path: the server may be on another host, where this
+            # path means nothing. The absolute path rides along as a label only, so
+            # that a traceback inside the override names the operator's own file.
+            spec.append({"kind": "python", "name": os.path.abspath(values), "text": text})
+        setattr(namespace, self.dest, spec)
+
+
+def describe_overrides(digest: list) -> str:
+    """One-line rendering of the server's echoed override digest."""
+    parts = []
+    for entry in digest or ():
+        if entry.get("kind") == "value":
+            parts.append(f"{entry['field']}={entry['value']}")
+        else:
+            parts.append(f"-C {entry['name']} ({entry.get('lines')}L)")
+    return "  ".join(parts)
+
+
 def report_transient_or_raise(exc: requests.HTTPError) -> None:
     """Print and swallow a 409/503; re-raise anything else."""
     response = exc.response
@@ -455,6 +527,27 @@ def main() -> None:
         "after the push is answered, so fetching it is never on the latency path.",
     )
     parser.add_argument("--interval", type=float, default=30.0)
+    # -c/-C mirror `pipetask run`, including the short flags and the fact that the
+    # two interleave: they share a dest so their command-line order is preserved,
+    # and the last write to a field wins.
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="config_overrides",
+        action=ConfigOverrideAction,
+        metavar="FIELD=VALUE",
+        help="override one DonutBlitzCornerConfig field, e.g. -c maxFitScatter=2.0. "
+        "Repeatable, and may be interleaved with -C; later wins.",
+    )
+    parser.add_argument(
+        "-C",
+        "--config-file",
+        dest="config_overrides",
+        action=ConfigOverrideAction,
+        metavar="FILE",
+        help="apply a config override file (its *contents* are sent, so the file "
+        "need not exist on the server). Repeatable.",
+    )
     args = parser.parse_args()
 
     if args.once and args.loop:
@@ -491,7 +584,7 @@ def main() -> None:
             try:
                 run_once(
                     args.host, args.token, args.calib_selector, source, args.wait,
-                    images=args.images,
+                    images=args.images, config_overrides=args.config_overrides,
                 )
             except requests.HTTPError as exc:
                 # Transient by design: a coordinator restart answers 503 with a
@@ -505,7 +598,7 @@ def main() -> None:
     else:
         run_once(
             args.host, args.token, args.calib_selector, source, args.wait,
-            images=args.images,
+            images=args.images, config_overrides=args.config_overrides,
         )
 
 

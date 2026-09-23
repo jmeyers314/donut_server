@@ -404,3 +404,212 @@ def test_results_rows_and_page_reject_the_unviewable(monkeypatch):
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
     assert "/admin/result/" in page.text
+
+
+# ------------------------------------------------------- config overrides (-c/-C)
+
+# A -C body long enough that finding it echoed anywhere would be unambiguous.
+SECRET_BODY = "config.maxFitScatter = 2.0  # UNIQUE_OVERRIDE_BODY_MARKER\n"
+
+DUMP = "import lsst.ts.wep.blitz.donutBlitzCorner\nconfig.maxFitScatter = 2.0\n"
+
+
+class FakeCoord:
+    """Just enough Coord surface for the config routes: no child, no shared block."""
+
+    def __init__(self, snapshot=None, generation=1, primed_args=None, state=None):
+        self._snapshot = snapshot
+        self.generation = generation
+        self.primed_args = primed_args
+        self.state = state or server.CoordState.READY
+
+    @property
+    def config_snapshot(self):
+        return self._snapshot
+
+    # /health reads these too.
+    def is_alive(self):
+        return True
+
+    spawns = 1
+    restart_attempts = 0
+    child_pid = 4242
+    child_uptime_s = 12.5
+    last_loss = None
+    degraded_reason = None
+    in_flight = 0
+
+
+def make_snapshot(generation=1, overrides=None):
+    import hashlib
+
+    return server.ConfigSnapshot(
+        dump=DUMP,
+        generation=generation,
+        overrides=overrides if overrides is not None else [],
+        at=1_700_000_000.0,
+        sha256=hashlib.sha256(DUMP.encode()).hexdigest(),
+    )
+
+
+def test_config_needs_a_token_and_409s_before_any_prepare(monkeypatch):
+    client = make_client(monkeypatch)
+    monkeypatch.setattr(
+        server, "coord", FakeCoord(snapshot=None, state=server.CoordState.STARTING)
+    )
+
+    assert client.get("/config").status_code == 401
+
+    # 409 rather than 404 or 503: the route is real and the coordinator may be
+    # healthy -- it simply has not prepared yet. The state is named so an operator
+    # can tell "still booting" from "up but never primed".
+    resp = client.get("/config", headers=auth())
+    assert resp.status_code == 409
+    assert "starting" in resp.text
+
+
+def test_config_serves_a_loadable_file_with_a_freshness_verdict(monkeypatch):
+    client = make_client(monkeypatch)
+    snap = make_snapshot(generation=3)
+    monkeypatch.setattr(
+        server, "coord", FakeCoord(snap, generation=3, primed_args={"cmd": "prepare"})
+    )
+
+    resp = client.get("/config", headers=auth())
+
+    assert resp.status_code == 200
+    # text/plain and a .py filename, so a saved copy round-trips through
+    # Config.load -- which is why the staleness verdict is in headers, not the body.
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert resp.headers["content-disposition"].endswith('filename="donutBlitzCornerConfig.py"')
+    assert resp.text == DUMP
+    assert resp.headers["x-donut-stale"] == "0"
+    assert resp.headers["x-donut-generation"] == "3"
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    "coord_kwargs",
+    [
+        # The snapshot predates the live child: a restart whose re-prime never landed.
+        {"generation": 4, "primed_args": {"cmd": "prepare"}},
+        # Or the coordinator is up but no longer primed at all.
+        {"generation": 3, "primed_args": None},
+    ],
+)
+def test_config_flags_a_snapshot_that_may_not_describe_the_live_child(monkeypatch, coord_kwargs):
+    client = make_client(monkeypatch)
+    monkeypatch.setattr(server, "coord", FakeCoord(make_snapshot(generation=3), **coord_kwargs))
+
+    resp = client.get("/config", headers=auth())
+
+    # Still 200 with the bytes: a stale answer is far more useful than none, as long
+    # as it says so.
+    assert resp.status_code == 200
+    assert resp.headers["x-donut-stale"] == "1"
+
+
+def test_config_is_still_served_while_degraded(monkeypatch):
+    """The cache exists precisely for this: DEGRADED is when an operator most wants
+    to know what the dead coordinator was running, and a command round-trip would
+    have nothing to talk to."""
+    client = make_client(monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "coord",
+        FakeCoord(
+            make_snapshot(generation=2),
+            generation=2,
+            primed_args={"cmd": "prepare"},
+            state=server.CoordState.DEGRADED,
+        ),
+    )
+
+    resp = client.get("/config", headers=auth())
+
+    assert resp.status_code == 200
+    assert resp.text == DUMP
+
+
+def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
+    """/health is polled at 1 Hz, so a -C body echoed here would be a permanent
+    bandwidth cost -- and the dump itself is ~77 KB, far too big to inline."""
+    client = make_client(monkeypatch)
+    primed = {
+        "cmd": "prepare",
+        "band": "r",
+        "calib_selector": "default",
+        "boresight_ra": 283.666,
+        "boresight_dec": -28.1326,
+        "config_overrides": [
+            {"kind": "value", "field": "maxFitScatter", "value": "2.0"},
+            {"kind": "python", "name": "/home/op/tweaks.py", "text": SECRET_BODY},
+        ],
+    }
+    snap = make_snapshot(generation=1, overrides=server._digest_overrides(primed["config_overrides"]))
+    monkeypatch.setattr(server, "coord", FakeCoord(snap, generation=1, primed_args=primed))
+
+    resp = client.get("/health", headers=auth())
+    body = resp.json()
+
+    assert "UNIQUE_OVERRIDE_BODY_MARKER" not in resp.text
+    assert body["config"] == {
+        "generation": 1,
+        "stale": False,
+        "bytes": len(DUMP),
+        "sha256": snap.sha256[:12],
+        "n_overrides": 2,
+        "at": 1_700_000_000.0,
+    }
+
+    shown = body["primed_args"]["config_overrides"]
+    # A -c entry survives whole: it is what an operator reads off the dashboard.
+    assert shown[0] == {"kind": "value", "field": "maxFitScatter", "value": "2.0"}
+    # A -C entry keeps its identity and a fingerprint, but not its body.
+    assert shown[1]["name"] == "/home/op/tweaks.py"
+    assert shown[1]["lines"] == 1
+    assert "text" not in shown[1]
+    # The fields the dashboard already renders are untouched by the projection.
+    assert body["primed_args"]["band"] == "r"
+    assert body["primed_args"]["boresight_ra"] == 283.666
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ("not-a-list", "must be a list"),
+        ([{"field": "x", "value": "1"}], "kind must be one of"),
+        ([{"kind": "nope", "field": "x", "value": "1"}], "kind must be one of"),
+        # A number here would silently take applyTo's YAML branch instead of its
+        # command-line branch, changing -c semantics, so it is refused outright.
+        ([{"kind": "value", "field": "maxFitScatter", "value": 2.0}], "must be a string"),
+        ([{"kind": "value", "field": "", "value": "1"}], "non-empty string"),
+        ([{"kind": "python", "name": "f.py"}], "text must be a string"),
+        ([{"kind": "value", "field": "x", "value": "1"}] * 65, "too many"),
+        ([{"kind": "python", "text": "#" * (256 * 1024 + 1)}], "over the"),
+    ],
+)
+def test_prepare_rejects_a_malformed_override_list_without_a_coordinator(
+    monkeypatch, overrides, expected
+):
+    """Shape validation happens before send_command, so none of these can reach the
+    coordinator -- which is what lets these tests run with no child at all."""
+    client = make_client(monkeypatch)
+
+    resp = client.post(
+        "/prepare",
+        json={"band": "r", "boresight_ra": 0.0, "boresight_dec": 0.0,
+              "config_overrides": overrides},
+        headers=auth(),
+    )
+
+    assert resp.status_code == 400
+    assert expected in resp.text
+
+
+def test_absent_and_empty_override_lists_are_the_same_thing():
+    # A bare /prepare is the documented reset for a bad override set, so "omitted"
+    # must not mean something different from "explicitly empty".
+    assert server._parse_overrides({}) == []
+    assert server._parse_overrides({"config_overrides": None}) == []
+    assert server._parse_overrides({"config_overrides": []}) == []

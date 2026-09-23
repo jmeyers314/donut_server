@@ -1,10 +1,12 @@
 """The long-lived engine that runs the real wavefront pipeline.
 
-Holds the module-globals `_CALIB_STORE` and `_REFCAT_STORE`, populated at
-`prepare` time and reused across jobs (each skipped on repeat if its own key --
-band + calib selector, or pointing -- is unchanged). Per job,
-`run_job` rebuilds the raw exposures out of shared memory, hands them to a
-hand-built in-memory Butler, and calls the real
+Holds the module-globals `_CALIB_STORE`, `_REFCAT_STORE` and `_TASK`, populated
+at `prepare` time and reused across jobs (each skipped on repeat if its own key
+-- band + calib selector, pointing, or the `-c`/`-C` config override list -- is
+unchanged). Three independent keys rather than one, because the work each gates
+differs by two orders of magnitude: ~100 FITS reads, a shard reshard, and a task
+rebuild respectively. Per job, `run_job` rebuilds the raw exposures out of shared
+memory, hands them to a hand-built in-memory Butler, and calls the real
 `DonutBlitzCornerTask.runQuantum()`.
 
 The task does its own two-stage forking internally (cutout, then WF fit), sized
@@ -72,6 +74,7 @@ from lsst.daf.butler import (
 from lsst.daf.butler.formatters.parquet import astropy_to_arrow
 from lsst.pipe.base import QuantumContext
 from lsst.pipe.base._quantumContext import ExecutionResources
+from lsst.pipe.base.configOverrides import ConfigOverrides
 from lsst.pipe.base.tests.in_memory_limited_butler import InMemoryLimitedButler
 from lsst.ts.wep.blitz.donutBlitzCorner import (
     DonutBlitzCornerConfig,
@@ -164,8 +167,37 @@ _DEFERRED: dict[str, Any] = {}
 
 # Band-independent and butler-independent, so these survive calib reloads and
 # are deliberately not inside _CALIB_STORE (which gets cleared on reload).
+#
+# The universe is immortal: nothing can invalidate a DimensionUniverse(). The task
+# is not -- it is built from a config that /prepare may override, so it carries its
+# own key and turns over independently of the calibs. That key is deliberately NOT
+# folded into _CALIB_STORE's (band, calib_selector): that one gates ~100 FITS reads
+# costing seconds, this one gates a ~0.14 s rebuild, and folding them would make a
+# single changed override trigger a full calib reload (and a band change rebuild the
+# task for nothing). _REFCAT_STORE is the same pattern.
 _UNIVERSE: Any = None
 _TASK: Any = None
+
+# None means no task has ever been built; () means one was built from an empty
+# override list. The two must stay distinguishable -- `_TASK is None` is the
+# readiness test, and an empty tuple is a perfectly ordinary prepared state.
+_TASK_KEY: tuple | None = None
+
+# config.saveToString() for the task above: ~77 KB, computed once at prepare and
+# served by the front-end's GET /config. Cached rather than recomputed per request
+# because saveToString() temporarily mutates the config's _imports and name (it
+# restores them in a finally), which is only safe on this single-threaded pre-fork
+# path.
+_TASK_DUMP: str = ""
+
+
+class ConfigOverrideError(RuntimeError):
+    """A supplied -c/-C override could not be applied.
+
+    A distinct type so the front-end can answer 400 rather than 500 for operator
+    error. Only `str(exc)` crosses the Pipe, so without this the alternative is
+    sniffing AttributeError / FieldValidationError / SyntaxError text.
+    """
 
 
 class QuantumBundle(NamedTuple):
@@ -179,18 +211,191 @@ class QuantumBundle(NamedTuple):
     timings: dict
 
 
-def _universe_and_task() -> tuple[Any, Any]:
-    """Build (once) the DimensionUniverse and the blitz task instance.
+def override_key(spec: list[dict] | None) -> tuple:
+    """Hashable, order-sensitive identity of an override list.
 
-    Neither needs a Registry or a repo config, and task construction never
-    touches a Butler (its subtasks are config-driven), so both can be made
-    once and reused across jobs.
+    Order matters because `ConfigOverrides.applyTo` applies in insertion order and
+    the last write wins, so the same entries in a different order are a different
+    config. `name` is included because it is compiled into the code object and so
+    changes tracebacks.
+
+    Carries the override text in full rather than a hash: the front-end caps the
+    total size, and a collision would silently serve a task built from a *different*
+    config, which is the one failure here nobody could diagnose.
+
+    None and [] both yield (), so "no overrides" has a single representation.
     """
-    global _UNIVERSE, _TASK
+    entries = []
+    for entry in spec or ():
+        if entry["kind"] == "value":
+            entries.append(("value", entry["field"], entry["value"]))
+        else:
+            entries.append(("python", entry.get("name") or "<override>", entry["text"]))
+    return tuple(entries)
+
+
+def apply_overrides(config, spec: list[dict] | None) -> None:
+    """Apply a -c/-C override list to `config`, in order, pipetask-style.
+
+    This is `pipetask run`'s own mechanism: ConfigOverrides.addValueOverride is `-c`
+    and addPythonOverride is `-C`, and a single applyTo() at the end preserves the
+    relative order of the two kinds.
+
+    A "value" entry's value stays a *string* all the way from the command line to
+    here on purpose: applyTo only runs its expression parser on strings, and that
+    parser is what gives `-c` its command-line semantics (bare words become strings,
+    `[1,2]` becomes a list, `True` becomes a bool). Pre-parsing it to JSON types
+    upstream would take the YAML branch instead and quietly change those semantics.
+
+    A "python" entry is compiled with its client-side filename so a traceback names
+    the operator's file rather than <string>. It is passed as a code object to
+    addPythonOverride, which execs it -- deliberately never addFileOverride, which
+    would resolve a path on *this* host.
+    """
+    overrides = ConfigOverrides()
+    try:
+        for index, entry in enumerate(spec or ()):
+            if entry["kind"] == "value":
+                overrides.addValueOverride(entry["field"], entry["value"])
+            else:
+                name = entry.get("name") or "<override>"
+                overrides.addPythonOverride(compile(entry["text"], name, "exec"))
+        overrides.applyTo(config)
+    except Exception as exc:
+        raise ConfigOverrideError(f"{type(exc).__name__}: {exc}") from exc
+
+
+# What build_quantum_context knows how to wire. An override that perturbs the
+# connection set past these is rejected at prepare rather than allowed to fail on
+# the push path -- see _check_connections.
+WIRED_INPUTS = frozenset(
+    {"raws", "ptc", "linearizer", "crosstalk", "flat", "intrinsicZernikes", "refCat"}
+)
+WIRED_OUTPUTS = frozenset({"cornerResults"})
+
+
+def _check_connections(config) -> None:
+    """Refuse a config whose connection set this coordinator cannot wire.
+
+    build_quantum_context builds exactly one output ref, for `cornerResults`, and a
+    payload for exactly the inputs above. A config that asks for more is not a
+    coordinator bug but it *looks* like one: `-c doZernikesOutput=True` adds a
+    second output, and buildDatasetRefs then raises a bare `KeyError: 'zernikes'`
+    from inside the task -- on the push path, after ~900 MB of raws have already
+    crossed the wire.
+
+    Checked here, at prepare, where the error can still reach a client and name the
+    actual cause. Runs before the task ctor because building the connections is the
+    cheaper half.
+    """
+    conns = config.connections.ConnectionsClass(config=config)
+    inputs = set(conns.inputs) | set(conns.prerequisiteInputs)
+    outputs = set(conns.outputs)
+
+    if extra_out := sorted(outputs - WIRED_OUTPUTS):
+        raise ConfigOverrideError(
+            f"this service cannot wire output connection(s) {extra_out}: it builds a "
+            f"ref only for {sorted(WIRED_OUTPUTS)}, so the task would fail on push "
+            f"with a KeyError. Supporting these needs per-detector output refs in "
+            f"build_quantum_context."
+        )
+    if extra_in := sorted(inputs - WIRED_INPUTS):
+        raise ConfigOverrideError(
+            f"this service cannot supply input connection(s) {extra_in}: no dataset "
+            f"payload is built for them, so the task would fail on push."
+        )
+
+
+def _check_timeouts(config) -> None:
+    """Refuse a hangTimeout that would kill this process mid-job.
+
+    The hang watchdog fires from a side thread inside the coordinator and, having no
+    way to know which unit is late, can only `os._exit(1)` the whole process. A
+    hangTimeout below the per-unit timeout therefore converts every ordinary slow
+    job into a coordinator death -- and the front-end's restart path makes that
+    unrecoverable without operator action: a push-provoked loss is replayed by
+    _reprime (its skip-guard only covers prepare-provoked losses), and a successful
+    hello resets the restart counter, so it never reaches DEGRADED. The result is an
+    indefinite one-kill-per-push loop that looks healthy between pushes.
+
+    Non-positive is deliberately *allowed*: ts_wep treats `timeout <= 0` as
+    "watchdog disabled", which is a legitimate thing to ask for. Only a positive
+    value that undercuts unitTimeout is rejected -- the invariant the field's own
+    docstring states ("Raise it alongside unitTimeout, never below it").
+    """
+    hang = config.hangTimeout
+    unit = config.unitTimeout
+    if hang is not None and hang > 0 and unit is not None and hang <= unit:
+        raise ConfigOverrideError(
+            f"hangTimeout={hang} must exceed unitTimeout={unit} (or be <= 0 to "
+            "disable the watchdog): the watchdog can only abort the whole "
+            "coordinator process, so a hangTimeout under the per-unit timeout "
+            "turns every slow job into a coordinator restart."
+        )
+
+
+def build_task(spec: list[dict] | None) -> tuple[Any, str]:
+    """Build a task from a fresh config plus `spec`. Returns (task, config dump).
+
+    Touches no global, which is the point: applyTo mutates in place and stops at the
+    first failing override, so a rejected override list must not be able to leave a
+    half-mutated config installed. On any raise the caller's previous good task is
+    still the live one.
+
+    No explicit config.validate() -- Task.__init__ already calls it.
+    """
+    config = DonutBlitzCornerConfig()
+    apply_overrides(config, spec)
+    _check_connections(config)
+    _check_timeouts(config)
+    task = DonutBlitzCornerTask(config=config)
+    return task, config.saveToString()
+
+
+def ensure_task(spec: list[dict] | None) -> dict:
+    """Build the task for `spec`, or reuse the existing one. Returns prepare timings.
+
+    The task's own reuse guard, independent of the calib and refcat guards. Same key
+    set on both paths, so a reply's shape does not change between cold and reused.
+    """
+    global _UNIVERSE, _TASK, _TASK_KEY, _TASK_DUMP
+    t0 = time.monotonic()
     if _UNIVERSE is None:
         _UNIVERSE = DimensionUniverse()
-        _TASK = DonutBlitzCornerTask(config=DonutBlitzCornerConfig())
+
+    key = override_key(spec)
+    if _TASK is not None and _TASK_KEY == key:
+        return {"reused": True, "elapsed_s": time.monotonic() - t0, "n_overrides": len(key)}
+
+    # Published only on full success; see build_task.
+    task, dump = build_task(spec)
+    _TASK, _TASK_KEY, _TASK_DUMP = task, key, dump
+    return {"reused": False, "elapsed_s": time.monotonic() - t0, "n_overrides": len(key)}
+
+
+def require_task() -> tuple[Any, Any]:
+    """(universe, task) for the push path. Never builds anything.
+
+    Only prepare may change the task: task construction must happen before the
+    task's own forks, and a push that silently built a default-config task would
+    also be a push that silently ignored the operator's overrides.
+
+    Normally unreachable -- run_job's band cross-check fires first and says more.
+    Reachable in principle after a restart whose re-prime failed, which leaves the
+    coordinator READY but unprimed while the front-end still holds PREPARED jobs
+    that /push accepts. An explicit error rather than an AttributeError on None.
+    """
+    if _TASK is None:
+        raise RuntimeError(
+            "no task configured: /prepare has not run on this coordinator since it "
+            "started (or its last prepare failed)"
+        )
     return _UNIVERSE, _TASK
+
+
+def task_config_dump() -> str:
+    """The live task's full config as loadable Python. Served by GET /config."""
+    return _TASK_DUMP
 
 
 def _warm_up_parquet() -> None:
@@ -272,8 +477,8 @@ def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
     config_key = (band, calib_selector)
     t0 = time.monotonic()
 
-    # Pay the DimensionUniverse + task construction + pyarrow init here, not on push.
-    _universe_and_task()
+    # Pay the pyarrow init here, not on push. The universe and the task are handled
+    # by ensure_task, which the command loop calls ahead of this.
     _warm_up_parquet()
 
     # Ahead of the reuse guard below, so a repeat prepare still checks it: this is
@@ -372,7 +577,7 @@ def build_quantum_context(exposures: dict[str, Any], calib: CalibSet) -> Quantum
     The result is ready to hand straight to
     `DonutBlitzCornerTask.runQuantum()`.
     """
-    universe, task = _universe_and_task()
+    universe, task = require_task()
     conns = task.config.connections.ConnectionsClass(config=task.config)
     input_names = list(conns.inputs) + list(conns.prerequisiteInputs)
     out_name = "cornerResults"
@@ -576,7 +781,7 @@ def run_job(job_id: str, layout: list) -> dict:
     calib = _CALIB_STORE["calib"]
 
     bundle = build_quantum_context(exposures, calib)
-    _, task = _universe_and_task()
+    _, task = require_task()
 
     # The task forks its own cutout and WF-fit pools internally.
     #
@@ -801,6 +1006,10 @@ def coordinator_main(conn, shm_name: str) -> None:
             elif cmd == "prepare":
                 try:
                     timings = {
+                        # First, deliberately: it is the cheapest of the three and
+                        # the only one an operator can get wrong, so a malformed
+                        # override does not first pay a ~100-FITS calib reload.
+                        "task": ensure_task(command.get("config_overrides")),
                         "calib": load_calibs_for_prepare(
                             command["band"], command["calib_selector"]
                         ),
@@ -808,9 +1017,24 @@ def coordinator_main(conn, shm_name: str) -> None:
                             command["boresight_ra"], command["boresight_dec"]
                         ),
                     }
-                    conn.send({"ok": True, "timings": timings})
+                    # config_dump sits beside `timings`, never inside it: the
+                    # front-end stores timings on every JobRecord and returns them
+                    # 50 rows at a time from /admin/jobs at 1 Hz, where ~77 KB a row
+                    # would be catastrophic. Sent on the reused path too, so a
+                    # re-prime that hit the guard still refreshes the cache.
+                    conn.send({
+                        "ok": True,
+                        "timings": timings,
+                        "config_dump": task_config_dump(),
+                    })
                 except Exception as exc:
-                    conn.send({"ok": False, "error": str(exc)})
+                    # Tagged so the front-end can answer 400 for operator error and
+                    # 500 for everything else; only str(exc) crosses this Pipe.
+                    conn.send({
+                        "ok": False,
+                        "error": str(exc),
+                        "kind": "config_override" if isinstance(exc, ConfigOverrideError) else None,
+                    })
             elif cmd == "push":
                 try:
                     result = run_job(command["job_id"], command["layout"])
@@ -878,8 +1102,12 @@ if __name__ == "__main__":
         "calib_selector": "default",
         "boresight_ra": boresight_ra,
         "boresight_dec": boresight_dec,
+        "config_overrides": [],
     })
-    print("prepare ->", parent_conn.recv())
+    prepare_resp = parent_conn.recv()
+    # The config dump is ~77 KB, so report its size rather than printing it.
+    dump = prepare_resp.pop("config_dump", "")
+    print("prepare ->", prepare_resp, f"config_dump={len(dump)} bytes")
 
     t0 = time.monotonic()
     parent_conn.send({"cmd": "push", "job_id": "smoke-1", "layout": layout})
