@@ -40,7 +40,6 @@ for _var in (
 ):
     os.environ.setdefault(_var, "1")
 
-import ctypes
 import gc
 import glob
 import io
@@ -54,6 +53,7 @@ from multiprocessing import shared_memory
 from typing import Any, NamedTuple
 
 import pyarrow.parquet
+import threadpoolctl
 
 import lsst.afw.image as afwImage
 import lsst.ip.isr as ipIsr
@@ -856,17 +856,19 @@ def _assert_single_threaded_blas() -> None:
     OpenBLAS built with USE_OPENMP, and forking with live OpenMP threads is
     undefined behaviour -- so fail at startup rather than fork into it.
 
-    Both symbols are resolvable via the global handle because libopenblas and
-    libomp are already loaded by this module's own imports.
+    Uses threadpoolctl rather than ctypes.CDLL(None) to read the thread counts:
+    on Linux the loader opens libopenblas/libomp RTLD_LOCAL, so their symbols
+    aren't visible through a global handle even though the libraries are
+    loaded (confirmed: openblas_get_num_threads is exported by
+    libopenblasp*.so but unreachable via CDLL(None), raising
+    `undefined symbol`). macOS's flat namespace masked this. threadpoolctl
+    resolves each library's own path and dlopen()s it directly, so it works on
+    both platforms.
     """
-    lib = ctypes.CDLL(None)
     hot = {
-        name: n
-        for name, n in (
-            ("OpenBLAS", lib.openblas_get_num_threads()),
-            ("OpenMP", lib.omp_get_max_threads()),
-        )
-        if n != 1
+        info["prefix"]: info["num_threads"]
+        for info in threadpoolctl.threadpool_info()
+        if info["num_threads"] != 1
     }
     if hot:
         raise RuntimeError(
