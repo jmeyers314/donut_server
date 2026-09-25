@@ -591,6 +591,14 @@ class Coord:
 
     def _note_loss(self, exc: Exception, provoked_by: Optional[str] = None) -> None:
         proc = self._proc
+        # proc.exitcode is populated by waitpid, which only happens inside
+        # join()/is_alive(). A pipe-EOF loss reaches here without ever having
+        # called either, so exitcode can still read as the pre-reap None even
+        # though the child has already exited (EOF on the pipe implies the
+        # child is gone or about to be). Short timeout: the process is already
+        # dead or dying, so this should return almost immediately.
+        if proc is not None:
+            proc.join(timeout=1.0)
         self._last_loss = {
             "reason": str(exc),
             "exitcode": proc.exitcode if proc is not None else None,
