@@ -1021,23 +1021,27 @@ async def prepare(body: dict):
 
 
 @app.post("/push/{job_id}", dependencies=[Depends(check_auth)])
-async def push(job_id: str, request: Request):
+async def push(job_id: str, request: Request, num_workers: int | None = None):
     record = JOBS.get(job_id)
     if record is None:
         raise HTTPException(404, "unknown job_id")
     if record.state != JobState.PREPARED:
         raise HTTPException(409, f"job in state {record.state}, expected PREPARED")
+    if num_workers is not None and num_workers < 1:
+        raise HTTPException(400, "num_workers must be >= 1")
 
     async with coord.push_lock:
         view = memoryview(coord.shm.buf)
         try:
-            return await _receive_and_dispatch(job_id, record, request, view)
+            return await _receive_and_dispatch(job_id, record, request, view, num_workers)
         finally:
             # Must be released before Coord.stop() can close the block.
             view.release()
 
 
-async def _receive_and_dispatch(job_id, record, request: Request, view: memoryview) -> dict:
+async def _receive_and_dispatch(
+    job_id, record, request: Request, view: memoryview, num_workers: int | None = None
+) -> dict:
     """Stream the body into `view`, then hand the coordinator just the layout."""
     body_iter = request.stream()
     received = 0
@@ -1082,7 +1086,9 @@ async def _receive_and_dispatch(job_id, record, request: Request, view: memoryvi
     record.state = JobState.COMPUTING
     # Only the layout crosses the Pipe; the pixels stay in shared memory.
     try:
-        resp = await coord.send_command({"cmd": "push", "job_id": job_id, "layout": layout})
+        resp = await coord.send_command(
+            {"cmd": "push", "job_id": job_id, "layout": layout, "num_workers": num_workers}
+        )
     except (CoordinatorLost, CoordinatorUnavailable) as exc:
         # Record the failure before the 503 goes out, so /status and /result agree
         # with what the client just saw rather than stranding this job in COMPUTING.

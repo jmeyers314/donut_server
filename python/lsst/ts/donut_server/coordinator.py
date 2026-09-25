@@ -569,7 +569,9 @@ def reconstruct_exposures(layout: list) -> dict[str, Any]:
             sub_view.release()
 
 
-def build_quantum_context(exposures: dict[str, Any], calib: CalibSet) -> QuantumBundle:
+def build_quantum_context(
+    exposures: dict[str, Any], calib: CalibSet, num_workers: int | None = None
+) -> QuantumBundle:
     """Build the InMemoryLimitedButler / Quantum / in+out refs for one exposure.
 
     No Registry, SQLite or obs_lsst camera package is involved: the dimension
@@ -702,7 +704,7 @@ def build_quantum_context(exposures: dict[str, Any], calib: CalibSet) -> Quantum
     refs_s = time.perf_counter() - t0
 
     butler_qc = QuantumContext(
-        butler, quantum, resources=ExecutionResources(num_cores=NUM_WORKERS)
+        butler, quantum, resources=ExecutionResources(num_cores=num_workers or NUM_WORKERS)
     )
 
     timings = {
@@ -756,7 +758,7 @@ def _summarize(table) -> dict:
     }
 
 
-def run_job(job_id: str, layout: list) -> dict:
+def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     """Rebuild the raws, build the butler, run the real task."""
     t_total = time.perf_counter()
     # The only delimiter between one job's log lines and the next's, since the
@@ -780,7 +782,7 @@ def run_job(job_id: str, layout: list) -> dict:
         )
     calib = _CALIB_STORE["calib"]
 
-    bundle = build_quantum_context(exposures, calib)
+    bundle = build_quantum_context(exposures, calib, num_workers)
     _, task = require_task()
 
     # The task forks its own cutout and WF-fit pools internally.
@@ -1039,7 +1041,9 @@ def coordinator_main(conn, shm_name: str) -> None:
                     })
             elif cmd == "push":
                 try:
-                    result = run_job(command["job_id"], command["layout"])
+                    result = run_job(
+                        command["job_id"], command["layout"], command.get("num_workers")
+                    )
                     conn.send({"ok": True, "result": result})
                 except Exception as exc:
                     conn.send({"ok": False, "error": str(exc)})

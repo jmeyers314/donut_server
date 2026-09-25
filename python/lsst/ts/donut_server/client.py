@@ -257,6 +257,7 @@ def run_once(
     wait: float,
     images: bool = False,
     config_overrides: list | None = None,
+    num_workers: int | None = None,
 ) -> None:
     # Omitted entirely rather than sent empty when there is no token: this client
     # needs none against a server on the same host, which exempts loopback.
@@ -307,6 +308,7 @@ def run_once(
     resp = requests.post(
         f"{host}/push/{job_id}",
         data=blob,
+        params={"num_workers": num_workers} if num_workers is not None else None,
         headers={**headers, "Content-Type": "application/octet-stream"},
         timeout=300,
     )
@@ -498,11 +500,13 @@ def main() -> None:
         "--raw-dir", default=None, help="directory of raw_*.fits files"
     )
     parser.add_argument(
+        "-b",
         "--butler",
         default=None,
         help="butler repo (path or URI) to read raws from instead of --raw-dir",
     )
     parser.add_argument(
+        "-i",
         "--collections",
         default="LSSTCam/defaults",
         help="comma-separated collections to search for raw; required with --butler",
@@ -527,6 +531,13 @@ def main() -> None:
         "after the push is answered, so fetching it is never on the latency path.",
     )
     parser.add_argument("--interval", type=float, default=30.0)
+    parser.add_argument(
+        "-n",
+        "--num-workers",
+        type=int,
+        default=8,
+        help="cores the coordinator forks for this push",
+    )
     # -c/-C mirror `pipetask run`, including the short flags and the fact that the
     # two interleave: they share a dest so their command-line order is preserved,
     # and the last write to a field wins.
@@ -552,6 +563,8 @@ def main() -> None:
 
     if args.once and args.loop:
         parser.error("--once and --loop are mutually exclusive")
+    if args.num_workers is not None and args.num_workers < 1:
+        parser.error("-n/--num-workers must be >= 1")
     # Only remote runs need one: the server exempts loopback callers, so a client on
     # the server's own host is already authorized. Checked here rather than left to
     # the server so a genuinely remote run without a token fails now, with a reason,
@@ -585,6 +598,7 @@ def main() -> None:
                 run_once(
                     args.host, args.token, args.calib_selector, source, args.wait,
                     images=args.images, config_overrides=args.config_overrides,
+                    num_workers=args.num_workers,
                 )
             except requests.HTTPError as exc:
                 # Transient by design: a coordinator restart answers 503 with a
@@ -599,6 +613,7 @@ def main() -> None:
         run_once(
             args.host, args.token, args.calib_selector, source, args.wait,
             images=args.images, config_overrides=args.config_overrides,
+            num_workers=args.num_workers,
         )
 
 
