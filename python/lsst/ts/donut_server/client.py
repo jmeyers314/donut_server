@@ -252,7 +252,6 @@ def build_raw_parts(source: RawSource) -> dict[str, bytes]:
 def run_once(
     host: str,
     token: str,
-    calib_selector: str,
     source: RawSource,
     wait: float,
     images: bool = False,
@@ -276,7 +275,6 @@ def run_once(
         f"{host}/prepare",
         json={
             "band": source.band,
-            "calib_selector": calib_selector,
             "boresight_ra": boresight_ra,
             "boresight_dec": boresight_dec,
             "config_overrides": config_overrides or [],
@@ -493,7 +491,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Mock producer for the WF estimation service")
     parser.add_argument("--host", default="http://127.0.0.1:8000")
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
-    parser.add_argument("--calib-selector", default="default")
     # Defaults to None, not raw_dir(): resolving here would demand
     # DONUT_SERVER_RAW_DIR even from a --butler run that never reads files.
     parser.add_argument(
@@ -596,7 +593,7 @@ def main() -> None:
             t0 = time.monotonic()
             try:
                 run_once(
-                    args.host, args.token, args.calib_selector, source, args.wait,
+                    args.host, args.token, source, args.wait,
                     images=args.images, config_overrides=args.config_overrides,
                     num_workers=args.num_workers,
                 )
@@ -611,7 +608,7 @@ def main() -> None:
             time.sleep(max(0.0, args.interval - elapsed))
     else:
         run_once(
-            args.host, args.token, args.calib_selector, source, args.wait,
+            args.host, args.token, source, args.wait,
             images=args.images, config_overrides=args.config_overrides,
             num_workers=args.num_workers,
         )

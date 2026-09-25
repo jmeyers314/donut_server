@@ -1004,7 +1004,6 @@ async def prepare(body: dict):
         {
             "cmd": "prepare",
             "band": body.get("band"),
-            "calib_selector": body.get("calib_selector"),
             "boresight_ra": boresight_ra,
             "boresight_dec": boresight_dec,
             # Sent even when empty, so _primed_args is never ambiguous about whether

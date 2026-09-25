@@ -27,7 +27,6 @@ BANDS = ("r", "g", "i", "u")
 def prepare_command(band: str) -> dict:
     return {
         "band": band,
-        "calib_selector": "default",
         "boresight_ra": BORESIGHT[0],
         "boresight_dec": BORESIGHT[1],
         "config_overrides": [],
@@ -51,7 +50,7 @@ def test_a_cold_prepare_builds_and_activates_an_entry():
     assert prepared["timings"]["task"]["reused"] is False
     assert prepared["timings"]["calib"]["reused"] is False
     assert coordinator._ACTIVE_KEY == prepared["key"]
-    assert coordinator._CALIB_STORE["calib"].config_key == ("r", "default")
+    assert coordinator._CALIB_STORE["calib"].band == "r"
 
 
 def test_repeating_the_same_prepare_hits_every_reuse_guard():
@@ -75,7 +74,7 @@ def test_prepare_b_then_push_a_reloads_a_rather_than_running_under_b():
     coordinator.ensure_prepared_for_push(a["key"])
 
     assert coordinator._ACTIVE_KEY == a["key"]
-    assert coordinator._CALIB_STORE["calib"].config_key == ("r", "default")
+    assert coordinator._CALIB_STORE["calib"].band == "r"
 
 
 def test_push_after_eviction_reloads_from_the_original_prepare_command():
@@ -92,7 +91,7 @@ def test_push_after_eviction_reloads_from_the_original_prepare_command():
 
     assert a["key"] in coordinator._PREPARED_CACHE
     assert coordinator._ACTIVE_KEY == a["key"]
-    assert coordinator._CALIB_STORE["calib"].config_key == ("r", "default")
+    assert coordinator._CALIB_STORE["calib"].band == "r"
 
 
 def test_cap_evicts_least_recently_touched_first(monkeypatch):
@@ -119,6 +118,6 @@ def test_a_push_touch_protects_an_entry_from_eviction(monkeypatch):
 
 
 def test_push_for_a_key_never_prepared_is_a_loud_error():
-    bogus_key = ((), ("r", "default"), frozenset({0}))
+    bogus_key = ((), "r", frozenset({0}))
     with pytest.raises(RuntimeError, match="no prepared config"):
         coordinator.ensure_prepared_for_push(bogus_key)

@@ -81,7 +81,7 @@ States: `PREPARED → RECEIVING → COMPUTING → DONE` (or `ERROR`).
 All endpoints require `Authorization: Bearer <token>`, except `GET /health`, where it is optional so that a
 supervisor's probe can reach it.
 
-- `POST /prepare` — JSON `{band, calib_selector, boresight_ra, boresight_dec}`. Boresight is in degrees and
+- `POST /prepare` — JSON `{band, boresight_ra, boresight_dec}`. Boresight is in degrees and
   **required** (400 if missing, non-numeric or non-finite — `json` parses a bare `NaN` token, so finiteness
   is checked in the web process): it is what lets refcat shards preload before pixels exist. Returns
   `job_id`, state, `timings: {calib: {...}, refcat: {...}}`; both sub-dicts carry the same keys whether the

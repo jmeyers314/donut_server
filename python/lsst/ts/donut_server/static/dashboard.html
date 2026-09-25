@@ -387,7 +387,7 @@ function renderCoord(h) {
   ];
   if (h.primed_args) {
     const a = h.primed_args;
-    pairs.push(["primed", a.band + " / " + a.calib_selector + " / ra " +
+    pairs.push(["primed", a.band + " / ra " +
                 Number(a.boresight_ra).toFixed(3) + " dec " + Number(a.boresight_dec).toFixed(3)]);
     // The digest form: a -c entry whole, a -C entry as its name plus a line count.
     // The bodies are never in /health -- /config has the resulting full config.

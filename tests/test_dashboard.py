@@ -538,7 +538,6 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
     primed = {
         "cmd": "prepare",
         "band": "r",
-        "calib_selector": "default",
         "boresight_ra": 283.666,
         "boresight_dec": -28.1326,
         "config_overrides": [

@@ -2,14 +2,13 @@
 
 Holds `_PREPARED_CACHE`, a small LRU of `PreparedEntry` bundles -- each one a
 task, a calib set, and a resharded refcat, together under one composite key
-(the `-c`/`-C` override list, band + calib selector, and the refcat's level-5
-shard-id set, respectively). Bundled per entry, rather than the three
-independent singleton globals this replaced, because a second `/prepare`
-before any `/push` must not silently retarget a `job_id` that is still
-waiting to be pushed: a `job_id`'s `prepared_key` names the exact entry that
-was live when it was prepared, and `push` reactivates that entry -- reloading
-it if it was since evicted -- rather than running whatever the *most recent*
-prepare happened to load.
+(the `-c`/`-C` override list, the band, and the refcat's level-5 shard-id set,
+respectively). Bundled per entry, rather than the three independent singleton
+globals this replaced, because a second `/prepare` before any `/push` must not
+silently retarget a `job_id` that is still waiting to be pushed: a `job_id`'s
+`prepared_key` names the exact entry that was live when it was prepared, and
+`push` reactivates that entry -- reloading it if it was since evicted --
+rather than running whatever the *most recent* prepare happened to load.
 
 Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
 to a hand-built in-memory Butler, and calls the real
@@ -414,7 +413,7 @@ def _prepare_key(command: dict) -> tuple:
     RefCatStore's own reuse guard, which is keyed the same way.
     """
     task_key = override_key(command.get("config_overrides"))
-    calib_key = (command["band"], command["calib_selector"])
+    calib_key = command["band"]
     refcat_key = frozenset(
         refcat_store.shard_ids_for_pointing(command["boresight_ra"], command["boresight_dec"])
     )
@@ -433,7 +432,7 @@ def _activate_entry(entry: "PreparedEntry") -> None:
     _TASK = entry.task
     _TASK_DUMP = entry.task_dump
     _CALIB_STORE.clear()
-    _CALIB_STORE["config_key"] = entry.calib.config_key
+    _CALIB_STORE["band"] = entry.calib.band
     _CALIB_STORE["calib"] = entry.calib
     _REFCAT_STORE = entry.refcat_store
 
@@ -471,7 +470,7 @@ def _build_entry(key: tuple, command: dict) -> tuple["PreparedEntry", dict]:
     # The only place an unset DONUT_SERVER_STAMP_DIR can be reported to a client:
     # the write itself happens after the push reply, where a raise reaches nobody.
     os.makedirs(stamp_dir(), exist_ok=True)
-    calib, calib_timing = _build_calib(command["band"], command["calib_selector"])
+    calib, calib_timing = _build_calib(command["band"])
 
     store = refcat_store.RefCatStore()
     refcat_timing = store.ensure(command["boresight_ra"], command["boresight_dec"])
@@ -592,7 +591,7 @@ class CalibSet:
     simply has no entry (mirrors the real Butler connection's minimum=0).
     """
 
-    config_key: tuple
+    band: str
     detector_ids: list
     ptc_by_name: dict
     linearizer_by_name: dict
@@ -613,10 +612,9 @@ def _discover_detector_ids(calib_dir: str) -> list:
     return ids
 
 
-def _build_calib(band: str, calib_selector: str) -> tuple[CalibSet, dict]:
+def _build_calib(band: str) -> tuple[CalibSet, dict]:
     """Load one CalibSet fresh from disk. Always builds -- the composite-key
     cache above this is where reuse is decided, so this need not guard itself."""
-    config_key = (band, calib_selector)
     t0 = time.monotonic()
 
     calibs = calib_dir()
@@ -659,7 +657,7 @@ def _build_calib(band: str, calib_selector: str) -> tuple[CalibSet, dict]:
             intrinsic_zernikes_by_name[name] = ipIsr.IsrCalib.readFits(iz_path)
 
     calib = CalibSet(
-        config_key=config_key,
+        band=band,
         detector_ids=detector_ids,
         ptc_by_name=ptc_by_name,
         linearizer_by_name=linearizer_by_name,
@@ -901,8 +899,7 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     decode_s = time.perf_counter() - t0
 
     band = next(iter(exposures.values())).getFilter().bandLabel
-    prepared = _CALIB_STORE.get("config_key")
-    prepared_band = prepared[0] if prepared else None
+    prepared_band = _CALIB_STORE.get("band")
     if prepared_band != band:
         raise RuntimeError(
             f"raws are band {band!r} but prepare loaded band {prepared_band!r} "
@@ -1234,7 +1231,6 @@ if __name__ == "__main__":
     parent_conn.send({
         "cmd": "prepare",
         "band": band,
-        "calib_selector": "default",
         "boresight_ra": boresight_ra,
         "boresight_dec": boresight_dec,
         "config_overrides": [],
