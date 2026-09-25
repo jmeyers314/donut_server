@@ -1,26 +1,12 @@
-"""The -c/-C config override path: application, ordering, reuse, and rejection.
+"""The -c/-C config override path: application, ordering, and rejection.
 
-These drive the real `DonutBlitzCornerConfig` and build real tasks, but need no
-calibs, raws or refcat shards -- `ensure_task` touches no data -- so they run in
-well under a second.
-
-Every test resets the task globals, because `ensure_task`'s whole job is to mutate
-them and a leaked `_TASK` would make the reuse assertions order-dependent.
+These drive the real `DonutBlitzCornerConfig` and build real tasks via
+`build_task`, which touches no global and needs no calibs, raws or refcat
+shards, so they run in well under a second.
 """
 import pytest
 
 from lsst.ts.donut_server import coordinator
-
-
-@pytest.fixture(autouse=True)
-def clean_task_globals():
-    coordinator._TASK = None
-    coordinator._TASK_KEY = None
-    coordinator._TASK_DUMP = ""
-    yield
-    coordinator._TASK = None
-    coordinator._TASK_KEY = None
-    coordinator._TASK_DUMP = ""
 
 
 def value(field, val):
@@ -32,39 +18,16 @@ def python(text, name="<test>"):
 
 
 def test_no_overrides_builds_a_default_task():
-    timings = coordinator.ensure_task([])
+    task, dump = coordinator.build_task([])
 
-    assert timings["reused"] is False
-    assert timings["n_overrides"] == 0
-    # () not None: prepared with an empty list, which is distinct from never built.
-    assert coordinator._TASK_KEY == ()
-    assert coordinator._TASK.config.savePlots is False
-    assert coordinator.task_config_dump().startswith("import ")
+    assert task.config.savePlots is False
+    assert dump.startswith("import ")
 
 
-def test_a_value_override_is_applied_and_then_reused():
-    spec = [value("maxFitScatter", "2.0")]
+def test_a_value_override_is_applied():
+    task, _ = coordinator.build_task([value("maxFitScatter", "2.0")])
 
-    first = coordinator.ensure_task(spec)
-    assert first["reused"] is False
-    assert coordinator._TASK.config.maxFitScatter == 2.0
-    task = coordinator._TASK
-
-    # An equal-but-not-identical list must still hit the guard: the key is by value.
-    second = coordinator.ensure_task([value("maxFitScatter", "2.0")])
-    assert second["reused"] is True
-    assert coordinator._TASK is task
-
-
-def test_changing_an_override_rebuilds_the_task():
-    coordinator.ensure_task([value("maxFitScatter", "2.0")])
-    first_dump = coordinator.task_config_dump()
-
-    timings = coordinator.ensure_task([value("maxFitScatter", "3.0")])
-
-    assert timings["reused"] is False
-    assert coordinator._TASK.config.maxFitScatter == 3.0
-    assert coordinator.task_config_dump() != first_dump
+    assert task.config.maxFitScatter == 2.0
 
 
 @pytest.mark.parametrize(
@@ -79,15 +42,15 @@ def test_changing_an_override_rebuilds_the_task():
     ],
 )
 def test_overrides_apply_in_list_order(spec, expected):
-    coordinator.ensure_task(spec)
+    task, _ = coordinator.build_task(spec)
 
-    assert coordinator._TASK.config.maxFitScatter == expected
+    assert task.config.maxFitScatter == expected
 
 
 def test_a_nested_field_can_be_overridden():
-    coordinator.ensure_task([value("donutSelector.magMax", "16.0")])
+    task, _ = coordinator.build_task([value("donutSelector.magMax", "16.0")])
 
-    assert coordinator._TASK.config.donutSelector.magMax == 16.0
+    assert task.config.donutSelector.magMax == 16.0
 
 
 def test_a_multi_line_python_override_runs_and_names_its_file_in_the_traceback():
@@ -98,7 +61,7 @@ def test_a_multi_line_python_override_runs_and_names_its_file_in_the_traceback()
     )
 
     with pytest.raises(coordinator.ConfigOverrideError) as excinfo:
-        coordinator.ensure_task([python(text, name="/home/op/tweaks.py")])
+        coordinator.build_task([python(text, name="/home/op/tweaks.py")])
 
     # The supplied name is compiled in, so the operator's file and the offending line
     # number are what the traceback blames -- not <string>, which would be useless
@@ -113,28 +76,19 @@ def test_a_multi_line_python_override_runs_and_names_its_file_in_the_traceback()
     assert "nopeNotAField" in str(excinfo.value)
 
 
-def test_an_unknown_field_is_rejected_and_leaves_the_previous_task_installed():
+def test_an_unknown_field_is_rejected():
     # applyTo mutates in place and stops at the first failure, so the guarantee that
-    # matters is that a rejected list cannot install a half-applied config.
-    coordinator.ensure_task([value("maxFitScatter", "2.0")])
-    good_task, good_key, good_dump = (
-        coordinator._TASK, coordinator._TASK_KEY, coordinator.task_config_dump()
-    )
-
+    # matters is that a rejected list cannot leave a half-applied config visible --
+    # build_task touches no global, so there is nothing to check that on here beyond
+    # the raise itself; ensure_prepared's reuse guard covers "leaves the previous
+    # good config live".
     with pytest.raises(coordinator.ConfigOverrideError, match="nopeNotAField"):
-        coordinator.ensure_task(
-            [value("maxFitScatter", "9.0"), value("nopeNotAField", "1")]
-        )
-
-    assert coordinator._TASK is good_task
-    assert coordinator._TASK_KEY == good_key
-    assert coordinator.task_config_dump() == good_dump
-    assert coordinator._TASK.config.maxFitScatter == 2.0
+        coordinator.build_task([value("maxFitScatter", "9.0"), value("nopeNotAField", "1")])
 
 
 def test_a_wrong_type_is_rejected():
     with pytest.raises(coordinator.ConfigOverrideError, match="maxFitScatter"):
-        coordinator.ensure_task([value("maxFitScatter", "'not a float'")])
+        coordinator.build_task([value("maxFitScatter", "'not a float'")])
 
 
 def test_an_extra_output_connection_is_rejected_at_prepare():
@@ -146,7 +100,7 @@ def test_an_extra_output_connection_is_rejected_at_prepare():
     _check_connections, so this is the regression test for that.
     """
     with pytest.raises(coordinator.ConfigOverrideError, match="zernikes"):
-        coordinator.ensure_task([value("doZernikesOutput", "True")])
+        coordinator.build_task([value("doZernikesOutput", "True")])
 
 
 def test_a_hangtimeout_under_unittimeout_is_rejected():
@@ -154,24 +108,24 @@ def test_a_hangtimeout_under_unittimeout_is_rejected():
     # ordinary job, which the front-end then replays into an unbreakable restart
     # loop that never reaches DEGRADED.
     with pytest.raises(coordinator.ConfigOverrideError, match="hangTimeout"):
-        coordinator.ensure_task([value("hangTimeout", "1.0")])
+        coordinator.build_task([value("hangTimeout", "1.0")])
 
 
 def test_a_disabled_watchdog_is_allowed():
     # <= 0 means "watchdog off" upstream, which is a legitimate request -- the
     # hazard is a small *positive* value, so a naive "reject <= 0" would be wrong.
-    coordinator.ensure_task([value("hangTimeout", "0.0")])
+    task, _ = coordinator.build_task([value("hangTimeout", "0.0")])
 
-    assert coordinator._TASK.config.hangTimeout == 0.0
+    assert task.config.hangTimeout == 0.0
 
 
 def test_the_dump_round_trips_onto_a_fresh_config():
     from lsst.ts.wep.blitz.donutBlitzCorner import DonutBlitzCornerConfig
 
-    coordinator.ensure_task([value("maxFitScatter", "2.5")])
+    _, dump = coordinator.build_task([value("maxFitScatter", "2.5")])
 
     fresh = DonutBlitzCornerConfig()
-    fresh.loadFromString(coordinator.task_config_dump())
+    fresh.loadFromString(dump)
 
     assert fresh.maxFitScatter == 2.5
 
@@ -190,6 +144,7 @@ def test_order_changes_the_key():
     assert a != b
 
 
-def test_require_task_refuses_before_any_prepare():
+def test_require_task_refuses_before_any_prepare(monkeypatch):
+    monkeypatch.setattr(coordinator, "_TASK", None)
     with pytest.raises(RuntimeError, match="no task configured"):
         coordinator.require_task()

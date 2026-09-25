@@ -119,6 +119,11 @@ class JobRecord:
     # Serialized donutBlitzCornerResults, served by /result/{job_id}/table. Held
     # opaque bytes: this process never imports astropy or the LSST stack.
     table_parquet: Optional[bytes] = None
+    # The coordinator's composite cache key for the config this job was prepared
+    # against. Opaque here -- never inspected, just replayed on push so the
+    # coordinator reactivates (or, if evicted, reloads) *this* job's config
+    # rather than whatever the most recent prepare happened to leave active.
+    prepared_key: Optional[list] = None
 
 
 JOBS: dict[str, JobRecord] = {}
@@ -1015,7 +1020,12 @@ async def prepare(body: dict):
         status = 400 if resp.get("kind") == "config_override" else 500
         raise HTTPException(status, resp.get("error", "prepare failed"))
 
-    JOBS[job_id] = JobRecord(job_id=job_id, state=JobState.PREPARED, prepare_timings=resp.get("timings"))
+    JOBS[job_id] = JobRecord(
+        job_id=job_id,
+        state=JobState.PREPARED,
+        prepare_timings=resp.get("timings"),
+        prepared_key=resp.get("prepared_key"),
+    )
     # `generation` lets the producer's own logs attribute a latency spike to a
     # coordinator restart. The override digest is echoed so a --loop producer's own
     # log records the config each cycle actually ran with.
@@ -1095,7 +1105,13 @@ async def _receive_and_dispatch(
     # Only the layout crosses the Pipe; the pixels stay in shared memory.
     try:
         resp = await coord.send_command(
-            {"cmd": "push", "job_id": job_id, "layout": layout, "num_workers": num_workers}
+            {
+                "cmd": "push",
+                "job_id": job_id,
+                "layout": layout,
+                "num_workers": num_workers,
+                "prepared_key": record.prepared_key,
+            }
         )
     except (CoordinatorLost, CoordinatorUnavailable) as exc:
         # Record the failure before the 503 goes out, so /status and /result agree

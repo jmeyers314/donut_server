@@ -1,12 +1,18 @@
 """The long-lived engine that runs the real wavefront pipeline.
 
-Holds the module-globals `_CALIB_STORE`, `_REFCAT_STORE` and `_TASK`, populated
-at `prepare` time and reused across jobs (each skipped on repeat if its own key
--- band + calib selector, pointing, or the `-c`/`-C` config override list -- is
-unchanged). Three independent keys rather than one, because the work each gates
-differs by two orders of magnitude: ~100 FITS reads, a shard reshard, and a task
-rebuild respectively. Per job, `run_job` rebuilds the raw exposures out of shared
-memory, hands them to a hand-built in-memory Butler, and calls the real
+Holds `_PREPARED_CACHE`, a small LRU of `PreparedEntry` bundles -- each one a
+task, a calib set, and a resharded refcat, together under one composite key
+(the `-c`/`-C` override list, band + calib selector, and the refcat's level-5
+shard-id set, respectively). Bundled per entry, rather than the three
+independent singleton globals this replaced, because a second `/prepare`
+before any `/push` must not silently retarget a `job_id` that is still
+waiting to be pushed: a `job_id`'s `prepared_key` names the exact entry that
+was live when it was prepared, and `push` reactivates that entry -- reloading
+it if it was since evicted -- rather than running whatever the *most recent*
+prepare happened to load.
+
+Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
+to a hand-built in-memory Butler, and calls the real
 `DonutBlitzCornerTask.runQuantum()`.
 
 The task does its own two-stage forking internally (cutout, then WF fit), sized
@@ -48,6 +54,7 @@ import multiprocessing as mp
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, NamedTuple
@@ -110,8 +117,8 @@ def stamp_dir() -> str:
 
     Unlike the other three directories this one is an *output*, so the failure
     it guards against is different: the write happens after the push has already
-    been answered, where a raise reaches nobody. load_calibs_for_prepare calls
-    this so the error surfaces on /prepare instead.
+    been answered, where a raise reaches nobody. _build_entry calls this so the
+    error surfaces on /prepare instead.
     """
     d = os.environ.get("DONUT_SERVER_STAMP_DIR")
     if not d:
@@ -135,17 +142,6 @@ INSTRUMENT = "LSSTCam"
 # Arbitrary; no real collection is involved.
 RUN = "donut_server"
 
-# Populated by load_calibs_for_prepare; the objects here are handed to the
-# in-memory Butler, and the task's own fork workers inherit them via CoW.
-_CALIB_STORE: dict[str, Any] = {}
-
-# Populated at prepare time from the boresight alone, before any pixels exist --
-# which is the whole reason prepare takes a boresight, since resharding the local
-# level-5 files to the level-7 granularity the loader wants costs ~450 ms that
-# would otherwise land on the push critical path. Held outside _CALIB_STORE
-# because it turns over on a different key: pointing, not band + calib selector.
-_REFCAT_STORE = refcat_store.RefCatStore()
-
 # The reusable shared block the front-end streams raw pixels into, opened once
 # in coordinator_main and read in place -- raw pixels never cross the Pipe.
 _SHM: Any = None
@@ -165,29 +161,62 @@ _SHM_VIEW: Any = None
 # before it returns, which is what the ~30 s cadence actually requires.
 _DEFERRED: dict[str, Any] = {}
 
-# Band-independent and butler-independent, so these survive calib reloads and
-# are deliberately not inside _CALIB_STORE (which gets cleared on reload).
-#
-# The universe is immortal: nothing can invalidate a DimensionUniverse(). The task
-# is not -- it is built from a config that /prepare may override, so it carries its
-# own key and turns over independently of the calibs. That key is deliberately NOT
-# folded into _CALIB_STORE's (band, calib_selector): that one gates ~100 FITS reads
-# costing seconds, this one gates a ~0.14 s rebuild, and folding them would make a
-# single changed override trigger a full calib reload (and a band change rebuild the
-# task for nothing). _REFCAT_STORE is the same pattern.
+# Immortal: nothing can invalidate a DimensionUniverse(), so it is built once and
+# shared by every PreparedEntry rather than carried inside one.
 _UNIVERSE: Any = None
+
+# How many distinct (task, calib, refcat) bundles to keep warm at once. Bounded
+# rather than unbounded because a CalibSet is ~100 FITS files' worth of resident
+# memory -- sized to "a couple of configs in flight", not measured against a real
+# workload yet.
+PREPARED_CACHE_CAP = 3
+
+
+@dataclass
+class PreparedEntry:
+    """One fully-loaded (task, calib, refcat) bundle, keyed by all three of
+    their own independent keys at once.
+
+    Bundled together -- rather than as three independently-keyed globals --
+    because a `job_id`'s `prepared_key` must name one thing that `push` can
+    either find in the cache or rebuild whole; mixing today's cache-miss
+    task with yesterday's cache-hit calib would be exactly the silent
+    wrong-config run this cache exists to prevent.
+    """
+
+    key: tuple
+    task: Any
+    task_dump: str
+    calib: Any  # a CalibSet, see below
+    refcat_store: refcat_store.RefCatStore
+
+
+# Insertion order is LRU order: touched entries are popped and re-inserted at
+# the end (MRU), so the front is always the next eviction. dict/OrderedDict
+# iteration order is why this needs no separate bookkeeping.
+_PREPARED_CACHE: "OrderedDict[tuple, PreparedEntry]" = OrderedDict()
+
+# The prepare command that built each still-known key, kept forever (never
+# evicted alongside its PreparedEntry): a push-time cache miss must rebuild
+# from the *exact* args that were live at prepare time, and a composite key's
+# refcat component (a frozenset of shard ids) cannot be inverted back into the
+# boresight that produced it. These dicts are tiny (a handful of floats and
+# strings) next to a CalibSet, so keeping every key's command around costs
+# nothing worth bounding.
+_PREPARE_COMMANDS: dict[tuple, dict] = {}
+
+# The composite key of whichever PreparedEntry is currently active -- i.e. the
+# one _CALIB_STORE/_REFCAT_STORE/_TASK* below describe right now. None before
+# the first successful prepare.
+_ACTIVE_KEY: tuple | None = None
+
+# Mirror the currently-active PreparedEntry's task/calib/refcat, so run_job and
+# build_quantum_context need no change from the pre-cache design: they still
+# just read _CALIB_STORE / _REFCAT_STORE / _TASK. Kept in sync by
+# _activate_entry, the single place that switches which entry is "live".
+_CALIB_STORE: dict[str, Any] = {}
+_REFCAT_STORE = refcat_store.RefCatStore()
 _TASK: Any = None
-
-# None means no task has ever been built; () means one was built from an empty
-# override list. The two must stay distinguishable -- `_TASK is None` is the
-# readiness test, and an empty tuple is a perfectly ordinary prepared state.
-_TASK_KEY: tuple | None = None
-
-# config.saveToString() for the task above: ~77 KB, computed once at prepare and
-# served by the front-end's GET /config. Cached rather than recomputed per request
-# because saveToString() temporarily mutates the config's _imports and name (it
-# restores them in a finally), which is only safe on this single-threaded pre-fork
-# path.
 _TASK_DUMP: str = ""
 
 
@@ -352,27 +381,6 @@ def build_task(spec: list[dict] | None) -> tuple[Any, str]:
     return task, config.saveToString()
 
 
-def ensure_task(spec: list[dict] | None) -> dict:
-    """Build the task for `spec`, or reuse the existing one. Returns prepare timings.
-
-    The task's own reuse guard, independent of the calib and refcat guards. Same key
-    set on both paths, so a reply's shape does not change between cold and reused.
-    """
-    global _UNIVERSE, _TASK, _TASK_KEY, _TASK_DUMP
-    t0 = time.monotonic()
-    if _UNIVERSE is None:
-        _UNIVERSE = DimensionUniverse()
-
-    key = override_key(spec)
-    if _TASK is not None and _TASK_KEY == key:
-        return {"reused": True, "elapsed_s": time.monotonic() - t0, "n_overrides": len(key)}
-
-    # Published only on full success; see build_task.
-    task, dump = build_task(spec)
-    _TASK, _TASK_KEY, _TASK_DUMP = task, key, dump
-    return {"reused": False, "elapsed_s": time.monotonic() - t0, "n_overrides": len(key)}
-
-
 def require_task() -> tuple[Any, Any]:
     """(universe, task) for the push path. Never builds anything.
 
@@ -396,6 +404,140 @@ def require_task() -> tuple[Any, Any]:
 def task_config_dump() -> str:
     """The live task's full config as loadable Python. Served by GET /config."""
     return _TASK_DUMP
+
+
+def _prepare_key(command: dict) -> tuple:
+    """The composite cache key for one /prepare command.
+
+    The refcat component is the *shard-id set*, not the raw boresight, so a
+    dither within one pointing (same set) hits the cache -- matching
+    RefCatStore's own reuse guard, which is keyed the same way.
+    """
+    task_key = override_key(command.get("config_overrides"))
+    calib_key = (command["band"], command["calib_selector"])
+    refcat_key = frozenset(
+        refcat_store.shard_ids_for_pointing(command["boresight_ra"], command["boresight_dec"])
+    )
+    return (task_key, calib_key, refcat_key)
+
+
+def _activate_entry(entry: "PreparedEntry") -> None:
+    """Make `entry` the one run_job/build_quantum_context see.
+
+    The single place that touches the mirror globals, so every path that
+    switches the live config -- a fresh prepare, a cache-hit prepare, or a
+    push-time reload -- goes through here and cannot leave them half-updated.
+    """
+    global _ACTIVE_KEY, _TASK, _TASK_DUMP, _REFCAT_STORE
+    _ACTIVE_KEY = entry.key
+    _TASK = entry.task
+    _TASK_DUMP = entry.task_dump
+    _CALIB_STORE.clear()
+    _CALIB_STORE["config_key"] = entry.calib.config_key
+    _CALIB_STORE["calib"] = entry.calib
+    _REFCAT_STORE = entry.refcat_store
+
+
+def _evict_lru() -> None:
+    """Drop cache entries beyond PREPARED_CACHE_CAP, oldest (least-recently
+    touched) first. `_PREPARE_COMMANDS` is deliberately not pruned here -- see
+    its own docstring."""
+    while len(_PREPARED_CACHE) > PREPARED_CACHE_CAP:
+        evicted_key, _ = _PREPARED_CACHE.popitem(last=False)
+        _log.info(
+            "prepared-cache: evicted %r (cap=%d, now holding %d)",
+            evicted_key, PREPARED_CACHE_CAP, len(_PREPARED_CACHE),
+        )
+
+
+def _build_entry(key: tuple, command: dict) -> tuple["PreparedEntry", dict]:
+    """Build a fresh PreparedEntry for `key` from `command`'s args.
+
+    Used both for a cold /prepare and for a push-time reload of an evicted
+    entry -- the two are the same operation, just triggered differently.
+    """
+    spec = command.get("config_overrides")
+
+    t0 = time.monotonic()
+    task, task_dump = build_task(spec)
+    task_timing = {
+        "reused": False,
+        "elapsed_s": time.monotonic() - t0,
+        "n_overrides": len(key[0]),
+    }
+
+    # Pay the pyarrow init here, not on push.
+    _warm_up_parquet()
+    # The only place an unset DONUT_SERVER_STAMP_DIR can be reported to a client:
+    # the write itself happens after the push reply, where a raise reaches nobody.
+    os.makedirs(stamp_dir(), exist_ok=True)
+    calib, calib_timing = _build_calib(command["band"], command["calib_selector"])
+
+    store = refcat_store.RefCatStore()
+    refcat_timing = store.ensure(command["boresight_ra"], command["boresight_dec"])
+
+    entry = PreparedEntry(key=key, task=task, task_dump=task_dump, calib=calib, refcat_store=store)
+    return entry, {"task": task_timing, "calib": calib_timing, "refcat": refcat_timing}
+
+
+def ensure_prepared(command: dict) -> dict:
+    """Get-or-build the PreparedEntry for one /prepare command, activate it,
+    and return its key plus prepare timings shaped like today's response.
+
+    On a cache hit, `RefCatStore.ensure` is still called (against the possibly
+    slightly-different boresight this call carries) so the response always
+    reports the current pointing and stays cheap on the reused path -- same
+    behaviour as the old singleton `_REFCAT_STORE.ensure` reuse guard.
+    """
+    global _UNIVERSE
+    if _UNIVERSE is None:
+        _UNIVERSE = DimensionUniverse()
+
+    key = _prepare_key(command)
+    entry = _PREPARED_CACHE.get(key)
+
+    if entry is None:
+        entry, timings = _build_entry(key, command)
+        _PREPARED_CACHE[key] = entry
+        _PREPARE_COMMANDS[key] = dict(command)
+        _evict_lru()
+    else:
+        _PREPARED_CACHE.move_to_end(key)
+        timings = {
+            "task": {"reused": True, "elapsed_s": 0.0, "n_overrides": len(key[0])},
+            "calib": {"reused": True, "elapsed_s": 0.0},
+            "refcat": entry.refcat_store.ensure(command["boresight_ra"], command["boresight_dec"]),
+        }
+
+    _activate_entry(entry)
+    return {"key": key, "timings": timings}
+
+
+def ensure_prepared_for_push(key: tuple) -> "PreparedEntry":
+    """The PreparedEntry for `key`, for the push path. Reloads it from its
+    original prepare command if it was evicted since, rather than silently
+    running whatever entry happens to be active -- the exact hazard this cache
+    replaced. Moves the entry to MRU either way, so an active job's config is
+    not evicted out from under a straggling push.
+    """
+    entry = _PREPARED_CACHE.get(key)
+    if entry is not None:
+        _PREPARED_CACHE.move_to_end(key)
+        _activate_entry(entry)
+        return entry
+
+    command = _PREPARE_COMMANDS.get(key)
+    if command is None:
+        raise RuntimeError(
+            f"no prepared config found for key {key!r}: it was never prepared on "
+            "this coordinator (or the coordinator has restarted since)"
+        )
+    _log.info("prepared-cache: reloading evicted entry for push, key=%r", key)
+    entry, _ = _build_entry(key, command)
+    _PREPARED_CACHE[key] = entry
+    _evict_lru()
+    _activate_entry(entry)
+    return entry
 
 
 def _warm_up_parquet() -> None:
@@ -429,8 +571,8 @@ def write_stamp_table(job_id: str, table) -> str:
     front-end and the client are concerned. Hence the rule that existence means
     completeness. An interrupted write leaves an inert .tmp instead.
     """
-    # No makedirs here: load_calibs_for_prepare already created the directory, and
-    # a push cannot reach this without a prepare having succeeded first.
+    # No makedirs here: _build_entry already created the directory, and a push
+    # cannot reach this without a prepare having succeeded first.
     final = os.path.join(stamp_dir(), f"{job_id}.parquet")
     tmp = f"{final}.tmp"
     payload = to_parquet(table)
@@ -471,23 +613,11 @@ def _discover_detector_ids(calib_dir: str) -> list:
     return ids
 
 
-def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
-    """Populate _CALIB_STORE with real calibs for `band`. Skips reload if
-    config is unchanged (reuse guard)."""
+def _build_calib(band: str, calib_selector: str) -> tuple[CalibSet, dict]:
+    """Load one CalibSet fresh from disk. Always builds -- the composite-key
+    cache above this is where reuse is decided, so this need not guard itself."""
     config_key = (band, calib_selector)
     t0 = time.monotonic()
-
-    # Pay the pyarrow init here, not on push. The universe and the task are handled
-    # by ensure_task, which the command loop calls ahead of this.
-    _warm_up_parquet()
-
-    # Ahead of the reuse guard below, so a repeat prepare still checks it: this is
-    # the only place an unset DONUT_SERVER_STAMP_DIR can be reported to a client.
-    # The write itself happens after the push reply, where a raise reaches nobody.
-    os.makedirs(stamp_dir(), exist_ok=True)
-
-    if _CALIB_STORE.get("config_key") == config_key:
-        return {"reused": True, "elapsed_s": time.monotonic() - t0}
 
     calibs = calib_dir()
     detector_ids = _discover_detector_ids(calibs)
@@ -537,17 +667,15 @@ def load_calibs_for_prepare(band: str, calib_selector: str) -> dict:
         flat_by_name=flat_by_name,
         intrinsic_zernikes_by_name=intrinsic_zernikes_by_name,
     )
-    _CALIB_STORE.clear()
-    _CALIB_STORE["config_key"] = config_key
-    _CALIB_STORE["calib"] = calib
 
-    return {
+    timings = {
         "reused": False,
         "elapsed_s": time.monotonic() - t0,
         "n_detectors": len(detector_ids),
         "n_intrinsic_zernikes": len(intrinsic_zernikes_by_name),
         "band": band,
     }
+    return calib, timings
 
 
 def reconstruct_exposures(layout: list) -> dict[str, Any]:
@@ -1009,27 +1137,22 @@ def coordinator_main(conn, shm_name: str) -> None:
                 break
             elif cmd == "prepare":
                 try:
-                    timings = {
-                        # First, deliberately: it is the cheapest of the three and
-                        # the only one an operator can get wrong, so a malformed
-                        # override does not first pay a ~100-FITS calib reload.
-                        "task": ensure_task(command.get("config_overrides")),
-                        "calib": load_calibs_for_prepare(
-                            command["band"], command["calib_selector"]
-                        ),
-                        "refcat": _REFCAT_STORE.ensure(
-                            command["boresight_ra"], command["boresight_dec"]
-                        ),
-                    }
+                    prepared = ensure_prepared(command)
                     # config_dump sits beside `timings`, never inside it: the
                     # front-end stores timings on every JobRecord and returns them
                     # 50 rows at a time from /admin/jobs at 1 Hz, where ~77 KB a row
                     # would be catastrophic. Sent on the reused path too, so a
                     # re-prime that hit the guard still refreshes the cache.
+                    #
+                    # The front-end never inspects prepared_key -- it is opaque
+                    # data to store on the JobRecord and echo back verbatim on
+                    # push, since this Pipe is pickle (unlike the front-end's own
+                    # HTTP boundary) it survives the round trip unchanged.
                     conn.send({
                         "ok": True,
-                        "timings": timings,
+                        "timings": prepared["timings"],
                         "config_dump": task_config_dump(),
+                        "prepared_key": prepared["key"],
                     })
                 except Exception as exc:
                     # Tagged so the front-end can answer 400 for operator error and
@@ -1041,6 +1164,12 @@ def coordinator_main(conn, shm_name: str) -> None:
                     })
             elif cmd == "push":
                 try:
+                    prepared_key = command.get("prepared_key")
+                    if prepared_key is not None:
+                        # Reactivates the job's own entry -- reloading it first if
+                        # it was evicted since prepare -- rather than running
+                        # whatever entry a later prepare happened to leave active.
+                        ensure_prepared_for_push(tuple(prepared_key))
                     result = run_job(
                         command["job_id"], command["layout"], command.get("num_workers")
                     )
