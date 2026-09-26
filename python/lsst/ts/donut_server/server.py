@@ -148,19 +148,6 @@ def _stamp_path(job_id: str) -> Optional[str]:
     return os.path.join(directory, f"{job_id}.parquet")
 
 
-def _fail_in_flight_jobs(loss: dict) -> None:
-    """Fail every job that was mid-flight when the coordinator died.
-
-    Without this a record stranded in COMPUTING makes /result?wait=N long-poll a
-    job that can never finish.
-    """
-    for record in JOBS.values():
-        if record.state in (JobState.RECEIVING, JobState.COMPUTING):
-            was = record.state
-            record.state = JobState.ERROR
-            record.error = f"coordinator lost during {was.value}: {loss.get('reason')}"
-
-
 @dataclass
 class ConfigSnapshot:
     """The blitz task's full config as of the last successful prepare.
@@ -242,7 +229,11 @@ class Coord:
         max_restart_attempts: int = MAX_RESTART_ATTEMPTS,
         backoff: tuple = RESTART_BACKOFF_S,
         on_restart: Optional[Callable[[dict], None]] = None,
+        index: int = 0,
     ) -> None:
+        # Which flight this is. Carried so a raised CoordinatorLost can name its
+        # own lane without the handler having to search the pool for it.
+        self.index = index
         self._proc = None
         self._conn = None
         self._shm = None
@@ -337,6 +328,16 @@ class Coord:
     @property
     def in_flight(self) -> int:
         return self._in_flight
+
+    @property
+    def busy(self) -> bool:
+        """Whether a command is running or queued on this flight.
+
+        Both terms are needed: _lock is held for the whole of send_command, which
+        includes the _ensure_usable wait before anything is in flight, and
+        _in_flight is non-zero during bring-up's hello, which does not hold _lock.
+        """
+        return self._in_flight > 0 or self._lock.locked()
 
     @property
     def child_uptime_s(self) -> Optional[float]:
@@ -691,7 +692,13 @@ class Coord:
 
     async def send_command(self, command: dict) -> dict:
         async with self._lock:
-            await self._ensure_usable()
+            try:
+                await self._ensure_usable()
+            except CoordinatorUnavailable as exc:
+                # Tagged so the 503 handler reports *this* flight's state rather
+                # than the pool's aggregate, which may be healthy.
+                exc.flight = self.index  # type: ignore[attr-defined]
+                raise
             try:
                 resp = await self._exchange(command)
             except CoordinatorLost as exc:
@@ -699,6 +706,7 @@ class Coord:
                 # Set under _lock, because requests arriving mid-restart must be
                 # able to check state *without* the lock -- _restart holds it.
                 self._start_restart()
+                exc.flight = self.index  # type: ignore[attr-defined]
                 # The failed command is deliberately not retried: a push that
                 # killed the coordinator may kill it again, and the job's state
                 # machine has already moved on. 503 and let the producer decide.
@@ -759,14 +767,187 @@ class Coord:
                 lock.release()
 
 
-coord = Coord(on_restart=_fail_in_flight_jobs)
+class FlightPool:
+    """N independent coordinator processes ("flights"), and the routing between
+    them and the jobs they prepared.
+
+    Concurrency comes entirely from there being N `Coord`s: each already owns its
+    own child, Pipe, shared block, command lock and push lock, so two jobs in
+    COMPUTING at once needs no new mechanism -- only a decision about which flight
+    a given job belongs to, which is what this class is.
+
+    Nothing here is shared between flights. In particular a flight's crash must
+    not touch a job that a different flight is happily computing, which is why
+    `_fail_jobs` filters on the routing table rather than failing everything
+    mid-flight.
+    """
+
+    def __init__(self, n: int = 1, **coord_kwargs) -> None:
+        self.flights = [
+            Coord(index=i, on_restart=self._loss_handler(i), **coord_kwargs)
+            for i in range(n)
+        ]
+        # job_id -> flight index, written at /prepare and read at /push. Unbounded,
+        # like JOBS itself: two small ints per job. Deliberately not reaped on its
+        # own schedule -- a retention policy here that disagreed with JOBS' would
+        # turn a still-listed job into an unroutable push.
+        self._by_job: dict[str, int] = {}
+        self._last_used = [0.0] * n
+        # Prepares and pushes waiting on each flight's locks. Counted rather than
+        # read off asyncio.Lock, whose waiter list is private.
+        self._queued = [0] * n
+
+    def __len__(self) -> int:
+        return len(self.flights)
+
+    def __getitem__(self, index: int) -> Coord:
+        return self.flights[index]
+
+    def _loss_handler(self, index: int) -> Callable[[dict], None]:
+        def handler(loss: dict) -> None:
+            self._fail_jobs(index, loss)
+
+        return handler
+
+    def _fail_jobs(self, index: int, loss: dict) -> None:
+        """Fail the jobs that were mid-flight *on this flight* when its child died.
+
+        Without this a record stranded in COMPUTING makes /result?wait=N long-poll
+        a job that can never finish. Scoped to one flight because the alternative
+        -- failing every non-terminal job, which is what a single-coordinator
+        server could safely do -- would let one lane's crash kill another lane's
+        healthy job for no reason the producer could ever diagnose.
+        """
+        for job_id, record in JOBS.items():
+            if self._by_job.get(job_id) != index:
+                continue
+            if record.state in (JobState.RECEIVING, JobState.COMPUTING):
+                was = record.state
+                record.state = JobState.ERROR
+                record.error = f"coordinator lost during {was.value}: {loss.get('reason')}"
+
+    # ------------------------------------------------------------------ routing
+
+    def select(self, command: dict) -> Coord:
+        """Which flight should serve this prepare.
+
+        In priority order, all non-blocking:
+
+        1. A flight already primed with exactly this command. Free, and it keeps a
+           repeated pointing on one lane rather than warming a second one.
+        2. The least recently used flight that is READY and idle.
+        3. The least recently used flight, whose lock the caller will then wait on.
+
+        LRU rather than first-fit in 2, which is the difference between using the
+        pool and not: prepares arrive serially, one having finished before the next
+        is sent, so "the first idle flight" would be flight 0 every single time and
+        no job would ever be routed anywhere else. LRU rather than round-robin
+        because it is the flight holding the *least* useful config that should be
+        retargeted.
+
+        Only 3 can block, and it is also the only branch that can reach a
+        non-READY flight -- which is deliberate: that is where `_ensure_usable`
+        produces the ordinary 503, including when every flight is DEGRADED.
+        """
+        ready = [c for c in self.flights if c.state is CoordState.READY]
+        for coord in ready:
+            if coord.primed_args == command:
+                return coord
+        idle = [c for c in ready if not c.busy]
+        return self._lru(idle or self.flights)
+
+    def _lru(self, coords: list[Coord]) -> Coord:
+        return min(coords, key=lambda c: self._last_used[c.index])
+
+    def note_used(self, coord: Coord) -> None:
+        self._last_used[coord.index] = time.monotonic()
+
+    def route(self, job_id: str, coord: Coord) -> None:
+        self._by_job[job_id] = coord.index
+        self.note_used(coord)
+
+    def for_push(self, job_id: str) -> Coord:
+        """The flight that prepared `job_id`, or the LRU one if we have no record.
+
+        The fallback is not a guess: the push carries the job's `prepared_key`, and
+        the coordinator reloads that config from its own `_PREPARE_COMMANDS` before
+        running, so any flight can serve any job -- just more slowly. Reachable when
+        the routing entry predates a restart of the front-end but the job record
+        does not.
+        """
+        index = self._by_job.get(job_id)
+        if index is None:
+            coord = self._lru(self.flights)
+            self._by_job[job_id] = coord.index
+            return coord
+        return self.flights[index]
+
+    def queue_depth(self, coord: Coord) -> int:
+        return self._queued[coord.index]
+
+    @asynccontextmanager
+    async def queued(self, coord: Coord):
+        """Count a caller as backlog for the whole time it may be waiting."""
+        self._queued[coord.index] += 1
+        try:
+            yield coord
+        finally:
+            self._queued[coord.index] -= 1
+
+    # ---------------------------------------------------------------- aggregate
+
+    @property
+    def state(self) -> CoordState:
+        """One verdict for the pool: READY if any flight is, else the worst state.
+
+        Used by the 503 handler when the failure cannot be attributed to a single
+        flight. Worst-first ordering so a pool with one DEGRADED flight and one
+        still STARTING reports the degradation.
+        """
+        states = [c.state for c in self.flights]
+        if CoordState.READY in states:
+            return CoordState.READY
+        for state in (CoordState.DEGRADED, CoordState.STOPPING,
+                      CoordState.RESTARTING, CoordState.STARTING):
+            if state in states:
+                return state
+        return CoordState.STARTING
+
+    @property
+    def generation(self) -> int:
+        return max(c.generation for c in self.flights)
+
+    async def start(self) -> None:
+        for coord in self.flights:
+            await coord.start()
+
+    async def aclose(self) -> None:
+        for coord in self.flights:
+            await coord.aclose()
+
+
+def num_flights() -> int:
+    """How many coordinator processes to run.
+
+    Read from the environment rather than a constant because the transport from
+    `donutServer.py --num-flights` is the environment: uvicorn imports this module
+    in-process, so a CLI flag can only reach here as an env var.
+    """
+    try:
+        n = int(os.environ.get("DONUT_SERVER_NUM_FLIGHTS", "2"))
+    except ValueError:
+        n = 2
+    return max(1, n)
+
+
+pool = FlightPool(num_flights())
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await coord.start()
+    await pool.start()
     yield
-    await coord.aclose()
+    await pool.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -786,9 +967,15 @@ async def _coordinator_error(request: Request, exc: Exception) -> JSONResponse:
     503 + Retry-After as "come back", while 502 is often treated as
     semi-permanent, and what the producer actually needs is in `reason`.
     """
+    # Coord tags what it raises with its own index, so the body describes the lane
+    # that actually failed rather than the pool aggregate -- which, with N flights,
+    # will often read READY while this request's flight is not.
+    index = getattr(exc, "flight", None)
+    source: Any = pool.flights[index] if index is not None else pool
+
     if isinstance(exc, CoordinatorLost):
         reason = "coordinator_lost"
-    elif coord.state is CoordState.DEGRADED:
+    elif source.state is CoordState.DEGRADED:
         reason = "coordinator_degraded"
     else:
         reason = "coordinator_restarting"
@@ -798,8 +985,9 @@ async def _coordinator_error(request: Request, exc: Exception) -> JSONResponse:
         content={
             "reason": reason,
             "error": str(exc),
-            "state": coord.state.value,
-            "generation": coord.generation,
+            "state": source.state.value,
+            "generation": source.generation,
+            "flight": index,
         },
         headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
     )
@@ -999,18 +1187,22 @@ async def prepare(body: dict):
     boresight_dec = _required_float(body, "boresight_dec")
     overrides = _parse_overrides(body)
 
+    command = {
+        "cmd": "prepare",
+        "band": body.get("band"),
+        "boresight_ra": boresight_ra,
+        "boresight_dec": boresight_dec,
+        # Sent even when empty, so _primed_args is never ambiguous about whether
+        # a replayed prepare had overrides.
+        "config_overrides": overrides,
+    }
     job_id = str(uuid.uuid4())
-    resp = await coord.send_command(
-        {
-            "cmd": "prepare",
-            "band": body.get("band"),
-            "boresight_ra": boresight_ra,
-            "boresight_dec": boresight_dec,
-            # Sent even when empty, so _primed_args is never ambiguous about whether
-            # a replayed prepare had overrides.
-            "config_overrides": overrides,
-        }
-    )
+    coord = pool.select(command)
+    # Routed before the command is sent, not after: a prepare that kills its child
+    # must already be attributable to a lane, or _fail_jobs would skip it.
+    pool.route(job_id, coord)
+    async with pool.queued(coord):
+        resp = await coord.send_command(command)
     if not resp.get("ok"):
         JOBS[job_id] = JobRecord(job_id=job_id, state=JobState.ERROR, error=resp.get("error"))
         # 400 for a bad override, because it will fail identically forever; 500 would
@@ -1033,6 +1225,9 @@ async def prepare(body: dict):
         "state": JobState.PREPARED,
         "timings": resp.get("timings"),
         "generation": coord.generation,
+        # Which lane served this, so a producer's own logs can attribute latency to
+        # a flight rather than to the service as a whole.
+        "flight": coord.index,
         "config_overrides": _digest_overrides(overrides),
     }
 
@@ -1047,17 +1242,24 @@ async def push(job_id: str, request: Request, num_workers: int | None = None):
     if num_workers is not None and num_workers < 1:
         raise HTTPException(400, "num_workers must be >= 1")
 
-    async with coord.push_lock:
+    # The flight that prepared this job: its child is the one holding the config,
+    # and its shared block is the one the pixels have to land in.
+    coord = pool.for_push(job_id)
+    async with pool.queued(coord), coord.push_lock:
+        pool.note_used(coord)
         view = memoryview(coord.shm.buf)
         try:
-            return await _receive_and_dispatch(job_id, record, request, view, num_workers)
+            return await _receive_and_dispatch(
+                coord, job_id, record, request, view, num_workers
+            )
         finally:
             # Must be released before Coord.stop() can close the block.
             view.release()
 
 
 async def _receive_and_dispatch(
-    job_id, record, request: Request, view: memoryview, num_workers: int | None = None
+    coord: Coord, job_id, record, request: Request, view: memoryview,
+    num_workers: int | None = None,
 ) -> dict:
     """Stream the body into `view`, then hand the coordinator just the layout."""
     body_iter = request.stream()
@@ -1139,6 +1341,7 @@ async def _receive_and_dispatch(
         "state": record.state,
         "timings": timings,
         "generation": coord.generation,
+        "flight": coord.index,
     }
 
 
@@ -1227,7 +1430,7 @@ async def result_images(job_id: str):
     )
 
 
-def _config_is_stale(snap: ConfigSnapshot) -> bool:
+def _config_is_stale(coord: Coord, snap: ConfigSnapshot) -> bool:
     """Whether the cached dump might not describe the coordinator running right now.
 
     Either the snapshot predates the live child (a restart whose re-prime did not
@@ -1249,15 +1452,25 @@ async def config_dump():
     loop is serial, so a round-trip here would block behind an in-flight push, and a
     cache still answers when the coordinator is RESTARTING or DEGRADED -- which is
     when this question gets asked. Staleness is reported rather than hidden.
+
+    With N flights there are N snapshots. The freshest non-stale one is served, and
+    the flight it came from is named in a header, rather than merging them into a
+    config that describes no real process.
     """
-    snap = coord.config_snapshot
-    if snap is None:
+    candidates = [
+        (c, c.config_snapshot) for c in pool.flights if c.config_snapshot is not None
+    ]
+    if not candidates:
         # 409, not 404 (the route exists) and not 503 (the coordinator may be
         # perfectly healthy, just unprepared). Same "real, but not yet" semantics as
         # /result/{job_id}/images.
         raise HTTPException(
-            409, f"no config yet: coordinator is {coord.state.value} and has not prepared"
+            409, f"no config yet: coordinator is {pool.state.value} and has not prepared"
         )
+    # Newest first, preferring a snapshot that still describes its live child.
+    coord, snap = min(
+        candidates, key=lambda pair: (_config_is_stale(*pair), -pair[1].at)
+    )
     # Every header goes on this object: mutating an injected `response: Response` has
     # no effect once a handler returns a Response of its own.
     return Response(
@@ -1269,7 +1482,8 @@ async def config_dump():
             "Content-Disposition": 'inline; filename="donutBlitzCornerConfig.py"',
             "X-Donut-Generation": str(snap.generation),
             "X-Donut-Config-Sha256": snap.sha256,
-            "X-Donut-Stale": "1" if _config_is_stale(snap) else "0",
+            "X-Donut-Flight": str(coord.index),
+            "X-Donut-Stale": "1" if _config_is_stale(coord, snap) else "0",
             "Cache-Control": "no-store",
         },
     )
@@ -1282,56 +1496,80 @@ def _job_counts() -> dict:
     return counts
 
 
+def _flight_health(coord: Coord) -> dict:
+    snap = coord.config_snapshot
+    return {
+        "index": coord.index,
+        "status": coord.state.value,
+        "ready": coord.state is CoordState.READY,
+        "alive": coord.is_alive(),
+        "primed": coord.primed_args is not None,
+        # Projected, not raw: primed_args retains full -C bodies so it stays
+        # replayable, and this endpoint is polled once a second.
+        "primed_args": _redact_primed_args(coord.primed_args),
+        # A ~200-byte fingerprint of the config, so the dashboard can show that
+        # one is installed (and whether it is stale) without pulling 77 KB.
+        "config": None if snap is None else {
+            "generation": snap.generation,
+            "stale": _config_is_stale(coord, snap),
+            "bytes": len(snap.dump),
+            "sha256": snap.sha256[:12],
+            "n_overrides": len(snap.overrides),
+            "at": snap.at,
+        },
+        "generation": coord.generation,
+        "spawns": coord.spawns,
+        "restart_attempts": coord.restart_attempts,
+        "pid": coord.child_pid,
+        "child_uptime_s": coord.child_uptime_s,
+        # last_loss.exitcode is the highest-value field here: -11 is a segfault
+        # (a fork-safety regression), -9 is SIGKILL, which on a service that
+        # oscillates 4-6 GB RSS should be read as macOS jetsam, and 1 is a
+        # Python exception with a traceback in the log.
+        "last_loss": coord.last_loss,
+        "degraded_reason": coord.degraded_reason,
+        # alive without ready and with in_flight > 0, held for minutes, is the
+        # wedged-but-alive signature that /admin/restart exists for.
+        "in_flight": coord.in_flight,
+        "busy": coord.busy,
+        "queue_depth": pool.queue_depth(coord),
+    }
+
+
 @app.get("/health")
 async def health(request: Request, response: Response, authorization: str = Header(None)):
-    """The status *code* carries the verdict: 200 only when READY, else 503.
+    """The status *code* carries the verdict: 200 when any flight is READY, else 503.
 
     Nothing can supervise an endpoint that always returns 200. Auth is optional
     rather than absent -- a bare remote probe gets the verdict plus a minimal body,
     while a local caller or a valid token gets the full detail.
+
+    "Any flight" rather than "all": a pool with one healthy lane still serves every
+    request correctly, just at lower throughput, and a supervisor must not kill it
+    for that. `status` says "partial" in exactly that case, so the degradation is
+    still visible to anyone reading more than the status code.
     """
-    ready = coord.state is CoordState.READY
+    n_ready = sum(1 for c in pool.flights if c.state is CoordState.READY)
+    ready = n_ready > 0
     response.status_code = 200 if ready else 503
     response.headers["Cache-Control"] = "no-store"
 
-    body: dict[str, Any] = {"status": coord.state.value, "ready": ready}
+    if ready and n_ready < len(pool):
+        status = "partial"
+    else:
+        status = pool.state.value
+
+    body: dict[str, Any] = {"status": status, "ready": ready}
     if not _is_loopback(request):
         token = os.environ.get("DONUT_SERVER_TOKEN")
         if not token or authorization != f"Bearer {token}":
             return body
 
-    snap = coord.config_snapshot
     body.update(
         {
-            "alive": coord.is_alive(),
-            "primed": coord.primed_args is not None,
-            # Projected, not raw: primed_args retains full -C bodies so it stays
-            # replayable, and this endpoint is polled once a second.
-            "primed_args": _redact_primed_args(coord.primed_args),
-            # A ~200-byte fingerprint of the config, so the dashboard can show that
-            # one is installed (and whether it is stale) without pulling 77 KB.
-            "config": None if snap is None else {
-                "generation": snap.generation,
-                "stale": _config_is_stale(snap),
-                "bytes": len(snap.dump),
-                "sha256": snap.sha256[:12],
-                "n_overrides": len(snap.overrides),
-                "at": snap.at,
-            },
-            "generation": coord.generation,
-            "spawns": coord.spawns,
-            "restart_attempts": coord.restart_attempts,
-            "pid": coord.child_pid,
-            "child_uptime_s": coord.child_uptime_s,
-            # last_loss.exitcode is the highest-value field here: -11 is a segfault
-            # (a fork-safety regression), -9 is SIGKILL, which on a service that
-            # oscillates 4-6 GB RSS should be read as macOS jetsam, and 1 is a
-            # Python exception with a traceback in the log.
-            "last_loss": coord.last_loss,
-            "degraded_reason": coord.degraded_reason,
-            # alive without ready and with in_flight > 0, held for minutes, is the
-            # wedged-but-alive signature that /admin/restart exists for.
-            "in_flight": coord.in_flight,
+            "n_flights": len(pool),
+            "n_ready": n_ready,
+            "flights": [_flight_health(c) for c in pool.flights],
             "jobs": _job_counts(),
         }
     )
@@ -1339,17 +1577,35 @@ async def health(request: Request, response: Response, authorization: str = Head
 
 
 @app.post("/admin/restart", dependencies=[Depends(check_auth)])
-async def admin_restart(response: Response):
+async def admin_restart(response: Response, flight: int | None = None):
     """Recover a wedged-but-alive coordinator, and the only way out of DEGRADED.
 
     There is deliberately no automatic command timeout: a generous bound cannot be
     sized safely against a 6.1-8.9 s push, and a mis-sized one kills healthy work.
     An operator (or an external watchdog) who knows a job has been COMPUTING for
     minutes has strictly more information than a blind timeout.
+
+    Bare, this restarts every flight, which is what it meant when there was only
+    one. `?flight=N` targets a single lane -- the usual case now, since a wedge is
+    a property of one child and restarting the healthy lanes alongside it would
+    throw away their warm caches and any job they are computing.
     """
-    pid = coord.request_restart("operator requested restart via /admin/restart")
+    if flight is not None and not 0 <= flight < len(pool):
+        raise HTTPException(400, f"flight must be in 0..{len(pool) - 1}, got {flight}")
+    targets = pool.flights if flight is None else [pool.flights[flight]]
+    reason = "operator requested restart via /admin/restart"
     response.status_code = 202
-    return {"restarting": True, "killed_pid": pid, "state": coord.state.value}
+    return {
+        "restarting": True,
+        "flights": [
+            {
+                "index": coord.index,
+                "killed_pid": coord.request_restart(reason),
+                "state": coord.state.value,
+            }
+            for coord in targets
+        ],
+    }
 
 
 # ------------------------------------------------------------------- dashboard
@@ -1417,7 +1673,7 @@ async def admin_jobs(response: Response, limit: int = JOBS_PAGE_DEFAULT):
     O(limit), not O(len(JOBS)): JOBS is insertion-ordered, so the newest rows are
     the tail and islice(reversed(...)) stops after `limit` of them. Iterating the
     live view is safe here because this coroutine never awaits, and the only other
-    writer -- _fail_in_flight_jobs on the reader thread -- mutates records rather
+    writer -- FlightPool._fail_jobs on the reader thread -- mutates records rather
     than the dict.
     """
     limit = max(1, min(JOBS_PAGE_MAX, limit))
@@ -1425,9 +1681,9 @@ async def admin_jobs(response: Response, limit: int = JOBS_PAGE_DEFAULT):
     items = itertools.islice(reversed(JOBS.items()), limit)
     rows = [_job_row(job_id, record, now) for job_id, record in items]
 
-    # At most one job is non-terminal at a time: push_lock serializes pushes and
-    # the coordinator's command loop is serial.
-    active = next((row["job_id"] for row in rows if row["state"] in _ACTIVE_STATES), None)
+    # Plural, and unbounded in principle: one job per flight can be non-terminal
+    # at once, plus any number merely PREPARED and waiting to be pushed.
+    active = [row["job_id"] for row in rows if row["state"] in _ACTIVE_STATES]
 
     response.headers.update(_NO_STORE)
     # `counts` duplicates /health's `jobs` on purpose: the table and the per-node
@@ -1438,7 +1694,7 @@ async def admin_jobs(response: Response, limit: int = JOBS_PAGE_DEFAULT):
         "returned": len(rows),
         "limit": limit,
         "counts": _job_counts(),
-        "active_job_id": active,
+        "active_job_ids": active,
         "jobs": rows,
     }
 

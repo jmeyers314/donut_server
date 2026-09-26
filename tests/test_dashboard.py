@@ -80,7 +80,8 @@ def test_a_loopback_caller_needs_no_token(monkeypatch, host):
 
     # /health gives a local caller the full detail, not the minimal public body.
     body = client.get("/health").json()
-    assert {"pid", "in_flight", "last_loss", "jobs"} <= set(body)
+    assert {"n_flights", "n_ready", "flights", "jobs"} <= set(body)
+    assert {"pid", "in_flight", "last_loss"} <= set(body["flights"][0])
 
 
 def test_a_remote_caller_still_needs_the_token(monkeypatch):
@@ -177,8 +178,8 @@ def test_admin_jobs_is_newest_first_and_capped(monkeypatch):
 
 
 def test_admin_jobs_reports_the_job_in_flight(monkeypatch):
-    """active_job_id drives which node the job diagram highlights, and it must skip
-    the terminal states rather than just taking the newest row."""
+    """active_job_ids drives which node the job diagram highlights, and it must skip
+    the terminal states rather than just taking the newest rows."""
     jobs = {
         "old": JobRecord(job_id="old", state=JobState.DONE),
         "live": JobRecord(job_id="live", state=JobState.COMPUTING),
@@ -186,7 +187,7 @@ def test_admin_jobs_reports_the_job_in_flight(monkeypatch):
     }
     client = make_client(monkeypatch, jobs)
     body = client.get("/admin/jobs", headers=auth()).json()
-    assert body["active_job_id"] == "live"
+    assert body["active_job_ids"] == ["live"]
     assert body["counts"] == {"DONE": 1, "COMPUTING": 1, "ERROR": 1}
 
 
@@ -422,6 +423,7 @@ class FakeCoord:
         self.generation = generation
         self.primed_args = primed_args
         self.state = state or server.CoordState.READY
+        self.index = 0
 
     @property
     def config_snapshot(self):
@@ -438,6 +440,21 @@ class FakeCoord:
     last_loss = None
     degraded_reason = None
     in_flight = 0
+    busy = False
+
+
+def patch_pool(monkeypatch, *coords):
+    """Swap in a FlightPool over the given fakes, bypassing its own construction
+    (which would spawn real coordinators)."""
+    pool = server.FlightPool.__new__(server.FlightPool)
+    pool.flights = list(coords)
+    for i, coord in enumerate(coords):
+        coord.index = i
+    pool._by_job = {}
+    pool._last_used = [0.0] * len(coords)
+    pool._queued = [0] * len(coords)
+    monkeypatch.setattr(server, "pool", pool)
+    return pool
 
 
 def make_snapshot(generation=1, overrides=None):
@@ -454,9 +471,7 @@ def make_snapshot(generation=1, overrides=None):
 
 def test_config_needs_a_token_and_409s_before_any_prepare(monkeypatch):
     client = make_client(monkeypatch)
-    monkeypatch.setattr(
-        server, "coord", FakeCoord(snapshot=None, state=server.CoordState.STARTING)
-    )
+    patch_pool(monkeypatch, FakeCoord(snapshot=None, state=server.CoordState.STARTING))
 
     assert client.get("/config").status_code == 401
 
@@ -471,9 +486,7 @@ def test_config_needs_a_token_and_409s_before_any_prepare(monkeypatch):
 def test_config_serves_a_loadable_file_with_a_freshness_verdict(monkeypatch):
     client = make_client(monkeypatch)
     snap = make_snapshot(generation=3)
-    monkeypatch.setattr(
-        server, "coord", FakeCoord(snap, generation=3, primed_args={"cmd": "prepare"})
-    )
+    patch_pool(monkeypatch, FakeCoord(snap, generation=3, primed_args={"cmd": "prepare"}))
 
     resp = client.get("/config", headers=auth())
 
@@ -499,7 +512,7 @@ def test_config_serves_a_loadable_file_with_a_freshness_verdict(monkeypatch):
 )
 def test_config_flags_a_snapshot_that_may_not_describe_the_live_child(monkeypatch, coord_kwargs):
     client = make_client(monkeypatch)
-    monkeypatch.setattr(server, "coord", FakeCoord(make_snapshot(generation=3), **coord_kwargs))
+    patch_pool(monkeypatch, FakeCoord(make_snapshot(generation=3), **coord_kwargs))
 
     resp = client.get("/config", headers=auth())
 
@@ -514,9 +527,8 @@ def test_config_is_still_served_while_degraded(monkeypatch):
     to know what the dead coordinator was running, and a command round-trip would
     have nothing to talk to."""
     client = make_client(monkeypatch)
-    monkeypatch.setattr(
-        server,
-        "coord",
+    patch_pool(
+        monkeypatch,
         FakeCoord(
             make_snapshot(generation=2),
             generation=2,
@@ -546,13 +558,14 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
         ],
     }
     snap = make_snapshot(generation=1, overrides=server._digest_overrides(primed["config_overrides"]))
-    monkeypatch.setattr(server, "coord", FakeCoord(snap, generation=1, primed_args=primed))
+    patch_pool(monkeypatch, FakeCoord(snap, generation=1, primed_args=primed))
 
     resp = client.get("/health", headers=auth())
     body = resp.json()
 
     assert "UNIQUE_OVERRIDE_BODY_MARKER" not in resp.text
-    assert body["config"] == {
+    (flight,) = body["flights"]
+    assert flight["config"] == {
         "generation": 1,
         "stale": False,
         "bytes": len(DUMP),
@@ -561,7 +574,7 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
         "at": 1_700_000_000.0,
     }
 
-    shown = body["primed_args"]["config_overrides"]
+    shown = flight["primed_args"]["config_overrides"]
     # A -c entry survives whole: it is what an operator reads off the dashboard.
     assert shown[0] == {"kind": "value", "field": "maxFitScatter", "value": "2.0"}
     # A -C entry keeps its identity and a fingerprint, but not its body.
@@ -569,8 +582,8 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
     assert shown[1]["lines"] == 1
     assert "text" not in shown[1]
     # The fields the dashboard already renders are untouched by the projection.
-    assert body["primed_args"]["band"] == "r"
-    assert body["primed_args"]["boresight_ra"] == 283.666
+    assert flight["primed_args"]["band"] == "r"
+    assert flight["primed_args"]["boresight_ra"] == 283.666
 
 
 @pytest.mark.parametrize(

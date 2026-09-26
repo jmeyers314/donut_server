@@ -96,7 +96,24 @@ from lsst.ts.wep.blitz.donutBlitzCorner import (
 
 _log = logging.getLogger(__name__)
 
-NUM_WORKERS = 8
+def _num_workers() -> int:
+    """How many cores the task may fork over, per push.
+
+    Deliberately *not* divided by the number of flights: 8 workers on this host's
+    128 cores means even N=4 is nowhere near oversubscription, so partitioning the
+    budget would halve per-job parallelism to avoid a problem two orders of
+    magnitude away. Configurable so a small host can lower it. Resolved at import
+    in the child, which inherits the front-end's environment.
+    """
+    try:
+        n = int(os.environ.get("DONUT_SERVER_NUM_WORKERS", "8"))
+    except ValueError:
+        return 8
+    return max(1, n)
+
+
+NUM_WORKERS = _num_workers()
+
 
 def calib_dir() -> str:
     """The calib directory, located by the caller's environment.

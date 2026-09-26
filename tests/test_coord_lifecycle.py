@@ -465,10 +465,28 @@ def test_admin_restart_is_the_way_out_of_degraded():
 TOKEN = "test-token"
 
 
-def make_client(monkeypatch, coord):
+def make_pool(*coords):
+    """A FlightPool wrapping already-built Coords, bypassing its own construction.
+
+    The endpoint tests below each want a specific misbehaving child, which is
+    expressed through Coord's ctor seams -- so the pool is assembled around the
+    Coords rather than asked to build them.
+    """
+    pool = server.FlightPool.__new__(server.FlightPool)
+    pool.flights = list(coords)
+    for i, coord in enumerate(coords):
+        coord.index = i
+        coord._on_restart = pool._loss_handler(i)
+    pool._by_job = {}
+    pool._last_used = [0.0] * len(coords)
+    pool._queued = [0] * len(coords)
+    return pool
+
+
+def make_client(monkeypatch, *coords):
     monkeypatch.setenv("DONUT_SERVER_TOKEN", TOKEN)
     # lifespan reads the module global, so this must be patched before entering.
-    monkeypatch.setattr(server, "coord", coord)
+    monkeypatch.setattr(server, "pool", make_pool(*coords))
     monkeypatch.setattr(server, "JOBS", {})
     return TestClient(server.app)
 
@@ -501,9 +519,12 @@ def test_health_is_reachable_without_a_token(monkeypatch):
         assert resp.headers["cache-control"] == "no-store"
 
         detail = client.get("/health", headers=auth()).json()
-        assert detail["generation"] == 1
-        assert detail["alive"] is True
-        assert detail["primed"] is False
+        assert detail["n_flights"] == 1
+        assert detail["n_ready"] == 1
+        (flight,) = detail["flights"]
+        assert flight["generation"] == 1
+        assert flight["alive"] is True
+        assert flight["primed"] is False
 
 
 def test_health_503s_when_degraded_and_reports_the_exitcode(monkeypatch):
@@ -522,10 +543,11 @@ def test_health_503s_when_degraded_and_reports_the_exitcode(monkeypatch):
         body = resp.json()
         assert body["status"] == "degraded"
         assert body["ready"] is False
-        assert body["degraded_reason"]
+        (flight,) = body["flights"]
+        assert flight["degraded_reason"]
         # exitcode is the highest-value field in last_loss: 3 here because
         # exit_before_hello calls os._exit(3).
-        assert body["last_loss"]["exitcode"] == 3
+        assert flight["last_loss"]["exitcode"] == 3
 
 
 def test_prepare_503s_with_a_reason_when_the_coordinator_is_degraded(monkeypatch):
@@ -586,3 +608,230 @@ def test_health_503s_while_starting(monkeypatch):
         assert resp.status_code == 503
         assert resp.json() == {"status": "starting", "ready": False}
         assert coord.is_alive() is True
+
+
+# ------------------------------------------------------------- 14. the pool
+
+def prepare(client, band="r"):
+    return client.post(
+        "/prepare",
+        json={"band": band, "boresight_ra": 1.0, "boresight_dec": 2.0},
+        headers=auth(),
+    )
+
+
+def push_blob():
+    return protocol.pack_blob({"R00_SW0:img": b"pixels", "R00_SW0:meta": b"meta"})
+
+
+def test_each_flight_gets_its_own_child():
+    """The whole basis of the pool: N Coords are N processes with N shared blocks,
+    not N views onto one. Distinct pids is the cheapest proof."""
+
+    async def body():
+        pool = server.FlightPool(
+            2,
+            target=fake_coordinator.main,
+            target_args=([],),
+            shm_size=TEST_SHM_SIZE,
+            backoff=(0.0, 0.0, 0.0),
+        )
+        await pool.start()
+        try:
+            for coord in pool.flights:
+                await wait_ready(coord)
+            pids = {c.child_pid for c in pool.flights}
+            blocks = {c.shm.name for c in pool.flights}
+            assert len(pids) == 2
+            assert len(blocks) == 2
+            assert [c.index for c in pool.flights] == [0, 1]
+        finally:
+            await pool.aclose()
+
+    asyncio.run(body())
+
+
+def test_a_loss_on_one_flight_does_not_error_another_flights_job(monkeypatch):
+    """The correctness fix the pool needs most. A single-coordinator server could
+    safely fail every non-terminal job on a loss; with two lanes that would kill a
+    healthy job on the other one, for no reason its producer could diagnose."""
+    # Flight 0's second command (its push) crashes the child; flight 1 is healthy.
+    with make_client(monkeypatch, make_coord([None, "crash"]), make_coord()) as client:
+        for coord in server.pool.flights:
+            poll_until(lambda c=coord: c.state is CoordState.READY, what="READY")
+
+        # One job per flight. Distinct bands, so the second prepare cannot take
+        # select()'s already-primed branch back onto flight 0; LRU then sends it to
+        # flight 1, which is asserted rather than assumed.
+        a = prepare(client, "r").json()
+        b = prepare(client, "g").json()
+        assert (a["flight"], b["flight"]) == (0, 1)
+
+        # Strand b mid-flight by hand: driving a real concurrent push through
+        # TestClient would need two threads, and what is under test here is the
+        # filtering in _fail_jobs, not the concurrency.
+        server.JOBS[b["job_id"]].state = server.JobState.COMPUTING
+
+        resp = client.post(f"/push/{a['job_id']}", content=push_blob(), headers=auth())
+        assert resp.status_code == 503
+        assert resp.json()["flight"] == 0
+
+        assert server.JOBS[a["job_id"]].state is server.JobState.ERROR
+        assert server.JOBS[b["job_id"]].state is server.JobState.COMPUTING
+
+
+def test_a_repeated_prepare_stays_on_the_flight_that_is_already_primed(monkeypatch):
+    """Case 1 of select(): reusing a primed flight is free, and warming the second
+    lane with an identical config would only evict something useful from it."""
+    with make_client(monkeypatch, make_coord(), make_coord()) as client:
+        for coord in server.pool.flights:
+            poll_until(lambda c=coord: c.state is CoordState.READY, what="READY")
+
+        first = prepare(client, "r").json()["flight"]
+        # A different config goes to the other lane; the original then comes back to
+        # the lane still holding it, rather than to the now-LRU one.
+        other = prepare(client, "g").json()["flight"]
+        again = prepare(client, "r").json()["flight"]
+
+        assert other != first
+        assert again == first
+
+
+def test_a_push_for_an_unrouted_job_falls_back_rather_than_404ing(monkeypatch):
+    """The orphaned-push case: the job record exists but the routing entry does
+    not. Any flight can serve it -- the push carries prepared_key, which the
+    coordinator uses to reload that job's config -- so this must not be an error."""
+    with make_client(monkeypatch, make_coord()) as client:
+        job_id = prepare(client).json()["job_id"]
+        server.pool._by_job.clear()
+
+        resp = client.post(f"/push/{job_id}", content=push_blob(), headers=auth())
+
+        # The fake has no real pipeline, so the interesting assertion is that this
+        # reached a flight at all rather than 404ing on the missing route.
+        assert resp.status_code != 404
+        assert server.pool._by_job[job_id] == 0
+
+
+def test_health_is_partial_when_one_flight_is_down(monkeypatch):
+    """200 with a warning, not 503: a pool with one healthy lane serves every
+    request correctly, and a supervisor must not kill it for running slower."""
+    broken = Coord(
+        target=fake_coordinator.exit_before_hello,
+        target_args=([],),
+        shm_size=TEST_SHM_SIZE,
+        max_restart_attempts=1,
+        backoff=(0.0,),
+    )
+    with make_client(monkeypatch, make_coord(), broken) as client:
+        poll_until(lambda: server.pool.flights[0].state is CoordState.READY, what="READY")
+        poll_until(lambda: broken.state is CoordState.DEGRADED, what="DEGRADED")
+
+        resp = client.get("/health", headers=auth())
+        body = resp.json()
+
+        assert resp.status_code == 200
+        assert body["status"] == "partial"
+        assert body["ready"] is True
+        assert (body["n_flights"], body["n_ready"]) == (2, 1)
+        assert body["flights"][1]["status"] == "degraded"
+
+        # And a prepare still succeeds, on the lane that is up.
+        assert prepare(client).json()["flight"] == 0
+
+
+def test_restart_targets_one_flight_and_validates_the_index(monkeypatch):
+    with make_client(monkeypatch, make_coord(), make_coord()) as client:
+        for coord in server.pool.flights:
+            poll_until(lambda c=coord: c.state is CoordState.READY, what="READY")
+        untouched = server.pool.flights[1].child_pid
+
+        body = client.post("/admin/restart?flight=0", headers=auth()).json()
+        assert [f["index"] for f in body["flights"]] == [0]
+
+        poll_until(lambda: server.pool.flights[0].generation >= 2, what="generation 2")
+        # The other lane keeps its child, and its warm caches with it.
+        assert server.pool.flights[1].child_pid == untouched
+        assert server.pool.flights[1].generation == 1
+
+        assert client.post("/admin/restart?flight=9", headers=auth()).status_code == 400
+
+        # Bare still means every flight, which is what it meant with one.
+        body = client.post("/admin/restart", headers=auth()).json()
+        assert [f["index"] for f in body["flights"]] == [0, 1]
+
+
+def test_two_flights_compute_concurrently():
+    """The claim the whole change exists to make. Two 1 s commands issued together
+    must finish in ~1 s, not ~2: with a single coordinator the second queues behind
+    the first on the one _lock, and this is the only test that can tell the
+    difference between the two designs."""
+
+    async def body():
+        pool = server.FlightPool(
+            2,
+            target=fake_coordinator.main,
+            target_args=(["slow:1.0"],),
+            shm_size=TEST_SHM_SIZE,
+            backoff=(0.0, 0.0, 0.0),
+        )
+        await pool.start()
+        try:
+            for coord in pool.flights:
+                await wait_ready(coord)
+            t0 = time.monotonic()
+            await asyncio.gather(
+                *(c.send_command({"cmd": "ping"}) for c in pool.flights)
+            )
+            elapsed = time.monotonic() - t0
+            assert 1.0 <= elapsed < 1.8, elapsed
+        finally:
+            await pool.aclose()
+
+    asyncio.run(body())
+
+
+def test_one_flight_reproduces_single_coordinator_serialization():
+    """The safety net for the whole change: N=1 must behave exactly as before, which
+    for the pool's purposes means one lane, one lock, and no concurrency."""
+
+    async def body():
+        pool = server.FlightPool(
+            1,
+            target=fake_coordinator.main,
+            target_args=(["slow:0.5", "slow:0.5"],),
+            shm_size=TEST_SHM_SIZE,
+            backoff=(0.0, 0.0, 0.0),
+        )
+        await pool.start()
+        try:
+            (coord,) = pool.flights
+            await wait_ready(coord)
+            t0 = time.monotonic()
+            await asyncio.gather(
+                coord.send_command({"cmd": "ping"}),
+                coord.send_command({"cmd": "ping"}),
+            )
+            # Serialized behind the one _lock, as it always was.
+            assert time.monotonic() - t0 >= 1.0
+            # And every prepare and push necessarily routes to the same lane.
+            assert pool.select({"cmd": "prepare"}).index == 0
+            assert pool.for_push("never-prepared").index == 0
+        finally:
+            await pool.aclose()
+
+    asyncio.run(body())
+
+
+def test_num_flights_comes_from_the_environment(monkeypatch):
+    """The transport from `donutServer.py --num-flights` is the env var, because
+    uvicorn imports this module in-process."""
+    monkeypatch.delenv("DONUT_SERVER_NUM_FLIGHTS", raising=False)
+    assert server.num_flights() == 2
+    monkeypatch.setenv("DONUT_SERVER_NUM_FLIGHTS", "4")
+    assert server.num_flights() == 4
+    # Neither a typo nor a nonsense value may leave the service with no lanes.
+    monkeypatch.setenv("DONUT_SERVER_NUM_FLIGHTS", "0")
+    assert server.num_flights() == 1
+    monkeypatch.setenv("DONUT_SERVER_NUM_FLIGHTS", "two")
+    assert server.num_flights() == 2

@@ -22,7 +22,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    # Both default to None and are written into the environment below, because that
+    # is the only transport that reaches where they are read: uvicorn.run() imports
+    # the app by string in this process, and the coordinator children inherit the
+    # environment from it. The flags exist for discoverability through --help.
+    parser.add_argument(
+        "--num-flights",
+        type=int,
+        help="coordinator processes to run, each able to compute one job at a time "
+        "(default 2; DONUT_SERVER_NUM_FLIGHTS)",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        help="cores the task may fork over per push, not divided between flights "
+        "(default 8; DONUT_SERVER_NUM_WORKERS)",
+    )
     args = parser.parse_args()
+
+    # setdefault, so an already-exported env var wins over the flag's default of
+    # None -- and an explicit flag wins over nothing, which is the intent.
+    for flag, var in (
+        (args.num_flights, "DONUT_SERVER_NUM_FLIGHTS"),
+        (args.num_workers, "DONUT_SERVER_NUM_WORKERS"),
+    ):
+        if flag is not None:
+            os.environ.setdefault(var, str(flag))
 
     # Before importing anything that pulls numpy: keep BLAS/OpenMP
     # single-threaded so the task's 8 fork workers don't each fork with a live
@@ -50,6 +75,13 @@ def main() -> None:
     )
     print(f"Pipeline logs (INFO and above) -> {log}")
     print(f"  tail -f {log}")
+
+    # Announced because "how many lanes is this running" is the first thing to
+    # check when throughput looks wrong.
+    print(
+        f"Flights: {os.environ.get('DONUT_SERVER_NUM_FLIGHTS', '2')}"
+        f"  workers/push: {os.environ.get('DONUT_SERVER_NUM_WORKERS', '8')}"
+    )
 
     # Still generated even though the dashboard no longer asks for one: the token is
     # what protects /prepare and /push from the network. Callers on this host are
