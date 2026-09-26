@@ -66,6 +66,10 @@
   .chip.off { border-color: var(--bad); color: var(--bad); }
   .loss { margin-top: 8px; color: var(--warn); max-width: 110ch; }
   .loss:empty { display: none; }
+  /* --- flights --- */
+  .flight { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; margin-bottom: 10px; }
+  .fhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+  .ftitle { color: var(--ink); font-weight: 600; }
   /* --- state machine diagrams --- */
   svg { display: block; max-width: 100%; height: auto; }
   .nbox { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; rx: 4; }
@@ -119,25 +123,43 @@
   <span class="host" id="host"></span>
   <span class="spacer"></span>
   <span class="chip" id="poll">idle</span>
-  <button id="restart">restart coordinator</button>
+  <button id="restart">restart all flights</button>
 </header>
 
 <div class="banner" id="banner"></div>
 
-<section>
-  <h2>Coordinator <span class="note" id="coord-note"></span></h2>
-  <svg id="svg-coord" viewBox="0 0 860 200" role="img" aria-label="coordinator state machine">
-    <defs>
-      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
-              orient="auto-start-reverse">
-        <path d="M0,0 L10,5 L0,10 z" fill="#5b616d"/>
-      </marker>
-      <marker id="ar-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
-              orient="auto-start-reverse">
-        <path d="M0,0 L10,5 L0,10 z" fill="#c99a3d"/>
-      </marker>
-    </defs>
+<!-- The arrow markers live here rather than in the coordinator diagram, because
+     that diagram is now cloned per flight and the job diagram references the same
+     markers by id -- so they must sit in exactly one place that is always in the
+     document. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+            orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b616d"/>
+    </marker>
+    <marker id="ar-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+            orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c99a3d"/>
+    </marker>
+  </defs>
+</svg>
 
+<section>
+  <h2>Coordinator flights <span class="note" id="coord-note"></span></h2>
+  <!-- One of these per flight, cloned at render time and its ids prefixed "fN-".
+       A template's content is inert and not part of the document, so the ids below
+       never collide with the clones' -- but they are still the ids paint() looks
+       for, after prefixing. -->
+  <template id="flight-tpl">
+  <div class="flight">
+  <div class="fhead">
+    <span class="ftitle" data-el="title"></span>
+    <span class="note" data-el="note"></span>
+    <span class="spacer"></span>
+    <button data-el="restart">restart</button>
+  </div>
+  <svg viewBox="0 0 860 200" role="img" aria-label="coordinator state machine">
     <!-- starting -> degraded, routed above the row (attempts exhausted) -->
     <path class="edge" d="M90,40 L90,20 L702,20 L702,40" marker-end="url(#ar)"/>
     <text class="etext" x="200" y="15">bring-up attempts exhausted</text>
@@ -177,8 +199,11 @@
       <text class="nlabel" x="274" y="173">stopping</text>
     </g>
   </svg>
-  <div class="facts" id="coord-facts"></div>
-  <div class="loss" id="coord-loss"></div>
+  <div class="facts" data-el="facts"></div>
+  <div class="loss" data-el="loss"></div>
+  </div>
+  </template>
+  <div id="flights"></div>
 </section>
 
 <section>
@@ -363,11 +388,47 @@ function paint(svgPrefix, nodeIds, activeState) {
 const COORD_STATES = ["starting", "ready", "restarting", "degraded", "stopping"];
 const JOB_STATES = ["PREPARED", "RECEIVING", "COMPUTING", "DONE", "ERROR"];
 
-function renderCoord(h) {
-  paint("c-", COORD_STATES, h.status);
-  el("coord-note").textContent = h.ready ? "ready" : h.status;
+// One panel per flight, built from #flight-tpl on the first poll and reused after.
+// Rebuilt only when the flight count changes, so a 1 Hz poll does not throw away
+// and recreate N SVGs every second.
+const panels = new Map();
 
-  const facts = el("coord-facts");
+function flightPanel(index) {
+  let panel = panels.get(index);
+  if (panel) return panel;
+
+  const frag = el("flight-tpl").content.cloneNode(true);
+  const prefix = "f" + index + "-";
+  // paint() addresses nodes by id, so each clone's ids have to be distinct or every
+  // flight would light up whichever state the last-rendered one is in.
+  for (const node of frag.querySelectorAll("[id]")) node.id = prefix + node.id;
+  const parts = {prefix};
+  for (const node of frag.querySelectorAll("[data-el]")) parts[node.dataset.el] = node;
+  el("flights").appendChild(frag);
+
+  parts.restart.onclick = () => armRestart(index, parts.restart);
+  panels.set(index, parts);
+  return parts;
+}
+
+function renderFlights(h) {
+  const flights = h.flights || [];
+  if (panels.size !== flights.length) {
+    el("flights").textContent = "";
+    panels.clear();
+  }
+  el("coord-note").textContent =
+    h.n_ready + "/" + h.n_flights + " ready" + (h.status === "partial" ? "  ·  partial" : "");
+  for (const f of flights) renderCoord(f);
+}
+
+function renderCoord(h) {
+  const parts = flightPanel(h.index);
+  paint(parts.prefix + "c-", COORD_STATES, h.status);
+  parts.title.textContent = "flight " + h.index;
+  parts.note.textContent = h.ready ? "ready" : h.status;
+
+  const facts = parts.facts;
   facts.textContent = "";
   // alive and ready are shown separately on purpose: is_alive() is true both for a
   // child 15 s into importing afw and for one whose fork pool is wedged
@@ -375,6 +436,7 @@ function renderCoord(h) {
   put(facts, "span", "alive", "chip " + (h.alive ? "on" : "off"));
   put(facts, "span", "ready", "chip " + (h.ready ? "on" : "off"));
   put(facts, "span", h.primed ? "primed" : "unprimed", "chip " + (h.primed ? "on" : "off"));
+  put(facts, "span", h.busy ? "busy" : "idle", "chip " + (h.busy ? "on" : ""));
   // Only shown when the cached config may not describe the live child, since the
   // ordinary case is "current" and a permanent chip for that is just noise.
   if (h.config && h.config.stale) {
@@ -384,6 +446,9 @@ function renderCoord(h) {
     ["gen", fmt.num(h.generation)], ["spawns", fmt.num(h.spawns)],
     ["attempts", fmt.num(h.restart_attempts)], ["pid", fmt.num(h.pid)],
     ["up", fmt.age(h.child_uptime_s)], ["in-flight", fmt.num(h.in_flight)],
+    // The backlog on this lane: prepares and pushes waiting on its lock. Sustained
+    // depth on one flight while another sits idle means routing, not capacity.
+    ["queued", fmt.num(h.queue_depth)],
   ];
   if (h.primed_args) {
     const a = h.primed_args;
@@ -413,19 +478,19 @@ function renderCoord(h) {
     a.target = "_blank";
   }
 
-  const loss = el("coord-loss");
+  const loss = parts.loss;
   loss.textContent = "";
   const hot = h.status === "restarting" || h.status === "degraded";
-  el("e-ready-restarting").classList.toggle("hot", hot);
+  el(parts.prefix + "e-ready-restarting").classList.toggle("hot", hot);
   if (h.degraded_reason) {
     put(loss, "div", "degraded: " + h.degraded_reason);
   }
   if (h.last_loss) {
     const L = h.last_loss;
-    const parts = ["last loss @ " + fmt.clock(L.at), "gen " + fmt.num(L.generation),
-                   "pid " + fmt.num(L.pid)];
-    if (L.provoked_by) parts.push("provoked by " + L.provoked_by);
-    put(loss, "div", parts.join("  ·  "));
+    const bits = ["last loss @ " + fmt.clock(L.at), "gen " + fmt.num(L.generation),
+                  "pid " + fmt.num(L.pid)];
+    if (L.provoked_by) bits.push("provoked by " + L.provoked_by);
+    put(loss, "div", bits.join("  ·  "));
     const ec = exitcodeText(L.exitcode);
     if (ec) put(loss, "div", "exitcode " + ec);
     if (L.reason) put(loss, "div", L.reason);
@@ -457,8 +522,9 @@ function renderJobs(d) {
   // running or is simply the last one to have finished.
   el("job-note").textContent = current
     ? short(current.job_id) + "  " + current.state + "  " +
-      (d.active_job_id ? "in flight " + fmt.secs(current.age_s)
-                       : "(most recent, " + fmt.age(current.age_s) + " ago)")
+      ((d.active_job_ids || []).includes(current.job_id)
+        ? "in flight " + fmt.secs(current.age_s)
+        : "(most recent, " + fmt.age(current.age_s) + " ago)")
     : "no jobs yet";
 
   // The per-job log follows the current job, so it has to reload when that changes.
@@ -522,15 +588,12 @@ async function download(j) {
 const short = (id) => id.slice(0, 8) + "…";
 
 // The one job the diagram is about: whatever is in flight, else the most recent, so
-// between jobs the last outcome stays lit rather than the diagram going blank. At
-// most one job is non-terminal at a time (push_lock plus the coordinator's serial
-// command loop), so "in flight" is unambiguous and this is never a choice between
-// two candidates. Past jobs live in the table below; the diagram does not track
-// them.
+// between jobs the last outcome stays lit rather than the diagram going blank. With
+// N flights several jobs can be non-terminal at once, so pick the newest of them --
+// jobs arrives newest-first from /admin/jobs. Past jobs live in the table below.
 function currentJob(d) {
-  const active = d.active_job_id
-    ? jobs.find((x) => x.job_id === d.active_job_id) : null;
-  return active || jobs[0] || null;
+  const ids = new Set(d.active_job_ids || []);
+  return jobs.find((x) => ids.has(x.job_id)) || jobs[0] || null;
 }
 
 const PHASES = [
@@ -682,7 +745,7 @@ async function pollHealth() {
   const h = await api("/health");
   if (!h) return;
   health = h;
-  renderCoord(h);
+  renderFlights(h);
 }
 
 async function pollJobs() {
@@ -730,34 +793,61 @@ loop(() => { if (el("log-auto").checked) return pollLog(false); }, 2000);
 // (server.py:553), so anything COMPUTING dies with it. Two-step, and it says which
 // job it is about to kill.
 
+// One arming at a time across all the buttons: arming flight 1's while flight 0's is
+// already armed disarms flight 0's, so a second click can never hit a lane the
+// warning was not about.
 let armed = null;
-const btn = el("restart");
-btn.onclick = async () => {
-  if (!armed) {
-    const active = health && health.in_flight > 0;
-    const j = jobs.find((x) => ["PREPARED", "RECEIVING", "COMPUTING"].includes(x.state));
-    btn.textContent = j
-      ? "confirm — this KILLS job " + short(j.job_id) + " (" + j.state + ")"
-      : (active ? "confirm — a job is in flight and will be killed" : "confirm restart?");
-    btn.classList.add("armed");
-    armed = setTimeout(disarm, 5000);
+
+function disarm() {
+  if (!armed) return;
+  clearTimeout(armed.timer);
+  armed.button.textContent = armed.label;
+  armed.button.classList.remove("armed");
+  armed = null;
+}
+
+// index === null restarts every flight, which is what the bare endpoint means.
+async function armRestart(index, button) {
+  const mine = armed && armed.button === button;
+  disarm();
+  if (!mine) {
+    const label = button.textContent;
+    button.textContent = "confirm — " + atRisk(index);
+    button.classList.add("armed");
+    armed = {button, label, timer: setTimeout(disarm, 5000)};
     return;
   }
-  disarm();
-  const d = await api("/admin/restart", {method: "POST"});
+  const query = index === null ? "" : "?flight=" + index;
+  const d = await api("/admin/restart" + query, {method: "POST"});
   if (d) {
-    banner("restart", "restart requested — killed pid " + d.killed_pid +
-                      ", state " + d.state);
+    banner("restart", "restart requested — " + (d.flights || []).map(
+      (f) => "flight " + f.index + ": killed pid " + f.killed_pid + ", " + f.state
+    ).join("  ·  "));
     setTimeout(() => banner("restart", null), 8000);
   }
   pollHealth();
-};
-function disarm() {
-  clearTimeout(armed);
-  armed = null;
-  btn.textContent = "restart coordinator";
-  btn.classList.remove("armed");
 }
+
+// What this restart is about to destroy. Only jobs routed to the targeted flights
+// die, but /admin/jobs does not say which flight a job is on, so name the jobs when
+// restarting everything and fall back to the flight's own busy/in-flight state
+// otherwise.
+function atRisk(index) {
+  const flights = (health && health.flights) || [];
+  if (index !== null) {
+    const f = flights.find((x) => x.index === index);
+    return f && (f.in_flight > 0 || f.busy)
+      ? "flight " + index + " is busy and its job will be killed"
+      : "restart flight " + index + "?";
+  }
+  const running = jobs.filter((x) => ["PREPARED", "RECEIVING", "COMPUTING"].includes(x.state));
+  if (running.length) {
+    return "this KILLS " + running.map((j) => short(j.job_id) + " (" + j.state + ")").join(", ");
+  }
+  return "restart all " + flights.length + " flights?";
+}
+
+el("restart").onclick = () => armRestart(null, el("restart"));
 </script>
 </body>
 </html>
