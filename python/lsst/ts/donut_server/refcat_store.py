@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
@@ -199,42 +200,100 @@ def _build_catalog(columns: dict[str, np.ndarray], mask: np.ndarray) -> Any:
     return catalog
 
 
+def _reshard_one(shard_id: int) -> dict[int, Any]:
+    """Read one level-5 file and split it into its level-7 children.
+
+    Level-7 indices come from `esutil.htm`, which is vectorised over whole
+    columns; `lsst.sphgeom`'s `HtmPixelization.index` is per-point and would be
+    far too slow at ~1M rows. It takes degrees, hence the rad2deg -- the stored
+    values are radians.
+    """
+    directory = refcat_dir()
+    path = os.path.join(directory, f"{shard_id}.fits")
+    if not os.path.exists(path):
+        # The whole sky is covered when the directory is complete, so a miss
+        # means the local copy is partial -- say that rather than letting a
+        # bare FileNotFoundError imply the pointing was wrong.
+        raise RuntimeError(
+            f"{directory} is incomplete: no shard {shard_id} at {path}. "
+            f"Expected all 8192 level-{SHARD_LEVEL} files, ids 8192..16383."
+        )
+    record = fits.getdata(path)
+    columns = {name: np.asarray(record[name]) for name in record.dtype.names}
+    child_ids = esutil.htm.HTM(LOAD_LEVEL).lookup_id(
+        np.rad2deg(columns["coord_ra"]), np.rad2deg(columns["coord_dec"])
+    )
+    return {
+        int(child_id): _build_catalog(columns, child_ids == child_id)
+        for child_id in np.unique(child_ids)
+    }
+
+
 def load_and_reshard(shard_ids: list[int]) -> dict[int, Any]:
     """Read level-5 files and split them into one catalog per level-7 child.
 
-    Returns `{level-7 index: SimpleCatalog}`. Level-7 indices come from
-    `esutil.htm`, which is vectorised over whole columns; `lsst.sphgeom`'s
-    `HtmPixelization.index` is per-point and would be far too slow at ~1M rows.
-    It takes degrees, hence the rad2deg -- the stored values are radians.
+    Returns `{level-7 index: SimpleCatalog}`, flattened across every parent.
+    Uncached: `_ensure_shards` is where reuse is decided.
     """
-    indexer = esutil.htm.HTM(LOAD_LEVEL)
-    directory = refcat_dir()
     shards: dict[int, Any] = {}
     for shard_id in shard_ids:
-        path = os.path.join(directory, f"{shard_id}.fits")
-        if not os.path.exists(path):
-            # The whole sky is covered when the directory is complete, so a miss
-            # means the local copy is partial -- say that rather than letting a
-            # bare FileNotFoundError imply the pointing was wrong.
-            raise RuntimeError(
-                f"{directory} is incomplete: no shard {shard_id} at {path}. "
-                f"Expected all 8192 level-{SHARD_LEVEL} files, ids 8192..16383."
-            )
-        record = fits.getdata(path)
-        columns = {name: np.asarray(record[name]) for name in record.dtype.names}
-        child_ids = indexer.lookup_id(
-            np.rad2deg(columns["coord_ra"]), np.rad2deg(columns["coord_dec"])
-        )
-        for child_id in np.unique(child_ids):
-            shards[int(child_id)] = _build_catalog(columns, child_ids == child_id)
+        shards.update(_reshard_one(shard_id))
     return shards
+
+
+# One level-5 parent's 16 level-7 children per entry, insertion order as LRU (the
+# same idiom coordinator._PREPARED_CACHE uses). Module-level rather than per-store
+# because each PreparedEntry builds its own RefCatStore, so an instance-level
+# cache would share nothing across pointings.
+#
+# The catalogs here are *shared* by every store that wants the same parent, which
+# is safe because nothing mutates them: build_quantum_context hands them to an
+# InMemoryLimitedButler that deep-copies on every get().
+_SHARD_CACHE: "OrderedDict[int, dict[int, Any]]" = OrderedDict()
+
+# A couple of pointings' worth of level-5 parents (a pointing wants ~10).
+# Indicative: a parent is ~20 MB resident, so this bounds the cache at ~0.5 GB.
+# It bounds the *cache* only -- a live RefCatStore holds its own references to
+# the children it was built from, so an evicted parent still in use is not freed
+# until that store is evicted too.
+SHARD_CACHE_CAP = 24
+
+
+def _ensure_shards(wanted: frozenset[int]) -> tuple[dict[int, Any], int]:
+    """Level-7 children for every level-5 id in `wanted`, flattened, plus how
+    many parents actually had to be read from disk.
+
+    Only the missing parents are loaded, which is the whole point: a slew that
+    shifts 3 of 10 shards should not re-read the 7 it kept. Touched parents move
+    to MRU so the shards a pointing is actively using are the last evicted.
+    """
+    loaded = 0
+    shards: dict[int, Any] = {}
+    for shard_id in sorted(wanted):
+        children = _SHARD_CACHE.get(shard_id)
+        if children is None:
+            # Insert after the read returns, so a failure leaves the cache intact.
+            children = _SHARD_CACHE[shard_id] = _reshard_one(shard_id)
+            loaded += 1
+        else:
+            _SHARD_CACHE.move_to_end(shard_id)
+        shards.update(children)
+
+    # After composing, so a `wanted` larger than the cap still returns every
+    # child it asked for rather than tripping over its own eviction.
+    while len(_SHARD_CACHE) > SHARD_CACHE_CAP:
+        _SHARD_CACHE.popitem(last=False)
+
+    return shards, loaded
 
 
 class RefCatStore:
     """Cache of level-7 shard catalogs for the current pointing.
 
     Keyed on the *set of level-5 shard ids*, not on the boresight itself, so an
-    AOS sequence dithering within one pointing keeps hitting the cache.
+    AOS sequence dithering within one pointing keeps hitting the cache. When the
+    set does change, the children come from the module-level `_SHARD_CACHE`, so
+    only the parents this store has never seen are read from disk.
     """
 
     def __init__(self) -> None:
@@ -249,9 +308,10 @@ class RefCatStore:
         t0 = time.monotonic()
         wanted = frozenset(shard_ids_for_pointing(ra_deg, dec_deg))
         reused = wanted == self.shard_ids
+        n_loaded = 0
 
         if not reused:
-            shards = load_and_reshard(sorted(wanted))
+            shards, n_loaded = _ensure_shards(wanted)
             # Rebind rather than mutate, so a failure above leaves the previous
             # pointing's cache intact instead of half-replaced.
             self.shards = shards
@@ -259,13 +319,18 @@ class RefCatStore:
             self.n_rows = sum(len(catalog) for catalog in shards.values())
 
         # Same keys either way, so /prepare's response shape does not change
-        # between a cold call and a reused one.
+        # between a cold call and a reused one. `reused` keeps its original
+        # meaning -- this store's shard set was already the wanted one -- while
+        # n_shards_loaded exposes the partial case: a new set that mostly came
+        # out of the shared _SHARD_CACHE reads only the parents it lacked.
         return {
             "reused": reused,
             "elapsed_s": time.monotonic() - t0,
             "n_level5_files": len(self.shard_ids),
             "n_level7_shards": len(self.shards),
             "n_rows": self.n_rows,
+            "n_shards_loaded": n_loaded,
+            "n_shards_reused": 0 if reused else len(wanted) - n_loaded,
             "boresight": [ra_deg, dec_deg],
         }
 

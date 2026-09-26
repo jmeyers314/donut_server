@@ -215,6 +215,15 @@ def test_catalogs_carry_a_refcat_format_version(shards):
     assert getFormatVersionFromRefCat(max(shards.values(), key=len)) == 2
 
 
+@pytest.fixture(autouse=True)
+def clean_shard_cache():
+    """_SHARD_CACHE is module-level and shared across stores, so a test that
+    asserts on what a fresh store had to load is otherwise order-dependent."""
+    refcat_store._SHARD_CACHE.clear()
+    yield
+    refcat_store._SHARD_CACHE.clear()
+
+
 @pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
 def test_store_reuses_on_a_repeat_pointing():
     store = refcat_store.RefCatStore()
@@ -226,6 +235,64 @@ def test_store_reuses_on_a_repeat_pointing():
     second = store.ensure(BORESIGHT[0] + 0.001, BORESIGHT[1])
     assert second["reused"]
     assert store.shards is shards
+
+
+@pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
+def test_a_slew_loads_only_the_shards_it_does_not_already_have():
+    """The point of the module-level shard cache: a new shard set is a cold path
+    for the store but should still only read the parents nobody has read yet."""
+    slewed = (BORESIGHT[0] + 2.0, BORESIGHT[1])
+    overlap = set(refcat_store.shard_ids_for_pointing(*BORESIGHT)) & set(
+        refcat_store.shard_ids_for_pointing(*slewed)
+    )
+    assert overlap, "pick a slew that actually shares some shards"
+
+    store = refcat_store.RefCatStore()
+    first = store.ensure(*BORESIGHT)
+    assert first["n_shards_loaded"] == first["n_level5_files"]
+
+    second = store.ensure(*slewed)
+    assert not second["reused"]  # the set really did change
+    assert second["n_shards_reused"] == len(overlap)
+    assert second["n_shards_loaded"] == second["n_level5_files"] - len(overlap)
+
+
+@pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
+def test_a_second_store_at_the_same_pointing_reads_nothing():
+    """Each PreparedEntry builds its own RefCatStore, so the cache is only worth
+    having if it is shared between instances."""
+    refcat_store.RefCatStore().ensure(*BORESIGHT)
+
+    fresh = refcat_store.RefCatStore().ensure(*BORESIGHT)
+
+    assert not fresh["reused"]  # a fresh store's own shard set was empty
+    assert fresh["n_shards_loaded"] == 0
+    assert fresh["n_shards_reused"] == fresh["n_level5_files"]
+
+
+@pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
+def test_shard_cache_cap_evicts_least_recently_used(monkeypatch):
+    monkeypatch.setattr(refcat_store, "SHARD_CACHE_CAP", 3)
+
+    refcat_store._ensure_shards(frozenset({12345, 12346}))
+    refcat_store._ensure_shards(frozenset({12345, 12347}))  # touches 12345
+    refcat_store._ensure_shards(frozenset({12348}))  # over cap: drops 12346
+
+    assert set(refcat_store._SHARD_CACHE) == {12345, 12347, 12348}
+
+
+@pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
+def test_a_wanted_set_larger_than_the_cap_is_still_returned_whole(monkeypatch):
+    """Eviction runs after composition, so asking for more parents than the cap
+    holds must not lose children on the way out."""
+    monkeypatch.setattr(refcat_store, "SHARD_CACHE_CAP", 1)
+    wanted = frozenset({12345, 12346})
+
+    shards, loaded = refcat_store._ensure_shards(wanted)
+
+    assert loaded == 2
+    assert len(shards) == 32  # 16 level-7 children per level-5 parent
+    assert len(refcat_store._SHARD_CACHE) == 1
 
 
 @pytest.mark.skipif(not SHARD_PATHS, reason=NO_SHARDS)
