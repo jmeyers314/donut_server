@@ -36,10 +36,12 @@ def prepare_command(band: str) -> dict:
 @pytest.fixture(autouse=True)
 def clean_cache():
     coordinator._PREPARED_CACHE.clear()
+    coordinator._CALIB_CACHE.clear()
     coordinator._PREPARE_COMMANDS.clear()
     coordinator._ACTIVE_KEY = None
     yield
     coordinator._PREPARED_CACHE.clear()
+    coordinator._CALIB_CACHE.clear()
     coordinator._PREPARE_COMMANDS.clear()
     coordinator._ACTIVE_KEY = None
 
@@ -92,6 +94,33 @@ def test_push_after_eviction_reloads_from_the_original_prepare_command():
     assert a["key"] in coordinator._PREPARED_CACHE
     assert coordinator._ACTIVE_KEY == a["key"]
     assert coordinator._CALIB_STORE["calib"].band == "r"
+
+
+def test_a_pointing_change_at_one_band_reuses_the_calibs():
+    """The reason _CALIB_CACHE exists: a slew big enough to change the level-5
+    shard set is a new composite key, but the calibs depend only on the band and
+    must survive it."""
+    near = prepare_command("r")
+    far = prepare_command("r") | {"boresight_ra": BORESIGHT[0] + 2.0}
+
+    first = coordinator.ensure_prepared(near)
+    calib = coordinator._CALIB_STORE["calib"]
+    second = coordinator.ensure_prepared(far)
+
+    assert second["key"] != first["key"]  # the pointing really did change the key
+    assert second["timings"]["refcat"]["reused"] is False
+    assert second["timings"]["calib"]["reused"] is True
+    assert coordinator._CALIB_STORE["calib"] is calib
+
+
+def test_calib_cap_evicts_by_band(monkeypatch):
+    monkeypatch.setattr(coordinator, "CALIB_CACHE_CAP", 2)
+
+    for band in ("r", "g", "i"):
+        coordinator.ensure_prepared(prepare_command(band))
+
+    assert "r" not in coordinator._CALIB_CACHE
+    assert set(coordinator._CALIB_CACHE) == {"g", "i"}
 
 
 def test_cap_evicts_least_recently_touched_first(monkeypatch):

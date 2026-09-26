@@ -1,14 +1,21 @@
 """The long-lived engine that runs the real wavefront pipeline.
 
 Holds `_PREPARED_CACHE`, a small LRU of `PreparedEntry` bundles -- each one a
-task, a calib set, and a resharded refcat, together under one composite key
-(the `-c`/`-C` override list, the band, and the refcat's level-5 shard-id set,
-respectively). Bundled per entry, rather than the three independent singleton
-globals this replaced, because a second `/prepare` before any `/push` must not
-silently retarget a `job_id` that is still waiting to be pushed: a `job_id`'s
-`prepared_key` names the exact entry that was live when it was prepared, and
-`push` reactivates that entry -- reloading it if it was since evicted --
-rather than running whatever the *most recent* prepare happened to load.
+task plus a resharded refcat, under one composite key (the `-c`/`-C` override
+list, the band, and the refcat's level-5 shard-id set). Bundled per entry,
+rather than the independent singleton globals this replaced, because a second
+`/prepare` before any `/push` must not silently retarget a `job_id` that is
+still waiting to be pushed: a `job_id`'s `prepared_key` names the exact entry
+that was live when it was prepared, and `push` reactivates that entry --
+reloading it if it was since evicted -- rather than running whatever the *most
+recent* prepare happened to load.
+
+Calibs are cached separately, in `_CALIB_CACHE`, keyed on band alone: they are
+by far the most expensive thing prepare loads and they depend on nothing else
+in the composite key, so a pointing change must not discard them. The
+anti-hazard argument above is unaffected -- it never required that calibs be
+*copied* per entry, only that a `job_id` resolve to the exact config it was
+prepared against, and a band-keyed lookup off `key[1]` gives exactly that.
 
 Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
 to a hand-built in-memory Butler, and calls the real
@@ -164,29 +171,36 @@ _DEFERRED: dict[str, Any] = {}
 # shared by every PreparedEntry rather than carried inside one.
 _UNIVERSE: Any = None
 
-# How many distinct (task, calib, refcat) bundles to keep warm at once. Bounded
-# rather than unbounded because a CalibSet is ~100 FITS files' worth of resident
-# memory -- sized to "a couple of configs in flight", not measured against a real
-# workload yet.
+# How many distinct (task, refcat) bundles to keep warm at once. Bounded rather
+# than unbounded because a resharded refcat set is a few hundred MB -- sized to
+# "a couple of configs in flight", not measured against a real workload yet.
 PREPARED_CACHE_CAP = 3
+
+# How many bands' calibs to keep warm. A band change is rare, so two keeps the
+# current and previous band resident. This bound is what caps calib RSS: entries
+# in _PREPARED_CACHE deliberately hold no reference to a CalibSet, so _CALIB_CACHE
+# is its sole owner and dropping one here really frees it.
+CALIB_CACHE_CAP = 2
 
 
 @dataclass
 class PreparedEntry:
-    """One fully-loaded (task, calib, refcat) bundle, keyed by all three of
-    their own independent keys at once.
+    """One fully-loaded (task, refcat) bundle, keyed by the composite key.
 
-    Bundled together -- rather than as three independently-keyed globals --
-    because a `job_id`'s `prepared_key` must name one thing that `push` can
-    either find in the cache or rebuild whole; mixing today's cache-miss
-    task with yesterday's cache-hit calib would be exactly the silent
-    wrong-config run this cache exists to prevent.
+    Bundled together -- rather than as independently-keyed globals -- because a
+    `job_id`'s `prepared_key` must name one thing that `push` can either find in
+    the cache or rebuild whole; mixing today's cache-miss task with yesterday's
+    cache-hit refcat would be exactly the silent wrong-config run this cache
+    exists to prevent.
+
+    Carries no calib: the band is already `key[1]`, so the calib is resolved
+    through `_CALIB_CACHE` at activation time. That keeps an entry cheap and
+    keeps `CALIB_CACHE_CAP` a real memory bound rather than a lower bound.
     """
 
     key: tuple
     task: Any
     task_dump: str
-    calib: Any  # a CalibSet, see below
     refcat_store: refcat_store.RefCatStore
 
 
@@ -194,6 +208,13 @@ class PreparedEntry:
 # the end (MRU), so the front is always the next eviction. dict/OrderedDict
 # iteration order is why this needs no separate bookkeeping.
 _PREPARED_CACHE: "OrderedDict[tuple, PreparedEntry]" = OrderedDict()
+
+# Same insertion-order-is-LRU idiom, keyed on band alone. Separate from
+# _PREPARED_CACHE because calibs depend only on the band: sharing one composite
+# key would make a slew that shifts the refcat shard set reload every FITS file
+# in calib_dir(), including the PTCs, linearizers and crosstalk, which depend on
+# nothing in /prepare at all.
+_CALIB_CACHE: "OrderedDict[str, CalibSet]" = OrderedDict()
 
 # The prepare command that built each still-known key, kept forever (never
 # evicted alongside its PreparedEntry): a push-time cache miss must rebuild
@@ -420,6 +441,36 @@ def _prepare_key(command: dict) -> tuple:
     return (task_key, calib_key, refcat_key)
 
 
+def _ensure_calib(band: str) -> tuple["CalibSet", dict]:
+    """Get-or-build the CalibSet for `band`, and report it in `_build_calib`'s
+    own timing shape so a reused calib is described with its real counts rather
+    than zeroed placeholders.
+
+    Evicts past CALIB_CACHE_CAP, oldest first. Insertion happens only after
+    `_build_calib` returns, so a failed load leaves the previous bands cached.
+    """
+    calib = _CALIB_CACHE.get(band)
+    if calib is not None:
+        _CALIB_CACHE.move_to_end(band)
+        return calib, {
+            "reused": True,
+            "elapsed_s": 0.0,
+            "n_detectors": len(calib.detector_ids),
+            "n_intrinsic_zernikes": len(calib.intrinsic_zernikes_by_name),
+            "band": band,
+        }
+
+    calib, timings = _build_calib(band)
+    _CALIB_CACHE[band] = calib
+    while len(_CALIB_CACHE) > CALIB_CACHE_CAP:
+        evicted_band, _ = _CALIB_CACHE.popitem(last=False)
+        _log.info(
+            "calib-cache: evicted band %r (cap=%d, now holding %d)",
+            evicted_band, CALIB_CACHE_CAP, len(_CALIB_CACHE),
+        )
+    return calib, timings
+
+
 def _activate_entry(entry: "PreparedEntry") -> None:
     """Make `entry` the one run_job/build_quantum_context see.
 
@@ -428,12 +479,13 @@ def _activate_entry(entry: "PreparedEntry") -> None:
     push-time reload -- goes through here and cannot leave them half-updated.
     """
     global _ACTIVE_KEY, _TASK, _TASK_DUMP, _REFCAT_STORE
+    calib, _ = _ensure_calib(entry.key[1])
     _ACTIVE_KEY = entry.key
     _TASK = entry.task
     _TASK_DUMP = entry.task_dump
     _CALIB_STORE.clear()
-    _CALIB_STORE["band"] = entry.calib.band
-    _CALIB_STORE["calib"] = entry.calib
+    _CALIB_STORE["band"] = calib.band
+    _CALIB_STORE["calib"] = calib
     _REFCAT_STORE = entry.refcat_store
 
 
@@ -470,13 +522,12 @@ def _build_entry(key: tuple, command: dict) -> tuple["PreparedEntry", dict]:
     # The only place an unset DONUT_SERVER_STAMP_DIR can be reported to a client:
     # the write itself happens after the push reply, where a raise reaches nobody.
     os.makedirs(stamp_dir(), exist_ok=True)
-    calib, calib_timing = _build_calib(command["band"])
 
     store = refcat_store.RefCatStore()
     refcat_timing = store.ensure(command["boresight_ra"], command["boresight_dec"])
 
-    entry = PreparedEntry(key=key, task=task, task_dump=task_dump, calib=calib, refcat_store=store)
-    return entry, {"task": task_timing, "calib": calib_timing, "refcat": refcat_timing}
+    entry = PreparedEntry(key=key, task=task, task_dump=task_dump, refcat_store=store)
+    return entry, {"task": task_timing, "refcat": refcat_timing}
 
 
 def ensure_prepared(command: dict) -> dict:
@@ -495,6 +546,8 @@ def ensure_prepared(command: dict) -> dict:
     key = _prepare_key(command)
     entry = _PREPARED_CACHE.get(key)
 
+    _, calib_timing = _ensure_calib(command["band"])
+
     if entry is None:
         entry, timings = _build_entry(key, command)
         _PREPARED_CACHE[key] = entry
@@ -504,9 +557,9 @@ def ensure_prepared(command: dict) -> dict:
         _PREPARED_CACHE.move_to_end(key)
         timings = {
             "task": {"reused": True, "elapsed_s": 0.0, "n_overrides": len(key[0])},
-            "calib": {"reused": True, "elapsed_s": 0.0},
             "refcat": entry.refcat_store.ensure(command["boresight_ra"], command["boresight_dec"]),
         }
+    timings["calib"] = calib_timing
 
     _activate_entry(entry)
     return {"key": key, "timings": timings}
@@ -613,8 +666,8 @@ def _discover_detector_ids(calib_dir: str) -> list:
 
 
 def _build_calib(band: str) -> tuple[CalibSet, dict]:
-    """Load one CalibSet fresh from disk. Always builds -- the composite-key
-    cache above this is where reuse is decided, so this need not guard itself."""
+    """Load one CalibSet fresh from disk. Always builds -- `_ensure_calib` is
+    where reuse is decided, so this need not guard itself."""
     t0 = time.monotonic()
 
     calibs = calib_dir()
