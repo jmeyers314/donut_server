@@ -10,12 +10,17 @@ that was live when it was prepared, and `push` reactivates that entry --
 reloading it if it was since evicted -- rather than running whatever the *most
 recent* prepare happened to load.
 
-Calibs are cached separately, in `_CALIB_CACHE`, keyed on physical_filter alone:
-they are by far the most expensive thing prepare loads and they depend on nothing
-else in the composite key, so a pointing change must not discard them. The
-anti-hazard argument above is unaffected -- it never required that calibs be
-*copied* per entry, only that a `job_id` resolve to the exact config it was
-prepared against, and a lookup off `key.physical_filter` gives exactly that.
+Calibs are cached separately, and in two halves: `_FILTER_CALIB_CACHE` keyed on
+physical_filter for the flats and intrinsic Zernikes, and
+`_DETECTOR_CALIB_CACHE` -- one permanent entry -- for the PTCs, linearizers and
+crosstalk, which depend on nothing in `/prepare` at all. They are by far the
+most expensive thing prepare loads, so a pointing change must not discard them
+and a filter change must discard only the half that the filter selects.
+`_activate_entry` composes the two into the flat `CalibSet` view its readers
+expect. The anti-hazard argument above is unaffected -- it never required that
+calibs be *copied* per entry, only that a `job_id` resolve to the exact config
+it was prepared against, and a lookup off `key.physical_filter` gives exactly
+that.
 
 Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
 to a hand-built in-memory Butler, and calls the real
@@ -194,9 +199,10 @@ _UNIVERSE: Any = None
 PREPARED_CACHE_CAP = 3
 
 # How many filters' calibs to keep warm. A filter change is rare, so two keeps
-# the current and previous one resident. This bound is what caps calib RSS: entries
-# in _PREPARED_CACHE deliberately hold no reference to a CalibSet, so _CALIB_CACHE
-# is its sole owner and dropping one here really frees it.
+# the current and previous one resident. This bound is what caps the
+# filter-dependent calib RSS: entries in _PREPARED_CACHE deliberately hold no
+# reference to a CalibSet, so _FILTER_CALIB_CACHE is its sole owner and dropping
+# one here really frees it.
 CALIB_CACHE_CAP = 2
 
 
@@ -227,9 +233,9 @@ class PreparedEntry:
     exists to prevent.
 
     Carries no calib: the filter is already `key.physical_filter`, so the calib
-    is resolved through `_CALIB_CACHE` at activation time. That keeps an entry
-    cheap and keeps `CALIB_CACHE_CAP` a real memory bound rather than a lower
-    bound.
+    is resolved through the two calib caches at activation time. That keeps an
+    entry cheap and keeps `CALIB_CACHE_CAP` a real memory bound rather than a
+    lower bound.
     """
 
     key: PrepareKey
@@ -243,12 +249,24 @@ class PreparedEntry:
 # iteration order is why this needs no separate bookkeeping.
 _PREPARED_CACHE: "OrderedDict[PrepareKey, PreparedEntry]" = OrderedDict()
 
-# Same insertion-order-is-LRU idiom, keyed on physical_filter alone. Separate
-# from _PREPARED_CACHE because calibs depend only on the filter: sharing one
-# composite key would make a slew that shifts the refcat shard set reload every
-# FITS file in calib_dir(), including the PTCs, linearizers and crosstalk, which
-# depend on nothing in /prepare at all.
-_CALIB_CACHE: "OrderedDict[str, CalibSet]" = OrderedDict()
+# Calibs are cached apart from _PREPARED_CACHE because they depend only on the
+# filter: sharing one composite key would make a slew that shifts the refcat
+# shard set reload every FITS file in calib_dir(). They are then cached in two
+# pieces, because "only the filter" overstates it for three of the five types --
+# the PTCs, linearizers and crosstalk depend on nothing in /prepare at all, and
+# folding them in made a filter change re-read bytes that had not changed --
+# most of the rebuild time for a small minority of the bytes, since they are
+# deserialization-bound rather than I/O-bound.
+#
+# So the filter-independent half is a single entry, loaded at most once and
+# never evicted: it is the small half by memory and cannot vary while
+# calib_dir() is fixed. None until the first prepare builds it.
+_DETECTOR_CALIB_CACHE: "DetectorCalibs | None" = None
+
+# The filter-dependent half, on the same insertion-order-is-LRU idiom as
+# _PREPARED_CACHE and keyed on physical_filter alone. This is the bulk of the
+# calib memory, and so what CALIB_CACHE_CAP actually bounds.
+_FILTER_CALIB_CACHE: "OrderedDict[str, FilterCalibs]" = OrderedDict()
 
 # The prepare command that built each still-known key, kept forever (never
 # evicted alongside its PreparedEntry): a push-time cache miss must rebuild
@@ -478,34 +496,74 @@ def _prepare_key(command: dict) -> PrepareKey:
     return PrepareKey(task_key, command["physical_filter"], refcat_key)
 
 
-def _ensure_calib(physical_filter: str) -> tuple["CalibSet", dict]:
-    """Get-or-build the CalibSet for `physical_filter`, and report it in
-    `_build_calib`'s own timing shape so a reused calib is described with its
-    real counts rather than zeroed placeholders.
+def _ensure_detector_calibs() -> tuple["DetectorCalibs", bool, float]:
+    """Get-or-build the filter-independent calibs, with whether they were reused
+    and the seconds spent building. Loaded at most once per process -- see
+    `_DETECTOR_CALIB_CACHE`.
+
+    Assignment happens only after `_build_detector_calibs` returns, so a failed
+    load leaves the cache empty and the next prepare retries rather than
+    serving a half-built set."""
+    global _DETECTOR_CALIB_CACHE
+    if _DETECTOR_CALIB_CACHE is not None:
+        return _DETECTOR_CALIB_CACHE, True, 0.0
+
+    detector, elapsed_s = _build_detector_calibs()
+    _DETECTOR_CALIB_CACHE = detector
+    return detector, False, elapsed_s
+
+
+def _ensure_filter_calibs(
+    physical_filter: str, detector: "DetectorCalibs"
+) -> tuple["FilterCalibs", bool, float]:
+    """Get-or-build the filter-dependent calibs for `physical_filter`, with
+    whether they were reused and the seconds spent building.
+
+    `detector` is required rather than resolved here so the two halves cannot be
+    loaded in the wrong order: the flats are keyed by detector name, which only
+    the ptc headers know.
 
     Evicts past CALIB_CACHE_CAP, oldest first. Insertion happens only after
-    `_build_calib` returns, so a failed load leaves the previous filters cached.
-    """
-    calib = _CALIB_CACHE.get(physical_filter)
-    if calib is not None:
-        _CALIB_CACHE.move_to_end(physical_filter)
-        return calib, {
-            "reused": True,
-            "elapsed_s": 0.0,
-            "n_detectors": len(calib.detector_ids),
-            "n_intrinsic_zernikes": len(calib.intrinsic_zernikes_by_name),
-            "physical_filter": physical_filter,
-        }
+    `_build_filter_calibs` returns, so a failed load leaves the previous filters
+    cached."""
+    filtered = _FILTER_CALIB_CACHE.get(physical_filter)
+    if filtered is not None:
+        _FILTER_CALIB_CACHE.move_to_end(physical_filter)
+        return filtered, True, 0.0
 
-    calib, timings = _build_calib(physical_filter)
-    _CALIB_CACHE[physical_filter] = calib
-    while len(_CALIB_CACHE) > CALIB_CACHE_CAP:
-        evicted_filter, _ = _CALIB_CACHE.popitem(last=False)
+    filtered, elapsed_s = _build_filter_calibs(physical_filter, detector)
+    _FILTER_CALIB_CACHE[physical_filter] = filtered
+    while len(_FILTER_CALIB_CACHE) > CALIB_CACHE_CAP:
+        evicted_filter, _ = _FILTER_CALIB_CACHE.popitem(last=False)
         _log.info(
             "calib-cache: evicted physical_filter %r (cap=%d, now holding %d)",
-            evicted_filter, CALIB_CACHE_CAP, len(_CALIB_CACHE),
+            evicted_filter, CALIB_CACHE_CAP, len(_FILTER_CALIB_CACHE),
         )
-    return calib, timings
+    return filtered, False, elapsed_s
+
+
+def _ensure_calib(physical_filter: str) -> tuple["CalibSet", dict]:
+    """Get-or-build both calib halves for `physical_filter` and compose the
+    CalibSet view over them, reporting the pair in `_build_*`'s shared timing
+    shape so a reused calib is described with its real counts rather than
+    zeroed placeholders.
+
+    `elapsed_s` sums only what was actually built, and `reused` means *nothing*
+    was: the per-half flags are what distinguish "a filter change reloaded the
+    flats" from "a cold start reloaded everything".
+    """
+    detector, detector_reused, detector_s = _ensure_detector_calibs()
+    filtered, filter_reused, filter_s = _ensure_filter_calibs(physical_filter, detector)
+    calib = CalibSet(detector=detector, filtered=filtered)
+    return calib, {
+        "reused": detector_reused and filter_reused,
+        "detector_reused": detector_reused,
+        "filter_reused": filter_reused,
+        "elapsed_s": detector_s + filter_s,
+        "n_detectors": len(calib.detector_ids),
+        "n_intrinsic_zernikes": len(calib.intrinsic_zernikes_by_name),
+        "physical_filter": physical_filter,
+    }
 
 
 def _activate_entry(entry: "PreparedEntry") -> None:
@@ -674,26 +732,84 @@ def write_stamp_table(job_id: str, table) -> str:
 
 
 @dataclass
-class CalibSet:
-    """Real calibrations for prepare's physical_filter, keyed by detector name.
+class DetectorCalibs:
+    """The calibs dimensioned by (instrument, detector) alone, keyed by name.
 
-    Carries physical_filter rather than band because that is what actually
-    selected the flats -- band is a 6-valued coarsening of it, so two filters
-    sharing a band (an `r_57` -> `r_03` swap) would be indistinguishable.
-    `build_quantum_context` reads both labels off the exposure's FilterLabel, so
-    there is no band field here to keep consistent with anything.
+    Nothing in /prepare selects these, so they are loaded once and kept -- see
+    `_DETECTOR_CALIB_CACHE`. `build_quantum_context` puts exactly these three on
+    `detector_did`, which is where the split line comes from.
 
-    intrinsic_zernikes_by_name is partial: a detector missing that file
-    simply has no entry (mirrors the real Butler connection's minimum=0).
+    `names_by_id` is the id->name mapping the ptc headers established while
+    loading. The filter-dependent half needs it -- flats are named by id on disk
+    but keyed by name in memory -- and this is the only place it is known.
     """
 
-    physical_filter: str
     detector_ids: list
+    names_by_id: dict
     ptc_by_name: dict
     linearizer_by_name: dict
     crosstalk_by_name: dict
+
+
+@dataclass
+class FilterCalibs:
+    """The calibs that also carry physical_filter, keyed by detector name.
+
+    physical_filter rather than band because that is what actually selected the
+    flats -- band is a 6-valued coarsening of it, so two filters sharing a band
+    (an `r_57` -> `r_03` swap) would be indistinguishable. `build_quantum_context`
+    reads both labels off the exposure's FilterLabel, so there is no band field
+    here to keep consistent with anything.
+
+    intrinsic_zernikes_by_name is partial: a detector missing that file simply
+    has no entry (mirrors the real Butler connection's minimum=0).
+    """
+
+    physical_filter: str
     flat_by_name: dict
     intrinsic_zernikes_by_name: dict
+
+
+class CalibSet(NamedTuple):
+    """The two calib halves presented as the one flat object readers expect.
+
+    A view, not a container: it owns nothing and copies nothing, so composing a
+    fresh one per activation is free and `CALIB_CACHE_CAP` keeps bounding real
+    calib RSS through `_FILTER_CALIB_CACHE` alone. The forwarding properties
+    exist so `build_quantum_context` and `run_job` keep reading
+    `calib.ptc_by_name` / `calib.flat_by_name` across the split.
+    """
+
+    detector: DetectorCalibs
+    filtered: FilterCalibs
+
+    @property
+    def physical_filter(self) -> str:
+        return self.filtered.physical_filter
+
+    @property
+    def detector_ids(self) -> list:
+        return self.detector.detector_ids
+
+    @property
+    def ptc_by_name(self) -> dict:
+        return self.detector.ptc_by_name
+
+    @property
+    def linearizer_by_name(self) -> dict:
+        return self.detector.linearizer_by_name
+
+    @property
+    def crosstalk_by_name(self) -> dict:
+        return self.detector.crosstalk_by_name
+
+    @property
+    def flat_by_name(self) -> dict:
+        return self.filtered.flat_by_name
+
+    @property
+    def intrinsic_zernikes_by_name(self) -> dict:
+        return self.filtered.intrinsic_zernikes_by_name
 
 
 def _discover_detector_ids(calib_dir: str) -> list:
@@ -708,27 +824,31 @@ def _discover_detector_ids(calib_dir: str) -> list:
     return ids
 
 
-def _build_calib(physical_filter: str) -> tuple[CalibSet, dict]:
-    """Load one CalibSet fresh from disk. Always builds -- `_ensure_calib` is
-    where reuse is decided, so this need not guard itself."""
+def _build_detector_calibs() -> tuple[DetectorCalibs, float]:
+    """Load the filter-independent calibs fresh from disk, with the seconds it
+    took. Always builds -- `_ensure_detector_calibs` is where reuse is decided,
+    so this need not guard itself.
+
+    Also where the detector-id list is established, since it comes from the
+    ptc_*.fits filenames and so is itself filter-independent."""
     t0 = time.monotonic()
 
     calibs = calib_dir()
     detector_ids = _discover_detector_ids(calibs)
 
+    names_by_id: dict = {}
     ptc_by_name: dict = {}
     linearizer_by_name: dict = {}
     crosstalk_by_name: dict = {}
-    flat_by_name: dict = {}
-    intrinsic_zernikes_by_name: dict = {}
 
     for det_id in detector_ids:
-        # Filter-independent, required. Detector name comes off the calib
-        # object itself (._detectorName) -- no separate id->name table needed.
+        # Detector name comes off the calib object itself (._detectorName) --
+        # no separate id->name table needed.
         ptc = ipIsr.PhotonTransferCurveDataset.readFits(
             os.path.join(calibs, f"ptc_{det_id}.fits")
         )
         name = ptc._detectorName
+        names_by_id[det_id] = name
         ptc_by_name[name] = ptc
         linearizer_by_name[name] = ipIsr.Linearizer.readFits(
             os.path.join(calibs, f"linearizer_{det_id}.fits")
@@ -737,7 +857,35 @@ def _build_calib(physical_filter: str) -> tuple[CalibSet, dict]:
             os.path.join(calibs, f"crosstalk_{det_id}.fits")
         )
 
-        # Filter-dependent, required.
+    detector = DetectorCalibs(
+        detector_ids=detector_ids,
+        names_by_id=names_by_id,
+        ptc_by_name=ptc_by_name,
+        linearizer_by_name=linearizer_by_name,
+        crosstalk_by_name=crosstalk_by_name,
+    )
+    return detector, time.monotonic() - t0
+
+
+def _build_filter_calibs(
+    physical_filter: str, detector: DetectorCalibs
+) -> tuple[FilterCalibs, float]:
+    """Load the filter-dependent calibs for `physical_filter` fresh from disk,
+    with the seconds it took.
+
+    Takes `detector` only for its `names_by_id`: the flats are named by id on
+    disk but keyed by name in memory, and the ptcs are what establish that
+    mapping."""
+    t0 = time.monotonic()
+
+    calibs = calib_dir()
+    flat_by_name: dict = {}
+    intrinsic_zernikes_by_name: dict = {}
+
+    for det_id in detector.detector_ids:
+        name = detector.names_by_id[det_id]
+
+        # Required.
         flat_path = os.path.join(calibs, f"flat_{det_id}_{physical_filter}.fits")
         if not os.path.exists(flat_path):
             raise RuntimeError(
@@ -746,30 +894,18 @@ def _build_calib(physical_filter: str) -> tuple[CalibSet, dict]:
             )
         flat_by_name[name] = afwImage.ExposureF.readFits(flat_path)
 
-        # Filter-dependent, optional (mirrors the real Butler connection's
-        # minimum=0): missing file just means no entry for this detector.
+        # Optional (mirrors the real Butler connection's minimum=0): missing
+        # file just means no entry for this detector.
         iz_path = os.path.join(calibs, f"intrinsicZernikes_{det_id}_{physical_filter}.fits")
         if os.path.exists(iz_path):
             intrinsic_zernikes_by_name[name] = ipIsr.IsrCalib.readFits(iz_path)
 
-    calib = CalibSet(
+    filtered = FilterCalibs(
         physical_filter=physical_filter,
-        detector_ids=detector_ids,
-        ptc_by_name=ptc_by_name,
-        linearizer_by_name=linearizer_by_name,
-        crosstalk_by_name=crosstalk_by_name,
         flat_by_name=flat_by_name,
         intrinsic_zernikes_by_name=intrinsic_zernikes_by_name,
     )
-
-    timings = {
-        "reused": False,
-        "elapsed_s": time.monotonic() - t0,
-        "n_detectors": len(detector_ids),
-        "n_intrinsic_zernikes": len(intrinsic_zernikes_by_name),
-        "physical_filter": physical_filter,
-    }
-    return calib, timings
+    return filtered, time.monotonic() - t0
 
 
 def reconstruct_exposures(layout: list) -> dict[str, Any]:

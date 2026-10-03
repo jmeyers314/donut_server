@@ -57,7 +57,7 @@ the coordinator opens the block once (`track=False`) and decodes in place. Bound
 
 **Why fork / CoW.** The calib set is 558 MB and **4.87 s** to pickle, so 8 spawn workers would spend ~39 s
 serializing. ISR does not mutate the shared calibs (0 of 40 objects changed across real jobs, by
-pickled-state hash), and the shared `CalibSet` is protected by fork isolation as well as `copy=True` —
+pickled-state hash), and the shared calibs are protected by fork isolation as well as `copy=True` —
 `runQuantum` does its `get()`s in the parent, ISR runs in the children. Peak system delta is **3.7 GB**
 (`baseline + 8 × ~500 MB` of private scratch), affordable against 36 GB. CoW is real but **not** free:
 **4–10 GB of CoW faults per job**, since children touching inherited Python objects increment refcounts and
@@ -70,7 +70,11 @@ States: `PREPARED → RECEIVING → COMPUTING → DONE` (or `ERROR`).
 
 1. **prepare** (exposure starting, no pixels): loads/refreshes calibs into `_CALIB_STORE` (ptc, linearizer,
    crosstalk per detector; flat and intrinsicZernikes per detector+physical_filter) and refcat shards into
-   `_REFCAT_STORE`, both behind reuse guards. Also pays the one-time `DimensionUniverse` + task construction
+   `_REFCAT_STORE`, both behind reuse guards. The two calib groups are cached separately on exactly that
+   line, so a filter change reloads only what the filter selects — the per-detector calibs are the
+   cheaper half by memory but not by load time, since they are deserialization-bound rather than
+   I/O-bound. `CalibSet` is the view composing the two halves back into one object for
+   `build_quantum_context`. Also pays the one-time `DimensionUniverse` + task construction
    + pyarrow init. Raw-independent precompute belongs here.
 2. **push** (pixels ready): blob streamed into shared memory, layout handed to the coordinator, which
    rebuilds exposures, builds the butler, and runs the task. Blocks until done.
@@ -88,7 +92,9 @@ supervisor's probe can reach it.
   **required** (400 if missing, non-numeric or non-finite — `json` parses a bare `NaN` token, so finiteness
   is checked in the web process): it is what lets refcat shards preload before pixels exist. Returns
   `job_id`, state, `timings: {calib: {...}, refcat: {...}}`; both sub-dicts carry the same keys whether the
-  work was done or reused, so the shape never changes.
+  work was done or reused, so the shape never changes. `calib` additionally carries `detector_reused` and
+  `filter_reused`, since its `reused` (true only when *neither* half was built) cannot by itself
+  distinguish a cold start from a filter change.
 - `POST /push/{job_id}` — raw binary blob (below). Returns terminal state plus per-stage timings.
 - `GET /status/{job_id}`; `GET /result/{job_id}?wait=N` — JSON `ready`, `state`, `timings`, `summary`
   (row/detector/group counts, dropped columns), `table_url`; stays JSON so it remains long-pollable.

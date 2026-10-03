@@ -35,13 +35,18 @@ def prepare_command(physical_filter: str) -> dict:
 
 @pytest.fixture(autouse=True)
 def clean_cache():
+    # _DETECTOR_CALIB_CACHE is never evicted in production, so it has to be
+    # reset here or the first test to run leaves it populated and every later
+    # `detector_reused is False` assertion becomes order-dependent.
     coordinator._PREPARED_CACHE.clear()
-    coordinator._CALIB_CACHE.clear()
+    coordinator._FILTER_CALIB_CACHE.clear()
+    coordinator._DETECTOR_CALIB_CACHE = None
     coordinator._PREPARE_COMMANDS.clear()
     coordinator._ACTIVE_KEY = None
     yield
     coordinator._PREPARED_CACHE.clear()
-    coordinator._CALIB_CACHE.clear()
+    coordinator._FILTER_CALIB_CACHE.clear()
+    coordinator._DETECTOR_CALIB_CACHE = None
     coordinator._PREPARE_COMMANDS.clear()
     coordinator._ACTIVE_KEY = None
 
@@ -97,9 +102,9 @@ def test_push_after_eviction_reloads_from_the_original_prepare_command():
 
 
 def test_a_pointing_change_at_one_filter_reuses_the_calibs():
-    """The reason _CALIB_CACHE exists: a slew big enough to change the level-5
-    shard set is a new composite key, but the calibs depend only on the
-    physical_filter and must survive it."""
+    """The reason the calibs are cached apart from _PREPARED_CACHE: a slew big
+    enough to change the level-5 shard set is a new composite key, but the
+    calibs depend only on the physical_filter and must survive it."""
     near = prepare_command("r_57")
     far = prepare_command("r_57") | {"boresight_ra": BORESIGHT[0] + 2.0}
 
@@ -110,7 +115,29 @@ def test_a_pointing_change_at_one_filter_reuses_the_calibs():
     assert second["key"] != first["key"]  # the pointing really did change the key
     assert second["timings"]["refcat"]["reused"] is False
     assert second["timings"]["calib"]["reused"] is True
-    assert coordinator._CALIB_STORE["calib"] is calib
+    # Identity of the two halves, not of the CalibSet: that is a view, composed
+    # fresh per activation. Nothing being reloaded is the invariant here.
+    now = coordinator._CALIB_STORE["calib"]
+    assert now.detector is calib.detector
+    assert now.filtered is calib.filtered
+
+
+def test_a_filter_change_reloads_only_the_filter_dependent_half():
+    """Why the calib cache is split in two: the PTCs, linearizers and crosstalk
+    are dimensioned by detector alone, so re-reading them on a filter change was
+    most of the rebuild time spent on bytes that had not changed."""
+    first = coordinator.ensure_prepared(prepare_command("r_57"))
+    detector = coordinator._CALIB_STORE["calib"].detector
+    filtered = coordinator._CALIB_STORE["calib"].filtered
+
+    second = coordinator.ensure_prepared(prepare_command("g_6"))
+
+    assert second["key"] != first["key"]
+    assert second["timings"]["calib"]["detector_reused"] is True
+    assert second["timings"]["calib"]["filter_reused"] is False
+    assert second["timings"]["calib"]["reused"] is False
+    assert coordinator._CALIB_STORE["calib"].detector is detector
+    assert coordinator._CALIB_STORE["calib"].filtered is not filtered
 
 
 def test_calib_cap_evicts_by_physical_filter(monkeypatch):
@@ -119,8 +146,11 @@ def test_calib_cap_evicts_by_physical_filter(monkeypatch):
     for physical_filter in ("r_57", "g_6", "i_39"):
         coordinator.ensure_prepared(prepare_command(physical_filter))
 
-    assert "r_57" not in coordinator._CALIB_CACHE
-    assert set(coordinator._CALIB_CACHE) == {"g_6", "i_39"}
+    assert "r_57" not in coordinator._FILTER_CALIB_CACHE
+    assert set(coordinator._FILTER_CALIB_CACHE) == {"g_6", "i_39"}
+    # The cap bounds only the filter-dependent half; the other one outlives
+    # every eviction that happened above.
+    assert coordinator._DETECTOR_CALIB_CACHE is not None
 
 
 def test_cap_evicts_least_recently_touched_first(monkeypatch):

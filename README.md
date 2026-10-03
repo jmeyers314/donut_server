@@ -117,6 +117,9 @@ Two ways to see what is actually installed:
 
 A repeat prepare with an unchanged list reports `task: reused: true` and rebuilds nothing. The task,
 calib and refcat guards are independent, so changing an override does **not** trigger a calib reload.
+The calib guard is itself split: a *filter* change reloads only the flats and intrinsic Zernikes
+(`filter_reused: false`), while the PTCs, linearizers and crosstalk — dimensioned by detector alone —
+are loaded once per process and stay (`detector_reused: true`).
 
 ### Three sharp edges
 
@@ -160,6 +163,8 @@ path, so any movement here means import order or thread clamping regressed:
 - prepare `task`: `reused: false` and ~0.14 s on the first prepare or any changed override list,
   `reused: true` and ~0 s on a repeat. `calib` must stay `reused: true` across an override-only
   change — if it reloads, the two guards have been folded together
+- prepare `calib`: a *filter* change must report `detector_reused: true` and `filter_reused: false`.
+  If both go false, the two calib halves have been folded back together
 - `n_input_datasets: 208`
 - **63 donut rows** across 8 detectors, 28/29 groups fit
 - `donut_id` values are Gaia source ids (e.g. `6761235373898405888`) — the quickest confirmation the
