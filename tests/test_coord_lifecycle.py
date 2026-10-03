@@ -285,9 +285,9 @@ def test_last_prepare_is_replayed_after_a_restart():
         # Command 1 is the prepare (fine); command 2 crashes the child.
         async with started(make_coord([None, "crash"])) as coord:
             await wait_ready(coord)
-            resp = await coord.send_command({"cmd": "prepare", "band": "r"})
+            resp = await coord.send_command({"cmd": "prepare", "physical_filter": "r_57"})
             assert resp["seen"] == 1
-            assert coord.primed_args == {"cmd": "prepare", "band": "r"}
+            assert coord.primed_args == {"cmd": "prepare", "physical_filter": "r_57"}
 
             with pytest.raises(CoordinatorLost):
                 await coord.send_command({"cmd": "ping"})
@@ -297,7 +297,7 @@ def test_last_prepare_is_replayed_after_a_restart():
             # this command is its second -- no /prepare from the producer.
             resp = await coord.send_command({"cmd": "ping"})
             assert resp["seen"] == 2
-            assert coord.primed_args == {"cmd": "prepare", "band": "r"}
+            assert coord.primed_args == {"cmd": "prepare", "physical_filter": "r_57"}
 
     asyncio.run(body())
 
@@ -315,7 +315,7 @@ def test_config_overrides_are_replayed_verbatim_and_refresh_the_snapshot():
     """
     prepare = {
         "cmd": "prepare",
-        "band": "r",
+        "physical_filter": "r_57",
         "config_overrides": [
             {"kind": "value", "field": "maxFitScatter", "value": "2.0"},
             {"kind": "python", "name": "/home/op/tweaks.py", "text": "config.savePlots = True\n"},
@@ -356,9 +356,9 @@ def test_prepare_is_not_replayed_when_a_prepare_provoked_the_crash():
         # prepare) crashes the child.
         async with started(make_coord([None, "crash"])) as coord:
             await wait_ready(coord)
-            await coord.send_command({"cmd": "prepare", "band": "r"})
+            await coord.send_command({"cmd": "prepare", "physical_filter": "r_57"})
             with pytest.raises(CoordinatorLost):
-                await coord.send_command({"cmd": "prepare", "band": "g"})
+                await coord.send_command({"cmd": "prepare", "physical_filter": "g_6"})
             await wait_generation(coord, 2)
 
             resp = await coord.send_command({"cmd": "ping"})
@@ -563,7 +563,7 @@ def test_prepare_503s_with_a_reason_when_the_coordinator_is_degraded(monkeypatch
 
         resp = client.post(
             "/prepare",
-            json={"band": "r", "boresight_ra": 1.0, "boresight_dec": 2.0},
+            json={"physical_filter": "r_57", "boresight_ra": 1.0, "boresight_dec": 2.0},
             headers=auth(),
         )
         assert resp.status_code == 503
@@ -577,7 +577,7 @@ def test_push_503s_and_marks_the_job_errored(monkeypatch):
     with make_client(monkeypatch, coord) as client:
         job_id = client.post(
             "/prepare",
-            json={"band": "r", "boresight_ra": 1.0, "boresight_dec": 2.0},
+            json={"physical_filter": "r_57", "boresight_ra": 1.0, "boresight_dec": 2.0},
             headers=auth(),
         ).json()["job_id"]
 
@@ -612,10 +612,10 @@ def test_health_503s_while_starting(monkeypatch):
 
 # ------------------------------------------------------------- 14. the pool
 
-def prepare(client, band="r"):
+def prepare(client, physical_filter="r_57"):
     return client.post(
         "/prepare",
-        json={"band": band, "boresight_ra": 1.0, "boresight_dec": 2.0},
+        json={"physical_filter": physical_filter, "boresight_ra": 1.0, "boresight_dec": 2.0},
         headers=auth(),
     )
 
@@ -660,11 +660,11 @@ def test_a_loss_on_one_flight_does_not_error_another_flights_job(monkeypatch):
         for coord in server.pool.flights:
             poll_until(lambda c=coord: c.state is CoordState.READY, what="READY")
 
-        # One job per flight. Distinct bands, so the second prepare cannot take
+        # One job per flight. Distinct physical filters, so the second prepare cannot take
         # select()'s already-primed branch back onto flight 0; LRU then sends it to
         # flight 1, which is asserted rather than assumed.
-        a = prepare(client, "r").json()
-        b = prepare(client, "g").json()
+        a = prepare(client, "r_57").json()
+        b = prepare(client, "g_6").json()
         assert (a["flight"], b["flight"]) == (0, 1)
 
         # Strand b mid-flight by hand: driving a real concurrent push through

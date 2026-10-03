@@ -588,8 +588,8 @@ class Coord:
             self._note_prepared(args, resp)
         else:
             # Auto-re-priming is an availability optimization, not a correctness
-            # requirement: run_job cross-checks the raws' band against the loaded
-            # calibs, and the refcat coverage check is equivalent, so an unprimed
+            # requirement: run_job cross-checks the raws' physical_filter against
+            # the loaded calibs, and the refcat coverage check is equivalent, so an unprimed
             # coordinator fails the next push loudly rather than producing bad
             # wavefronts. Leave the child READY but unprimed.
             self._primed_args = None
@@ -1067,6 +1067,19 @@ def _required_float(body: dict, key: str) -> float:
     return float(value)
 
 
+def _required_str(body: dict, key: str) -> str:
+    """Reject a missing, non-string or blank field with a 400 rather than letting
+    it reach the coordinator.
+
+    Shape only -- whether calibs actually exist for the value is the
+    coordinator's to answer, and it says so with the path it looked for.
+    """
+    value = body.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(400, f"{key} is required and must be a non-empty string")
+    return value
+
+
 def _parse_overrides(body: dict) -> list:
     """Validate and normalize `config_overrides`. Returns [] when absent.
 
@@ -1189,7 +1202,7 @@ async def prepare(body: dict):
 
     command = {
         "cmd": "prepare",
-        "band": body.get("band"),
+        "physical_filter": _required_str(body, "physical_filter"),
         "boresight_ra": boresight_ra,
         "boresight_dec": boresight_dec,
         # Sent even when empty, so _primed_args is never ambiguous about whether

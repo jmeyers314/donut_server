@@ -6,18 +6,18 @@ import pytest
 from lsst.ts.donut_server import client
 
 VISITS = {
-    2026060700680: "y",
-    2026071300478: "r",
-    2026071300535: "i",
+    2026060700680: "y_10",
+    2026071300478: "r_57",
+    2026071300535: "i_39",
 }
 DETECTORS = [191, 192, 195, 196, 199, 200, 203, 204]
 
 
 @pytest.fixture
 def raw_dir(tmp_path):
-    for visit, band in VISITS.items():
+    for visit, physical_filter in VISITS.items():
         for det in DETECTORS:
-            (tmp_path / f"raw_{visit}_{det}_{band}.fits").touch()
+            (tmp_path / f"raw_{visit}_{det}_{physical_filter}.fits").touch()
     (tmp_path / "notes.txt").touch()  # ignored
     return str(tmp_path)
 
@@ -25,9 +25,9 @@ def raw_dir(tmp_path):
 def test_discover_groups_by_visit(raw_dir):
     found = client.discover_exposures(raw_dir)
     assert set(found) == set(VISITS)
-    for visit, band in VISITS.items():
-        got_band, paths = found[visit]
-        assert got_band == band
+    for visit, physical_filter in VISITS.items():
+        got_filter, paths = found[visit]
+        assert got_filter == physical_filter
         assert sorted(paths) == DETECTORS
 
 
@@ -35,13 +35,34 @@ def test_discover_empty_dir(tmp_path):
     assert client.discover_exposures(str(tmp_path)) == {}
 
 
-@pytest.mark.parametrize("visit,band", VISITS.items())
-def test_resolve_reports_band_of_visit(raw_dir, visit, band):
-    """Band tracks the exposure asked for, rather than anything a caller supplies
-    -- it is what /prepare turns into flat_<det>_<band>.fits."""
-    got_visit, got_band, paths = client.resolve_exposure(raw_dir, visit)
-    assert (got_visit, got_band) == (visit, band)
+@pytest.mark.parametrize("visit,physical_filter", VISITS.items())
+def test_resolve_reports_physical_filter_of_visit(raw_dir, visit, physical_filter):
+    """The filter tracks the exposure asked for, rather than anything a caller
+    supplies -- it is what /prepare turns into
+    flat_<det>_<physical_filter>.fits."""
+    got_visit, got_filter, paths = client.resolve_exposure(raw_dir, visit)
+    assert (got_visit, got_filter) == (visit, physical_filter)
     assert sorted(paths) == DETECTORS
+
+
+def test_a_raw_the_pattern_cannot_parse_is_an_error(raw_dir, tmp_path):
+    """A band-suffixed name is what the pre-physical_filter raws looked like, so
+    a half-renamed directory lands here. Skipping it silently would instead yield
+    a short detector list or a missing visit much later."""
+    (tmp_path / "raw_2026071300478_191_r.fits").touch()
+
+    with pytest.raises(RuntimeError, match="does not parse"):
+        client.discover_exposures(raw_dir)
+
+
+def test_a_filter_with_no_calibs_is_rejected_at_discovery(tmp_path):
+    """Caught here rather than as a missing flat_<det>_<filter>.fits deep in the
+    coordinator's calib load."""
+    for det in DETECTORS:
+        (tmp_path / f"raw_2026071300478_{det}_r_75.fits").touch()
+
+    with pytest.raises(RuntimeError, match="no calibs for"):
+        client.discover_exposures(str(tmp_path))
 
 
 def test_resolve_unknown_visit(raw_dir):

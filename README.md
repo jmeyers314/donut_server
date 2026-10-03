@@ -45,7 +45,7 @@ environment variable, so the data need not live in the checkout:
 | variable | size | contents |
 |---|---|---|
 | `DONUT_SERVER_RAW_DIR` | 5.1 G | real corner-sensor raws, overscan present, ISR-ready |
-| `DONUT_SERVER_CALIB_DIR` | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per band |
+| `DONUT_SERVER_CALIB_DIR` | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per physical_filter |
 | `DONUT_SERVER_REFCAT_DIR` | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
 
 `DONUT_SERVER_STAMP_DIR` is the one output directory, and it is required too. It needs no data up
@@ -63,7 +63,7 @@ Unset is a loud `RuntimeError` naming the variable, not a silent empty result. T
 tests skip when unset, so `scons`/`pytest` still pass without the data — check the skip count.
 
 **These files are never pruned, and at a 30 s cadence they arrive at ~2.0 GB/hour** (16.7 MB a job,
-measured on the r-band exposure below — the in-memory columns are ~21 MB and parquet compresses).
+measured on the r_57 exposure below — the in-memory columns are ~21 MB and parquet compresses).
 Deleting old
 ones is an operator or cron job; nothing in the service does it. They are also safe to delete at any
 time — the Zernikes a client waits for are served from the front-end's memory and never read back
@@ -151,7 +151,7 @@ loopback callers and serves the page to nobody else, so reaching it from another
 `ssh -L 8000:localhost:8000` tunnel. `DONUT_SERVER_TOKEN` is still what protects `/prepare` and
 `/push` from the network, so a producer on a *different* host does need `--token`.
 
-Acceptance criteria for the r-band exposure — a packaging or refactoring change touches no compute
+Acceptance criteria for the r_57 exposure — a packaging or refactoring change touches no compute
 path, so any movement here means import order or thread clamping regressed:
 
 - boresight `ra=283.6660 dec=-28.1326`

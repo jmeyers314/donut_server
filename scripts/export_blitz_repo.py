@@ -9,8 +9,8 @@ CALIBRATION collection and takes every dataset of every calibration type, with
 no detector or filter restriction. For LSSTCam that is the whole 189-detector
 focal plane across all physical filters -- orders of magnitude more than the
 eight corner wavefront sensors this task reads. So the dataset queries are
-spelled out here and restricted to the corners and to the bands the requested
-visits actually use.
+spelled out here and restricted to the corners and to the physical filters the
+requested visits actually use.
 
 Certification rides along for free: `saveCollection()` on a CALIBRATION
 collection exports its dataset associations *with their validity timespans*,
@@ -182,8 +182,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Visit %d: %d corner raws", visit, len(kept))
         raw_refs.extend(kept)
 
-    # Bands present in the exported raws drive which flats are needed. Querying
-    # all six would export five times the flats for no benefit.
+    # Physical filters present in the exported raws drive which flats are
+    # needed. Querying all six would export five times the flats for no benefit.
     physical_filters = sorted({str(r.dataId["physical_filter"]) for r in raw_refs})
     log.info("Physical filters in play: %s", physical_filters)
 

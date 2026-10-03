@@ -62,7 +62,7 @@ def host_is_loopback(host: str) -> bool:
     )
 
 
-_RAW_RE = re.compile(r"raw_(\d+)_(\d+)_([a-z]+)\.fits")
+_RAW_RE = re.compile(r"raw_(\d+)_(\d+)_([a-z]+_\d+)\.fits")
 
 # The server writes the image table after answering the push, so --images can
 # outrun it by a few tens of milliseconds and get a 409. Enough tries to cover a
@@ -70,19 +70,22 @@ _RAW_RE = re.compile(r"raw_(\d+)_(\d+)_([a-z]+)\.fits")
 IMAGES_ATTEMPTS = 5
 IMAGES_RETRY_S = 0.5
 
-# physical_filter -> band for the six survey filters this service has calibs for.
-# Read off the raws in `raw/` themselves, whose FilterLabel carries both labels;
-# it is the same set `calib/` holds flat_<det>_<band>.fits for. Anything else is
-# a hard error rather than a guess, because the band is what picks the flat, and
-# a filter we have not seen is one whose calibs nobody has checked.
-BAND_BY_PHYSICAL_FILTER = {
-    "u_24": "u",
-    "g_6": "g",
-    "r_57": "r",
-    "i_39": "i",
-    "z_20": "z",
-    "y_10": "y",
-}
+# The six survey filters this service has calibs for -- the same set `calib/`
+# holds flat_<det>_<physical_filter>.fits for. Anything else is a hard error
+# rather than a guess, because the filter is what picks the flat, and a filter
+# we have not seen is one whose calibs nobody has checked.
+KNOWN_PHYSICAL_FILTERS = frozenset({"u_24", "g_6", "r_57", "i_39", "z_20", "y_10"})
+
+
+def _check_known_filter(visit: int, physical_filter: str) -> str:
+    """Reject a filter this service has no calibs for, at discovery time rather
+    than as a missing-file error deep in the coordinator's calib load."""
+    if physical_filter not in KNOWN_PHYSICAL_FILTERS:
+        raise RuntimeError(
+            f"visit {visit} has physical_filter {physical_filter!r}, which this "
+            f"service has no calibs for; known: {sorted(KNOWN_PHYSICAL_FILTERS)}"
+        )
+    return physical_filter
 
 
 @dataclass(frozen=True)
@@ -97,7 +100,7 @@ class RawSource:
     """
 
     visit: int
-    band: str
+    physical_filter: str
     handles: dict[int, Any]
     load: Callable[[Any], Any]
     # Set when the pointing is available without reading pixels (the butler
@@ -106,26 +109,40 @@ class RawSource:
 
 
 def discover_exposures(raw_dir: str) -> dict[int, tuple[str, dict[int, str]]]:
-    """Scan `raw_dir` for raw_<visit>_<detector>_<band>.fits.
+    """Scan `raw_dir` for raw_<visit>_<detector>_<physical_filter>.fits.
 
-    Returns {visit: (band, {detector_id: path})}.
+    Returns {visit: (physical_filter, {detector_id: path})}.
+
+    A file the glob returned but the pattern cannot parse is an error, not a
+    skip: everything `raw_*.fits` matches is meant to be a raw, and silently
+    dropping one yields a short detector list or a missing visit much later
+    instead of naming the offending file here.
     """
     exposures: dict[int, tuple[str, dict[int, str]]] = {}
     for path in sorted(glob.glob(os.path.join(raw_dir, "raw_*.fits"))):
-        m = _RAW_RE.fullmatch(os.path.basename(path))
+        name = os.path.basename(path)
+        m = _RAW_RE.fullmatch(name)
         if not m:
-            continue
-        visit, det_id, band = int(m.group(1)), int(m.group(2)), m.group(3)
-        entry = exposures.setdefault(visit, (band, {}))
-        if entry[0] != band:
-            raise RuntimeError(f"visit {visit} has mixed bands: {entry[0]!r} and {band!r}")
+            raise RuntimeError(
+                f"raw filename does not parse as "
+                f"raw_<visit>_<detector>_<physical_filter>.fits: {name!r}"
+            )
+        visit, det_id = int(m.group(1)), int(m.group(2))
+        physical_filter = _check_known_filter(visit, m.group(3))
+        entry = exposures.setdefault(visit, (physical_filter, {}))
+        if entry[0] != physical_filter:
+            raise RuntimeError(
+                f"visit {visit} has mixed physical_filters: "
+                f"{entry[0]!r} and {physical_filter!r}"
+            )
         entry[1][det_id] = path
     return exposures
 
 
 def resolve_exposure(raw_dir: str, visit: int) -> tuple[int, str, dict[int, str]]:
-    """Locate one visit's raws. The band comes back as a property of the visit,
-    read off its filenames, so it cannot disagree with the pixels being sent."""
+    """Locate one visit's raws. The physical_filter comes back as a property of
+    the visit, read off its filenames, so it cannot disagree with the pixels
+    being sent."""
     exposures = discover_exposures(raw_dir)
     if not exposures:
         raise RuntimeError(f"no raw_*.fits files found in {raw_dir!r}")
@@ -134,18 +151,18 @@ def resolve_exposure(raw_dir: str, visit: int) -> tuple[int, str, dict[int, str]
             f"visit {visit} not found in {raw_dir!r}; have {sorted(exposures)}"
         )
 
-    band, paths = exposures[visit]
-    return visit, band, paths
+    physical_filter, paths = exposures[visit]
+    return visit, physical_filter, paths
 
 
 def resolve_from_files(raw_dir: str, visit: int) -> RawSource:
-    """A RawSource backed by `raw_<visit>_<detector>_<band>.fits` files."""
+    """A RawSource backed by `raw_<visit>_<detector>_<physical_filter>.fits` files."""
     import lsst.afw.image as afwImage
 
-    chosen_visit, band, paths = resolve_exposure(raw_dir, visit)
+    chosen_visit, physical_filter, paths = resolve_exposure(raw_dir, visit)
     return RawSource(
         visit=chosen_visit,
-        band=band,
+        physical_filter=physical_filter,
         handles=dict(paths),
         load=afwImage.ExposureF.readFits,
     )
@@ -162,10 +179,10 @@ def resolve_from_butler(
       Only the 8 corner wavefront sensors belong in it: the server's calibs are
       keyed by detector name and it rejects a push naming any detector it has
       no calibs for.
-    - The band is derived from the exposure's `physical_filter` via
-      `BAND_BY_PHYSICAL_FILTER` and reported, never accepted from the caller.
-      /prepare loads flats and intrinsic Zernikes for it, so a band that
-      disagreed with the pixels would silently pair them with the wrong flat.
+    - The `physical_filter` is read off the exposure record and reported, never
+      accepted from the caller. /prepare loads flats and intrinsic Zernikes for
+      it, so a filter that disagreed with the pixels would silently pair them
+      with the wrong flat.
     - Raws are dimensioned by `exposure`, not `visit`; the integer is the same
       one the file naming calls a visit.
     - `boresight` comes off the exposure record's `tracking_ra` /
@@ -201,18 +218,11 @@ def resolve_from_butler(
         **{ref.dataId["detector"]: ref for ref in refs}
     }
 
-    physical_filter = str(record.physical_filter)
-    try:
-        band = BAND_BY_PHYSICAL_FILTER[physical_filter]
-    except KeyError:
-        raise RuntimeError(
-            f"visit {visit} has physical_filter {physical_filter!r}, which has no "
-            f"known band; known: {sorted(BAND_BY_PHYSICAL_FILTER)}"
-        ) from None
+    physical_filter = _check_known_filter(visit, str(record.physical_filter))
 
     return RawSource(
         visit=visit,
-        band=band,
+        physical_filter=physical_filter,
         handles=handles,
         load=butler.get,
         boresight=(record.tracking_ra, record.tracking_dec)
@@ -263,7 +273,7 @@ def run_once(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     print(
-        f"exposure -> visit={source.visit} band={source.band} "
+        f"exposure -> visit={source.visit} physical_filter={source.physical_filter} "
         f"detectors={sorted(source.handles)}"
     )
 
@@ -274,7 +284,7 @@ def run_once(
     resp = requests.post(
         f"{host}/prepare",
         json={
-            "band": source.band,
+            "physical_filter": source.physical_filter,
             "boresight_ra": boresight_ra,
             "boresight_dec": boresight_dec,
             "config_overrides": config_overrides or [],
@@ -513,9 +523,9 @@ def main() -> None:
         "--visit",
         type=int,
         required=True,
-        help="visit to send. Its band is derived from the exposure itself, so "
-        "there is no --band. Raws are exposure-dimensioned in the butler; this "
-        "is that same integer.",
+        help="visit to send. Its physical_filter is derived from the exposure "
+        "itself, so there is no --physical-filter. Raws are exposure-dimensioned "
+        "in the butler; this is that same integer.",
     )
     parser.add_argument("--wait", type=float, default=10.0, help="seconds to long-poll /result")
     parser.add_argument("--once", action="store_true", help="single prepare/push/result cycle (default)")

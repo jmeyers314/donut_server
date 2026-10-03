@@ -322,7 +322,8 @@ def _done_job(job_id="j1"):
     record = JobRecord(job_id=job_id, state=JobState.DONE)
     record.table_parquet = _results_parquet()
     record.result = {"summary": {"n_rows": 5, "parquet_bytes": len(record.table_parquet)},
-                     "quantum": {"visit": 123, "band": "r"}}
+                     "quantum": {"visit": 123, "band": "r",
+                                 "physical_filter": "r_57"}}
     return record
 
 
@@ -549,7 +550,7 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
     client = make_client(monkeypatch)
     primed = {
         "cmd": "prepare",
-        "band": "r",
+        "physical_filter": "r_57",
         "boresight_ra": 283.666,
         "boresight_dec": -28.1326,
         "config_overrides": [
@@ -582,7 +583,7 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
     assert shown[1]["lines"] == 1
     assert "text" not in shown[1]
     # The fields the dashboard already renders are untouched by the projection.
-    assert flight["primed_args"]["band"] == "r"
+    assert flight["primed_args"]["physical_filter"] == "r_57"
     assert flight["primed_args"]["boresight_ra"] == 283.666
 
 
@@ -610,7 +611,7 @@ def test_prepare_rejects_a_malformed_override_list_without_a_coordinator(
 
     resp = client.post(
         "/prepare",
-        json={"band": "r", "boresight_ra": 0.0, "boresight_dec": 0.0,
+        json={"physical_filter": "r_57", "boresight_ra": 0.0, "boresight_dec": 0.0,
               "config_overrides": overrides},
         headers=auth(),
     )

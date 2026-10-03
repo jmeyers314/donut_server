@@ -17,16 +17,16 @@ NO_DATA = f"needs DONUT_SERVER_CALIB_DIR and DONUT_SERVER_REFCAT_DIR, got {CALIB
 
 pytestmark = pytest.mark.skipif(not (CALIB_DIR and REFCAT_DIR), reason=NO_DATA)
 
-# Same pointing throughout: what varies between commands below is the band,
-# which is enough to force a distinct calib_key (and hence a distinct
-# composite key) without needing four different boresights.
+# Same pointing throughout: what varies between commands below is the
+# physical_filter, which is enough to force a distinct calib_key (and hence a
+# distinct composite key) without needing four different boresights.
 BORESIGHT = (283.666, -28.1326)
-BANDS = ("r", "g", "i", "u")
+PHYSICAL_FILTERS = ("r_57", "g_6", "i_39", "u_24")
 
 
-def prepare_command(band: str) -> dict:
+def prepare_command(physical_filter: str) -> dict:
     return {
-        "band": band,
+        "physical_filter": physical_filter,
         "boresight_ra": BORESIGHT[0],
         "boresight_dec": BORESIGHT[1],
         "config_overrides": [],
@@ -47,17 +47,17 @@ def clean_cache():
 
 
 def test_a_cold_prepare_builds_and_activates_an_entry():
-    prepared = coordinator.ensure_prepared(prepare_command("r"))
+    prepared = coordinator.ensure_prepared(prepare_command("r_57"))
 
     assert prepared["timings"]["task"]["reused"] is False
     assert prepared["timings"]["calib"]["reused"] is False
     assert coordinator._ACTIVE_KEY == prepared["key"]
-    assert coordinator._CALIB_STORE["calib"].band == "r"
+    assert coordinator._CALIB_STORE["calib"].physical_filter == "r_57"
 
 
 def test_repeating_the_same_prepare_hits_every_reuse_guard():
-    first = coordinator.ensure_prepared(prepare_command("r"))
-    second = coordinator.ensure_prepared(prepare_command("r"))
+    first = coordinator.ensure_prepared(prepare_command("r_57"))
+    second = coordinator.ensure_prepared(prepare_command("r_57"))
 
     assert second["key"] == first["key"]
     assert second["timings"]["task"]["reused"] is True
@@ -69,39 +69,39 @@ def test_prepare_b_then_push_a_reloads_a_rather_than_running_under_b():
     not silently under whatever B most recently loaded -- the exact hazard
     this cache exists to prevent.
     """
-    a = coordinator.ensure_prepared(prepare_command("r"))
-    coordinator.ensure_prepared(prepare_command("g"))
+    a = coordinator.ensure_prepared(prepare_command("r_57"))
+    coordinator.ensure_prepared(prepare_command("g_6"))
     assert coordinator._ACTIVE_KEY != a["key"]  # B is live now
 
     coordinator.ensure_prepared_for_push(a["key"])
 
     assert coordinator._ACTIVE_KEY == a["key"]
-    assert coordinator._CALIB_STORE["calib"].band == "r"
+    assert coordinator._CALIB_STORE["calib"].physical_filter == "r_57"
 
 
 def test_push_after_eviction_reloads_from_the_original_prepare_command():
     """Same as above, but A has actually been evicted from the cache (not just
     superseded as the active entry) by the time its push arrives.
     """
-    a = coordinator.ensure_prepared(prepare_command("r"))
-    coordinator.ensure_prepared(prepare_command("g"))
-    coordinator.ensure_prepared(prepare_command("i"))
-    coordinator.ensure_prepared(prepare_command("u"))  # cap=3 default: evicts A
+    a = coordinator.ensure_prepared(prepare_command("r_57"))
+    coordinator.ensure_prepared(prepare_command("g_6"))
+    coordinator.ensure_prepared(prepare_command("i_39"))
+    coordinator.ensure_prepared(prepare_command("u_24"))  # cap=3 default: evicts A
     assert a["key"] not in coordinator._PREPARED_CACHE
 
     coordinator.ensure_prepared_for_push(a["key"])
 
     assert a["key"] in coordinator._PREPARED_CACHE
     assert coordinator._ACTIVE_KEY == a["key"]
-    assert coordinator._CALIB_STORE["calib"].band == "r"
+    assert coordinator._CALIB_STORE["calib"].physical_filter == "r_57"
 
 
-def test_a_pointing_change_at_one_band_reuses_the_calibs():
+def test_a_pointing_change_at_one_filter_reuses_the_calibs():
     """The reason _CALIB_CACHE exists: a slew big enough to change the level-5
-    shard set is a new composite key, but the calibs depend only on the band and
-    must survive it."""
-    near = prepare_command("r")
-    far = prepare_command("r") | {"boresight_ra": BORESIGHT[0] + 2.0}
+    shard set is a new composite key, but the calibs depend only on the
+    physical_filter and must survive it."""
+    near = prepare_command("r_57")
+    far = prepare_command("r_57") | {"boresight_ra": BORESIGHT[0] + 2.0}
 
     first = coordinator.ensure_prepared(near)
     calib = coordinator._CALIB_STORE["calib"]
@@ -113,20 +113,23 @@ def test_a_pointing_change_at_one_band_reuses_the_calibs():
     assert coordinator._CALIB_STORE["calib"] is calib
 
 
-def test_calib_cap_evicts_by_band(monkeypatch):
+def test_calib_cap_evicts_by_physical_filter(monkeypatch):
     monkeypatch.setattr(coordinator, "CALIB_CACHE_CAP", 2)
 
-    for band in ("r", "g", "i"):
-        coordinator.ensure_prepared(prepare_command(band))
+    for physical_filter in ("r_57", "g_6", "i_39"):
+        coordinator.ensure_prepared(prepare_command(physical_filter))
 
-    assert "r" not in coordinator._CALIB_CACHE
-    assert set(coordinator._CALIB_CACHE) == {"g", "i"}
+    assert "r_57" not in coordinator._CALIB_CACHE
+    assert set(coordinator._CALIB_CACHE) == {"g_6", "i_39"}
 
 
 def test_cap_evicts_least_recently_touched_first(monkeypatch):
     monkeypatch.setattr(coordinator, "PREPARED_CACHE_CAP", 3)
 
-    keys = [coordinator.ensure_prepared(prepare_command(band))["key"] for band in BANDS]
+    keys = [
+        coordinator.ensure_prepared(prepare_command(pf))["key"]
+        for pf in PHYSICAL_FILTERS
+    ]
 
     assert keys[0] not in coordinator._PREPARED_CACHE
     for key in keys[1:]:
@@ -138,15 +141,15 @@ def test_a_push_touch_protects_an_entry_from_eviction(monkeypatch):
     push must not lose its config to an eviction caused by newer prepares."""
     monkeypatch.setattr(coordinator, "PREPARED_CACHE_CAP", 2)
 
-    a = coordinator.ensure_prepared(prepare_command("r"))
-    coordinator.ensure_prepared(prepare_command("g"))
+    a = coordinator.ensure_prepared(prepare_command("r_57"))
+    coordinator.ensure_prepared(prepare_command("g_6"))
     coordinator.ensure_prepared_for_push(a["key"])  # touch A -> MRU
-    coordinator.ensure_prepared(prepare_command("i"))  # should evict B, not A
+    coordinator.ensure_prepared(prepare_command("i_39"))  # should evict B, not A
 
     assert a["key"] in coordinator._PREPARED_CACHE
 
 
 def test_push_for_a_key_never_prepared_is_a_loud_error():
-    bogus_key = ((), "r", frozenset({0}))
+    bogus_key = coordinator.PrepareKey((), "r_57", frozenset({0}))
     with pytest.raises(RuntimeError, match="no prepared config"):
         coordinator.ensure_prepared_for_push(bogus_key)

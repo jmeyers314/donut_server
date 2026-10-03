@@ -20,10 +20,10 @@ SHARD_DIR = os.environ.get("DONUT_SERVER_REFCAT_DIR", "")
 SHARD_PATHS = sorted(glob.glob(os.path.join(SHARD_DIR, "*.fits"))) if SHARD_DIR else []
 NO_SHARDS = f"no shards in {SHARD_DIR or '$DONUT_SERVER_REFCAT_DIR (unset)'}"
 RAW_DIR = os.environ.get("DONUT_SERVER_RAW_DIR", "")
-RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*_r.fits"))) if RAW_DIR else []
+RAW_PATHS = sorted(glob.glob(os.path.join(RAW_DIR, "raw_*_r_57.fits"))) if RAW_DIR else []
 NO_RAWS = f"no raw_*.fits in {RAW_DIR or '$DONUT_SERVER_RAW_DIR (unset)'}"
 
-# The r-band exposure's boresight, and the level-5 shards a FIELD_RADIUS_DEG
+# The r_57 exposure's boresight, and the level-5 shards a FIELD_RADIUS_DEG
 # circle about it covers. Recorded from a measurement, not derived, so that a
 # change in FIELD_RADIUS_DEG or in the envelope logic shows up here.
 BORESIGHT = (283.666, -28.1326)

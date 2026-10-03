@@ -11,8 +11,8 @@ Linux (USDF/summit) — see Open questions.
 
 ## Workload shape (measured)
 
-One exposure, 8 sensors, band r, dev laptop. **Measure steady state, not the first job:** the first
-`runQuantum` in a fresh coordinator costs 7.5–8.9 s; jobs 2 onward settle at 6.1–6.7 s.
+One exposure, 8 sensors, physical_filter r_57, dev laptop. **Measure steady state, not the first job:**
+the first `runQuantum` in a fresh coordinator costs 7.5–8.9 s; jobs 2 onward settle at 6.1–6.7 s.
 
 | | value |
 |---|---|
@@ -69,7 +69,7 @@ every refcount write dirties an object-header page. Fork-safety is validated aga
 States: `PREPARED → RECEIVING → COMPUTING → DONE` (or `ERROR`).
 
 1. **prepare** (exposure starting, no pixels): loads/refreshes calibs into `_CALIB_STORE` (ptc, linearizer,
-   crosstalk per detector; flat and intrinsicZernikes per detector+band) and refcat shards into
+   crosstalk per detector; flat and intrinsicZernikes per detector+physical_filter) and refcat shards into
    `_REFCAT_STORE`, both behind reuse guards. Also pays the one-time `DimensionUniverse` + task construction
    + pyarrow init. Raw-independent precompute belongs here.
 2. **push** (pixels ready): blob streamed into shared memory, layout handed to the coordinator, which
@@ -81,7 +81,10 @@ States: `PREPARED → RECEIVING → COMPUTING → DONE` (or `ERROR`).
 All endpoints require `Authorization: Bearer <token>`, except `GET /health`, where it is optional so that a
 supervisor's probe can reach it.
 
-- `POST /prepare` — JSON `{band, boresight_ra, boresight_dec}`. Boresight is in degrees and
+- `POST /prepare` — JSON `{physical_filter, boresight_ra, boresight_dec}`. `physical_filter` is the full
+  label (`r_57`), not the band (`r`): it is the token the flat and intrinsicZernikes filenames carry, and
+  **required** (400 if missing, not a string, or blank — shape only; whether calibs exist for the value is
+  the coordinator's answer to give, with the path it looked for). Boresight is in degrees and
   **required** (400 if missing, non-numeric or non-finite — `json` parses a bare `NaN` token, so finiteness
   is checked in the web process): it is what lets refcat shards preload before pixels exist. Returns
   `job_id`, state, `timings: {calib: {...}, refcat: {...}}`; both sub-dicts carry the same keys whether the
@@ -152,7 +155,7 @@ reshard to 131k files was rejected: it still needs the astropy→afw conversion,
 off-critical-path prepare time that is cached anyway, and costs 131k inodes plus a second catalog copy.
 
 The coordinator envelopes a `FIELD_RADIUS_DEG = 2.0` circle at level 5 about the boresight (10 shards,
-101 MB, 1.15M rows for the r-band field), reads those files, reshards, and caches keyed on the *set* of
+101 MB, 1.15M rows for the r_57 field), reads those files, reshards, and caches keyed on the *set* of
 level-5 ids, so AOS dithers within one pointing reuse it (0.3 ms). Rotator angle is deliberately not in the
 API: the region is a circle centred on the boresight, so rotation cannot change which shards it touches.
 Max angular distance from boresight to any corner-sensor pixel, with the 400 px margin, is **1.878°**; a
@@ -173,15 +176,17 @@ is slightly incomplete near its own faint limit.
 
 ## Data on disk
 
-`raw/raw_<visit>_<detectorId>_<band>.fits` — 48 files, 6 exposures x 8 detectors, one per band (u,g,r,i,z,y).
+`raw/raw_<visit>_<detectorId>_<physical_filter>.fits` — 48 files, 6 exposures x 8 detectors, one per filter
+(`u_24, g_6, r_57, i_39, z_20, y_10`). The filter is parsed back out of the filename by
+`client.discover_exposures`, which is why the name carries the full label and not the band.
 Detector ids are always `[191,192,195,196,199,200,203,204]` = `R00_SW0/SW1, R04_SW0/SW1, R40_SW0/SW1,
 R44_SW0/SW1`. Each is an **un-assembled** `ExposureF`: bbox (0,0)–(4607,2047), image float32, mask int32
 all-zero, variance all-zero, WCS present, Detector attached with 8 amps whose `rawBBox`es tile the image
 exactly — overscan present, ISR-ready. `VisitInfo.id` matches the filename's visit; `DAYOBS`/`GROUPID`
 supply `day_obs`/`group`.
 
-`calib/` holds `ptc_<det>`, `linearizer_<det>`, `crosstalk_<det>` (band-independent) and
-`flat_<det>_<band>`, `intrinsicZernikes_<det>_<band>` for all six bands.
+`calib/` holds `ptc_<det>`, `linearizer_<det>`, `crosstalk_<det>` (filter-independent) and
+`flat_<det>_<physical_filter>`, `intrinsicZernikes_<det>_<physical_filter>` for all six filters.
 
 ## The hand-built Butler
 
@@ -248,8 +253,10 @@ the repo root, and the three data trees are located by `DONUT_SERVER_{CALIB,REFC
   of the three view sites releases in a `finally`.
 - **`track=False`** when the coordinator opens the block, or the child's `resource_tracker` unlinks it on
   exit. The front-end creates and is the sole unlinker.
-- **The raws' band is cross-checked against the band `prepare` loaded** — otherwise the wrong flats are
-  applied silently.
+- **The raws' `physicalLabel` is cross-checked against the physical_filter `prepare` loaded** — otherwise
+  the wrong flats are applied silently. Comparing `bandLabel` would only check a 6-valued projection of the
+  key, so two filters sharing a band would pass while paired with the wrong flat; this compares the literal
+  string that selected the flat files.
 - **The raws' refcat shard coverage is cross-checked against what `prepare` loaded**, same reasoning: a
   pointing mismatch would degrade astrometry silently. The check compares level-5 id *sets* computed from
   the raws' own WCSs, not an angular tolerance, and **must use a 400 px margin, not 300** — see
@@ -284,9 +291,9 @@ the repo root, and the three data trees are located by `DONUT_SERVER_{CALIB,REFC
   absent: a bare probe has no bearer token. `is_alive()` alone is unusable as readiness — it is `True` for a
   child 15 s into importing afw + ts_wep, and for one whose fork pool is deadlocked.
 - **Auto-re-priming is an availability optimization, not a correctness requirement.** A restarted-but-
-  unprimed coordinator fails the next push loudly via the band and refcat-coverage cross-checks above, and
-  that is what makes replaying the last `prepare` safe to do automatically. Skipped when the crash was
-  provoked *by* a `prepare`, to avoid a crash loop.
+  unprimed coordinator fails the next push loudly via the physical_filter and refcat-coverage cross-checks
+  above, and that is what makes replaying the last `prepare` safe to do automatically. Skipped when the
+  crash was provoked *by* a `prepare`, to avoid a crash loop.
 
 ## Not yet built
 
@@ -341,7 +348,7 @@ bin/donutClient.py --token <tok> --visit 2026071300478 --wait 60
 ```
 
 The client prints the boresight, per-stage timings, the result summary, and real Zernikes
-(`zk_deviation_ccs`, shape (n, 27), microns). For the r-band exposure expect boresight
+(`zk_deviation_ccs`, shape (n, 27), microns). For the r_57 exposure expect boresight
 `ra=283.6660 dec=-28.1326`; prepare reporting `n_level5_files: 10`, `n_level7_shards: 160`,
 `n_rows: 1148693` in ~0.5–0.7 s cold and ~0.0003 s on a repeat; `n_input_datasets: 208`; and **63 donut
 rows** across 8 detectors with 28/29 groups fit. `donut_id` values are Gaia source ids (e.g.

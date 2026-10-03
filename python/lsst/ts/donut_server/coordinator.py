@@ -2,20 +2,20 @@
 
 Holds `_PREPARED_CACHE`, a small LRU of `PreparedEntry` bundles -- each one a
 task plus a resharded refcat, under one composite key (the `-c`/`-C` override
-list, the band, and the refcat's level-5 shard-id set). Bundled per entry,
-rather than the independent singleton globals this replaced, because a second
+list, the physical_filter, and the refcat's level-5 shard-id set). Bundled per
+entry, rather than the independent singleton globals this replaced, because a second
 `/prepare` before any `/push` must not silently retarget a `job_id` that is
 still waiting to be pushed: a `job_id`'s `prepared_key` names the exact entry
 that was live when it was prepared, and `push` reactivates that entry --
 reloading it if it was since evicted -- rather than running whatever the *most
 recent* prepare happened to load.
 
-Calibs are cached separately, in `_CALIB_CACHE`, keyed on band alone: they are
-by far the most expensive thing prepare loads and they depend on nothing else
-in the composite key, so a pointing change must not discard them. The
+Calibs are cached separately, in `_CALIB_CACHE`, keyed on physical_filter alone:
+they are by far the most expensive thing prepare loads and they depend on nothing
+else in the composite key, so a pointing change must not discard them. The
 anti-hazard argument above is unaffected -- it never required that calibs be
 *copied* per entry, only that a `job_id` resolve to the exact config it was
-prepared against, and a band-keyed lookup off `key[1]` gives exactly that.
+prepared against, and a lookup off `key.physical_filter` gives exactly that.
 
 Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
 to a hand-built in-memory Butler, and calls the real
@@ -151,7 +151,7 @@ def stamp_dir() -> str:
         )
     return d
 
-# Per-donut postage stamps: ~21 MB of the result table (measured on the r-band
+# Per-donut postage stamps: ~21 MB of the result table (measured on the r_57
 # exposure, 63 donuts -- stamp is 167x167 each, wf_img and model_img 83x83).
 # Held out of the reply, not discarded: the remaining 59 columns, including all
 # the Zernikes, are ~214 KB as parquet and are what the client waits for. The
@@ -193,11 +193,27 @@ _UNIVERSE: Any = None
 # "a couple of configs in flight", not measured against a real workload yet.
 PREPARED_CACHE_CAP = 3
 
-# How many bands' calibs to keep warm. A band change is rare, so two keeps the
-# current and previous band resident. This bound is what caps calib RSS: entries
+# How many filters' calibs to keep warm. A filter change is rare, so two keeps
+# the current and previous one resident. This bound is what caps calib RSS: entries
 # in _PREPARED_CACHE deliberately hold no reference to a CalibSet, so _CALIB_CACHE
 # is its sole owner and dropping one here really frees it.
 CALIB_CACHE_CAP = 2
+
+
+class PrepareKey(NamedTuple):
+    """The composite cache key for one /prepare command.
+
+    A NamedTuple rather than a bare tuple so the components are read by name:
+    `_activate_entry` needs the filter out of the middle of the key, and a
+    positional `key[1]` there is the kind of thing nothing type-checks and a
+    later reordering silently breaks. Still a tuple, so it hashes and compares
+    exactly as the plain tuple it replaced -- `_PREPARED_CACHE` and
+    `_PREPARE_COMMANDS` need no change.
+    """
+
+    task: tuple
+    physical_filter: str
+    refcat: frozenset
 
 
 @dataclass
@@ -210,12 +226,13 @@ class PreparedEntry:
     cache-hit refcat would be exactly the silent wrong-config run this cache
     exists to prevent.
 
-    Carries no calib: the band is already `key[1]`, so the calib is resolved
-    through `_CALIB_CACHE` at activation time. That keeps an entry cheap and
-    keeps `CALIB_CACHE_CAP` a real memory bound rather than a lower bound.
+    Carries no calib: the filter is already `key.physical_filter`, so the calib
+    is resolved through `_CALIB_CACHE` at activation time. That keeps an entry
+    cheap and keeps `CALIB_CACHE_CAP` a real memory bound rather than a lower
+    bound.
     """
 
-    key: tuple
+    key: PrepareKey
     task: Any
     task_dump: str
     refcat_store: refcat_store.RefCatStore
@@ -224,13 +241,13 @@ class PreparedEntry:
 # Insertion order is LRU order: touched entries are popped and re-inserted at
 # the end (MRU), so the front is always the next eviction. dict/OrderedDict
 # iteration order is why this needs no separate bookkeeping.
-_PREPARED_CACHE: "OrderedDict[tuple, PreparedEntry]" = OrderedDict()
+_PREPARED_CACHE: "OrderedDict[PrepareKey, PreparedEntry]" = OrderedDict()
 
-# Same insertion-order-is-LRU idiom, keyed on band alone. Separate from
-# _PREPARED_CACHE because calibs depend only on the band: sharing one composite
-# key would make a slew that shifts the refcat shard set reload every FITS file
-# in calib_dir(), including the PTCs, linearizers and crosstalk, which depend on
-# nothing in /prepare at all.
+# Same insertion-order-is-LRU idiom, keyed on physical_filter alone. Separate
+# from _PREPARED_CACHE because calibs depend only on the filter: sharing one
+# composite key would make a slew that shifts the refcat shard set reload every
+# FITS file in calib_dir(), including the PTCs, linearizers and crosstalk, which
+# depend on nothing in /prepare at all.
 _CALIB_CACHE: "OrderedDict[str, CalibSet]" = OrderedDict()
 
 # The prepare command that built each still-known key, kept forever (never
@@ -240,12 +257,12 @@ _CALIB_CACHE: "OrderedDict[str, CalibSet]" = OrderedDict()
 # boresight that produced it. These dicts are tiny (a handful of floats and
 # strings) next to a CalibSet, so keeping every key's command around costs
 # nothing worth bounding.
-_PREPARE_COMMANDS: dict[tuple, dict] = {}
+_PREPARE_COMMANDS: dict[PrepareKey, dict] = {}
 
 # The composite key of whichever PreparedEntry is currently active -- i.e. the
 # one _CALIB_STORE/_REFCAT_STORE/_TASK* below describe right now. None before
 # the first successful prepare.
-_ACTIVE_KEY: tuple | None = None
+_ACTIVE_KEY: PrepareKey | None = None
 
 # Mirror the currently-active PreparedEntry's task/calib/refcat, so run_job and
 # build_quantum_context need no change from the pre-cache design: they still
@@ -425,7 +442,7 @@ def require_task() -> tuple[Any, Any]:
     task's own forks, and a push that silently built a default-config task would
     also be a push that silently ignored the operator's overrides.
 
-    Normally unreachable -- run_job's band cross-check fires first and says more.
+    Normally unreachable -- run_job's filter cross-check fires first and says more.
     Reachable in principle after a restart whose re-prime failed, which leaves the
     coordinator READY but unprimed while the front-end still holds PREPARED jobs
     that /push accepts. An explicit error rather than an AttributeError on None.
@@ -443,47 +460,50 @@ def task_config_dump() -> str:
     return _TASK_DUMP
 
 
-def _prepare_key(command: dict) -> tuple:
+def _prepare_key(command: dict) -> PrepareKey:
     """The composite cache key for one /prepare command.
 
     The refcat component is the *shard-id set*, not the raw boresight, so a
     dither within one pointing (same set) hits the cache -- matching
     RefCatStore's own reuse guard, which is keyed the same way.
+
+    `physical_filter` is subscripted, not `.get`: a caller that still sends the
+    old `band` field fails here, loudly, rather than keying the cache on None
+    and only failing later on a `flat_<det>_None.fits` that does not exist.
     """
     task_key = override_key(command.get("config_overrides"))
-    calib_key = command["band"]
     refcat_key = frozenset(
         refcat_store.shard_ids_for_pointing(command["boresight_ra"], command["boresight_dec"])
     )
-    return (task_key, calib_key, refcat_key)
+    return PrepareKey(task_key, command["physical_filter"], refcat_key)
 
 
-def _ensure_calib(band: str) -> tuple["CalibSet", dict]:
-    """Get-or-build the CalibSet for `band`, and report it in `_build_calib`'s
-    own timing shape so a reused calib is described with its real counts rather
-    than zeroed placeholders.
+def _ensure_calib(physical_filter: str) -> tuple["CalibSet", dict]:
+    """Get-or-build the CalibSet for `physical_filter`, and report it in
+    `_build_calib`'s own timing shape so a reused calib is described with its
+    real counts rather than zeroed placeholders.
 
     Evicts past CALIB_CACHE_CAP, oldest first. Insertion happens only after
-    `_build_calib` returns, so a failed load leaves the previous bands cached.
+    `_build_calib` returns, so a failed load leaves the previous filters cached.
     """
-    calib = _CALIB_CACHE.get(band)
+    calib = _CALIB_CACHE.get(physical_filter)
     if calib is not None:
-        _CALIB_CACHE.move_to_end(band)
+        _CALIB_CACHE.move_to_end(physical_filter)
         return calib, {
             "reused": True,
             "elapsed_s": 0.0,
             "n_detectors": len(calib.detector_ids),
             "n_intrinsic_zernikes": len(calib.intrinsic_zernikes_by_name),
-            "band": band,
+            "physical_filter": physical_filter,
         }
 
-    calib, timings = _build_calib(band)
-    _CALIB_CACHE[band] = calib
+    calib, timings = _build_calib(physical_filter)
+    _CALIB_CACHE[physical_filter] = calib
     while len(_CALIB_CACHE) > CALIB_CACHE_CAP:
-        evicted_band, _ = _CALIB_CACHE.popitem(last=False)
+        evicted_filter, _ = _CALIB_CACHE.popitem(last=False)
         _log.info(
-            "calib-cache: evicted band %r (cap=%d, now holding %d)",
-            evicted_band, CALIB_CACHE_CAP, len(_CALIB_CACHE),
+            "calib-cache: evicted physical_filter %r (cap=%d, now holding %d)",
+            evicted_filter, CALIB_CACHE_CAP, len(_CALIB_CACHE),
         )
     return calib, timings
 
@@ -496,12 +516,12 @@ def _activate_entry(entry: "PreparedEntry") -> None:
     push-time reload -- goes through here and cannot leave them half-updated.
     """
     global _ACTIVE_KEY, _TASK, _TASK_DUMP, _REFCAT_STORE
-    calib, _ = _ensure_calib(entry.key[1])
+    calib, _ = _ensure_calib(entry.key.physical_filter)
     _ACTIVE_KEY = entry.key
     _TASK = entry.task
     _TASK_DUMP = entry.task_dump
     _CALIB_STORE.clear()
-    _CALIB_STORE["band"] = calib.band
+    _CALIB_STORE["physical_filter"] = calib.physical_filter
     _CALIB_STORE["calib"] = calib
     _REFCAT_STORE = entry.refcat_store
 
@@ -563,7 +583,7 @@ def ensure_prepared(command: dict) -> dict:
     key = _prepare_key(command)
     entry = _PREPARED_CACHE.get(key)
 
-    _, calib_timing = _ensure_calib(command["band"])
+    _, calib_timing = _ensure_calib(command["physical_filter"])
 
     if entry is None:
         entry, timings = _build_entry(key, command)
@@ -573,7 +593,7 @@ def ensure_prepared(command: dict) -> dict:
     else:
         _PREPARED_CACHE.move_to_end(key)
         timings = {
-            "task": {"reused": True, "elapsed_s": 0.0, "n_overrides": len(key[0])},
+            "task": {"reused": True, "elapsed_s": 0.0, "n_overrides": len(key.task)},
             "refcat": entry.refcat_store.ensure(command["boresight_ra"], command["boresight_dec"]),
         }
     timings["calib"] = calib_timing
@@ -655,13 +675,19 @@ def write_stamp_table(job_id: str, table) -> str:
 
 @dataclass
 class CalibSet:
-    """Real calibrations for prepare's band, keyed by detector name.
+    """Real calibrations for prepare's physical_filter, keyed by detector name.
+
+    Carries physical_filter rather than band because that is what actually
+    selected the flats -- band is a 6-valued coarsening of it, so two filters
+    sharing a band (an `r_57` -> `r_03` swap) would be indistinguishable.
+    `build_quantum_context` reads both labels off the exposure's FilterLabel, so
+    there is no band field here to keep consistent with anything.
 
     intrinsic_zernikes_by_name is partial: a detector missing that file
     simply has no entry (mirrors the real Butler connection's minimum=0).
     """
 
-    band: str
+    physical_filter: str
     detector_ids: list
     ptc_by_name: dict
     linearizer_by_name: dict
@@ -682,7 +708,7 @@ def _discover_detector_ids(calib_dir: str) -> list:
     return ids
 
 
-def _build_calib(band: str) -> tuple[CalibSet, dict]:
+def _build_calib(physical_filter: str) -> tuple[CalibSet, dict]:
     """Load one CalibSet fresh from disk. Always builds -- `_ensure_calib` is
     where reuse is decided, so this need not guard itself."""
     t0 = time.monotonic()
@@ -697,7 +723,7 @@ def _build_calib(band: str) -> tuple[CalibSet, dict]:
     intrinsic_zernikes_by_name: dict = {}
 
     for det_id in detector_ids:
-        # Band-independent, required. Detector name comes off the calib
+        # Filter-independent, required. Detector name comes off the calib
         # object itself (._detectorName) -- no separate id->name table needed.
         ptc = ipIsr.PhotonTransferCurveDataset.readFits(
             os.path.join(calibs, f"ptc_{det_id}.fits")
@@ -711,23 +737,23 @@ def _build_calib(band: str) -> tuple[CalibSet, dict]:
             os.path.join(calibs, f"crosstalk_{det_id}.fits")
         )
 
-        # Band-dependent, required.
-        flat_path = os.path.join(calibs, f"flat_{det_id}_{band}.fits")
+        # Filter-dependent, required.
+        flat_path = os.path.join(calibs, f"flat_{det_id}_{physical_filter}.fits")
         if not os.path.exists(flat_path):
             raise RuntimeError(
                 f"Missing required flat calib for detector {name} ({det_id}), "
-                f"band {band!r}: {flat_path}"
+                f"physical_filter {physical_filter!r}: {flat_path}"
             )
         flat_by_name[name] = afwImage.ExposureF.readFits(flat_path)
 
-        # Band-dependent, optional (mirrors the real Butler connection's
+        # Filter-dependent, optional (mirrors the real Butler connection's
         # minimum=0): missing file just means no entry for this detector.
-        iz_path = os.path.join(calibs, f"intrinsicZernikes_{det_id}_{band}.fits")
+        iz_path = os.path.join(calibs, f"intrinsicZernikes_{det_id}_{physical_filter}.fits")
         if os.path.exists(iz_path):
             intrinsic_zernikes_by_name[name] = ipIsr.IsrCalib.readFits(iz_path)
 
     calib = CalibSet(
-        band=band,
+        physical_filter=physical_filter,
         detector_ids=detector_ids,
         ptc_by_name=ptc_by_name,
         linearizer_by_name=linearizer_by_name,
@@ -741,7 +767,7 @@ def _build_calib(band: str) -> tuple[CalibSet, dict]:
         "elapsed_s": time.monotonic() - t0,
         "n_detectors": len(detector_ids),
         "n_intrinsic_zernikes": len(intrinsic_zernikes_by_name),
-        "band": band,
+        "physical_filter": physical_filter,
     }
     return calib, timings
 
@@ -819,7 +845,7 @@ def build_quantum_context(
 
     # Exact coverage check rather than an angular tolerance on the boresight: a
     # prepare/push pointing mismatch would otherwise degrade astrometry silently
-    # instead of failing, the same failure mode the band cross-check guards.
+    # instead of failing, the same failure mode the filter cross-check guards.
     uncovered = _REFCAT_STORE.uncovered(refcat_store.shard_ids_for_exposures(exposures))
     if uncovered:
         raise RuntimeError(
@@ -968,12 +994,17 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     exposures = reconstruct_exposures(layout)
     decode_s = time.perf_counter() - t0
 
-    band = next(iter(exposures.values())).getFilter().bandLabel
-    prepared_band = _CALIB_STORE.get("band")
-    if prepared_band != band:
+    # physicalLabel, not bandLabel: band is a 6-valued coarsening of the filter,
+    # so comparing it only checks a projection of the key. Two filters sharing a
+    # band would pass that check while paired with the wrong flat -- the exact
+    # failure this guard exists to catch. This compares the literal string that
+    # selected the flat files.
+    physical_filter = next(iter(exposures.values())).getFilter().physicalLabel
+    prepared_filter = _CALIB_STORE.get("physical_filter")
+    if prepared_filter != physical_filter:
         raise RuntimeError(
-            f"raws are band {band!r} but prepare loaded band {prepared_band!r} "
-            "-- the flats would be wrong"
+            f"raws are physical_filter {physical_filter!r} but prepare loaded "
+            f"{prepared_filter!r} -- the flats would be wrong"
         )
     calib = _CALIB_STORE["calib"]
 
@@ -1263,11 +1294,11 @@ if __name__ == "__main__":
     # the butler build in isolation.
     from lsst.ts.donut_server import client
 
-    VISIT = 2026071300478  # the r-band exposure
+    VISIT = 2026071300478  # the r_57 exposure
     source = client.resolve_from_files(client.raw_dir(), VISIT)
-    band = source.band
+    physical_filter = source.physical_filter
     print(
-        f"exposure -> visit={source.visit} band={band} "
+        f"exposure -> visit={source.visit} physical_filter={physical_filter} "
         f"detectors={sorted(source.handles)}"
     )
 
@@ -1300,7 +1331,7 @@ if __name__ == "__main__":
 
     parent_conn.send({
         "cmd": "prepare",
-        "band": band,
+        "physical_filter": physical_filter,
         "boresight_ra": boresight_ra,
         "boresight_dec": boresight_dec,
         "config_overrides": [],
