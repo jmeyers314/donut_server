@@ -26,28 +26,100 @@ def main() -> None:
     # is the only transport that reaches where they are read: uvicorn.run() imports
     # the app by string in this process, and the coordinator children inherit the
     # environment from it. The flags exist for discoverability through --help.
+    # Short forms follow `pipetask run`: -j is the process count
+    # (--processes there), -n the cores one quantum may use
+    # (--cores-per-quantum).
     parser.add_argument(
+        "-j",
         "--num-flights",
         type=int,
         help="coordinator processes to run, each able to compute one job at a time "
         "(default 2; DONUT_SERVER_NUM_FLIGHTS)",
     )
     parser.add_argument(
+        "-n",
         "--num-workers",
         type=int,
         help="cores the task may fork over per push, not divided between flights "
         "(default 8; DONUT_SERVER_NUM_WORKERS)",
     )
+    # Giving a repo is what selects the butler calib backend -- there is no
+    # --calib-backend flag, because the repo is the only thing that backend needs
+    # that the files one cannot use. Short forms match donutClient.py's -b/-i,
+    # which in turn match `pipetask run`.
+    parser.add_argument(
+        "-b",
+        "--butler-repo",
+        help="butler repo root or alias to resolve calibs from, valid for the "
+        "exposure's time; without this they are read from the flat FITS tree "
+        "under DONUT_SERVER_CALIB_DIR (DONUT_SERVER_BUTLER_REPO)",
+    )
+    parser.add_argument(
+        "-i",
+        "--butler-collections",
+        help="comma-separated collections to resolve calibs from, highest priority "
+        "first; only meaningful with --butler-repo "
+        "(default LSSTCam/defaults; DONUT_SERVER_BUTLER_COLLECTIONS)",
+    )
     args = parser.parse_args()
 
-    # setdefault, so an already-exported env var wins over the flag's default of
-    # None -- and an explicit flag wins over nothing, which is the intent.
+    # These flags *are* a way of setting the environment variables, which is the
+    # only transport that reaches where they are read -- so a flag assigns,
+    # overriding whatever was exported. Each defaults to None, and None means
+    # "not given", leaving an exported value in place. Precedence is therefore
+    # flag > exported > default, the usual way round.
     for flag, var in (
         (args.num_flights, "DONUT_SERVER_NUM_FLIGHTS"),
         (args.num_workers, "DONUT_SERVER_NUM_WORKERS"),
+        (args.butler_repo, "DONUT_SERVER_BUTLER_REPO"),
+        (args.butler_collections, "DONUT_SERVER_BUTLER_COLLECTIONS"),
     ):
         if flag is not None:
-            os.environ.setdefault(var, str(flag))
+            os.environ[var] = str(flag)
+
+    # A repo implies the butler backend; no repo implies the files one. The
+    # coordinator still reads DONUT_SERVER_CALIB_BACKEND -- it is the backend's
+    # own contract and what the tests set -- so this derives it rather than
+    # replacing it.
+    #
+    # Naming a repo on the command line is as explicit as it gets, so it wins
+    # over an exported backend; a repo that arrived in the environment only
+    # defaults it, leaving an exported DONUT_SERVER_CALIB_BACKEND=files able to
+    # pin the files backend while a repo stays exported for another run.
+    if args.butler_repo is not None:
+        os.environ["DONUT_SERVER_CALIB_BACKEND"] = "butler"
+    elif os.environ.get("DONUT_SERVER_BUTLER_REPO"):
+        os.environ.setdefault("DONUT_SERVER_CALIB_BACKEND", "butler")
+
+    # Collections without a repo would otherwise be silently ignored: they only
+    # ever reach the butler backend, so this is someone expecting calibs to come
+    # from a repo they have not named.
+    if os.environ.get("DONUT_SERVER_BUTLER_COLLECTIONS") and not os.environ.get(
+        "DONUT_SERVER_BUTLER_REPO"
+    ):
+        parser.error(
+            f"{'--butler-collections' if args.butler_collections else 'DONUT_SERVER_BUTLER_COLLECTIONS'}"
+            " needs a repo; pass --butler-repo (or export DONUT_SERVER_BUTLER_REPO). "
+            "Without one, calibs come from DONUT_SERVER_CALIB_DIR and no "
+            "collection is consulted"
+        )
+
+    # An exported backend with no repo to resolve from. Caught here because
+    # otherwise it comes up looking healthy: nothing on the startup path resolves
+    # a calib, so both flights spawn, /health reports ready, and every /prepare
+    # then fails with a 500.
+    #
+    # That the repo *resolves* is deliberately not checked: that needs
+    # Butler.from_config, and keeping the stack out of this process is
+    # load-bearing (uvicorn.run imports the app in-process below). The
+    # coordinator validates it at the first resolve.
+    if os.environ.get("DONUT_SERVER_CALIB_BACKEND") == "butler" and not os.environ.get(
+        "DONUT_SERVER_BUTLER_REPO"
+    ):
+        parser.error(
+            "DONUT_SERVER_CALIB_BACKEND=butler needs a repo; pass --butler-repo "
+            "(or export DONUT_SERVER_BUTLER_REPO)"
+        )
 
     # Before importing anything that pulls numpy: keep BLAS/OpenMP
     # single-threaded so the task's 8 fork workers don't each fork with a live
@@ -82,6 +154,31 @@ def main() -> None:
         f"Flights: {os.environ.get('DONUT_SERVER_NUM_FLIGHTS', '2')}"
         f"  workers/push: {os.environ.get('DONUT_SERVER_NUM_WORKERS', '8')}"
     )
+
+    # Which calibs are in use, for the same reason -- and since the backend is
+    # now inferred from whether a repo was given, the line has to name the source
+    # it chose, not just the choice. Read back out of the environment so it
+    # reports what the coordinator will actually see, including values that came
+    # from the shell rather than a flag.
+    backend = os.environ.get("DONUT_SERVER_CALIB_BACKEND", "files")
+    if backend == "butler":
+        collections = os.environ.get("DONUT_SERVER_BUTLER_COLLECTIONS", "LSSTCam/defaults")
+        print(f"Calibs: butler  repo={os.environ.get('DONUT_SERVER_BUTLER_REPO', '<unset>')}")
+        print(f"  collections={collections}")
+    elif backend == "files":
+        # Not resolved through coordinator.calib_dir(), which raises when unset:
+        # importing it would pull the stack into this process. An unset dir is
+        # the coordinator's error to report, so just say it is unset.
+        print(
+            f"Calibs: files  dir="
+            f"{os.environ.get('DONUT_SERVER_CALIB_DIR', '<unset>')}"
+        )
+    else:
+        # Reported rather than folded into the files branch, which would print a
+        # calib dir this server is never going to read. Not rejected here: the
+        # valid set belongs to coordinator.calib_backend(), which raises naming
+        # it -- but only at the first /prepare, so say so now.
+        print(f"Calibs: {backend!r} is not a known backend; /prepare will fail")
 
     # Still generated even though the dashboard no longer asks for one: the token is
     # what protects /prepare and /push from the network. Callers on this host are

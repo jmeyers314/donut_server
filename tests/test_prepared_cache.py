@@ -23,14 +23,29 @@ pytestmark = pytest.mark.skipif(not (CALIB_DIR and REFCAT_DIR), reason=NO_DATA)
 BORESIGHT = (283.666, -28.1326)
 PHYSICAL_FILTERS = ("r_57", "g_6", "i_39", "u_24")
 
+# The r_57 exposure's own midpoint. Held fixed across these commands so the
+# physical_filter stays the only thing that varies; the files backend ignores it
+# anyway, but it is part of the key, so a varying one would make every prepare
+# below a distinct entry for a reason unrelated to what each test is checking.
+CALIB_TIME = "2026-07-14T05:42:02.206"
+
 
 def prepare_command(physical_filter: str) -> dict:
     return {
         "physical_filter": physical_filter,
         "boresight_ra": BORESIGHT[0],
         "boresight_dec": BORESIGHT[1],
+        "calib_time": CALIB_TIME,
         "config_overrides": [],
     }
+
+
+@pytest.fixture(autouse=True)
+def files_backend(monkeypatch):
+    """Pin the files backend: these tests describe the cache, not the backend,
+    and a developer shell with DONUT_SERVER_CALIB_BACKEND=butler exported would
+    otherwise silently retarget them at a repo."""
+    monkeypatch.setenv("DONUT_SERVER_CALIB_BACKEND", "files")
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +195,6 @@ def test_a_push_touch_protects_an_entry_from_eviction(monkeypatch):
 
 
 def test_push_for_a_key_never_prepared_is_a_loud_error():
-    bogus_key = coordinator.PrepareKey((), "r_57", frozenset({0}))
+    bogus_key = coordinator.PrepareKey((), "r_57", frozenset({0}), CALIB_TIME)
     with pytest.raises(RuntimeError, match="no prepared config"):
         coordinator.ensure_prepared_for_push(bogus_key)

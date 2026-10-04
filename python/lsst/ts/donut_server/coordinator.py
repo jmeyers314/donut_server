@@ -10,17 +10,23 @@ that was live when it was prepared, and `push` reactivates that entry --
 reloading it if it was since evicted -- rather than running whatever the *most
 recent* prepare happened to load.
 
-Calibs are cached separately, and in two halves: `_FILTER_CALIB_CACHE` keyed on
-physical_filter for the flats and intrinsic Zernikes, and
-`_DETECTOR_CALIB_CACHE` -- one permanent entry -- for the PTCs, linearizers and
-crosstalk, which depend on nothing in `/prepare` at all. They are by far the
-most expensive thing prepare loads, so a pointing change must not discard them
-and a filter change must discard only the half that the filter selects.
-`_activate_entry` composes the two into the flat `CalibSet` view its readers
-expect. The anti-hazard argument above is unaffected -- it never required that
-calibs be *copied* per entry, only that a `job_id` resolve to the exact config
-it was prepared against, and a lookup off `key.physical_filter` gives exactly
-that.
+Calibs are cached separately, and in two halves: `_FILTER_CALIB_CACHE` for the
+flats and intrinsic Zernikes, and `_DETECTOR_CALIB_CACHE` -- one slot -- for the
+PTCs, linearizers and crosstalk, which depend on nothing in `/prepare` at all.
+They are by far the most expensive thing prepare loads, so a pointing change
+must not discard them and a filter change must discard only the half that the
+filter selects. `_activate_entry` composes the two into the flat `CalibSet` view
+its readers expect. The anti-hazard argument above is unaffected -- it never
+required that calibs be *copied* per entry, only that a `job_id` resolve to the
+exact config it was prepared against, which a lookup off its own prepare command
+gives exactly.
+
+Where the calibs come from is a backend: `FilesCalibBackend` reads flat FITS out
+of `DONUT_SERVER_CALIB_DIR` (the default, and what the tests use -- it needs no
+repo), and `ButlerCalibBackend` resolves them from a real repo the way
+`pipetask run` would. The backend answers an *identity* per half, and that
+identity is what the two caches are keyed on, so a recertification that changes
+which datasets a filter resolves to invalidates the right half by itself.
 
 Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
 to a hand-built in-memory Butler, and calls the real
@@ -83,11 +89,13 @@ from lsst.ts.donut_server import exposure_codec
 from lsst.ts.donut_server import logtail
 from lsst.ts.donut_server import refcat_store
 from lsst.daf.butler import (
+    Butler,
     DataCoordinate,
     DatasetRef,
     DatasetType,
     DimensionUniverse,
     Quantum,
+    Timespan,
 )
 from lsst.daf.butler.formatters.parquet import astropy_to_arrow
 from lsst.pipe.base import QuantumContext
@@ -131,9 +139,62 @@ def calib_dir() -> str:
     if not d:
         raise RuntimeError(
             "DONUT_SERVER_CALIB_DIR is not set; point it at the directory "
-            "holding ptc_*.fits, linearizer_*.fits, flat_*.fits (see README)."
+            "holding ptc_*.fits, linearizer_*.fits, flat_*.fits (see README). "
+            "Required only under DONUT_SERVER_CALIB_BACKEND=files (the default)."
         )
     return d
+
+
+# The eight corner wavefront sensors, id -> full_name. SW0 is extra-focal, SW1
+# intra-focal. Verified against the `detector` dimension records in
+# /Users/jmeyers3/repo; scripts/export_blitz_repo.py has the same id list under
+# the name CORNER_DETECTORS, but scripts/ is not on the package path so this is
+# a deliberate second copy rather than an import.
+#
+# The files backend does not use this -- it discovers ids from the ptc_*.fits
+# filenames, which is authoritative for a tree that might hold a subset. The
+# butler backend has no files to glob, so the focal plane has to be named.
+CORNER_DETECTOR_NAMES = {
+    191: "R00_SW0",
+    192: "R00_SW1",
+    195: "R04_SW0",
+    196: "R04_SW1",
+    199: "R40_SW0",
+    200: "R40_SW1",
+    203: "R44_SW0",
+    204: "R44_SW1",
+}
+CORNER_DETECTORS = tuple(CORNER_DETECTOR_NAMES)
+
+
+def butler_repo() -> str:
+    """The butler repo for the `butler` calib backend, from the environment."""
+    d = os.environ.get("DONUT_SERVER_BUTLER_REPO")
+    if not d:
+        raise RuntimeError(
+            "DONUT_SERVER_BUTLER_REPO is not set, but "
+            "DONUT_SERVER_CALIB_BACKEND=butler requires it; point it at a "
+            "butler repo root or an alias (see README)."
+        )
+    return d
+
+
+def butler_collections() -> list[str]:
+    """The input collections to resolve calibs from, highest priority first.
+
+    Comma-separated, defaulting to the same `LSSTCam/defaults` that
+    client.py's --collections and scripts/export_blitz_repo.py use. Passed to
+    the butler *unfiltered* -- see ButlerCalibBackend on why the chain is not
+    reduced to its CALIBRATION children.
+    """
+    raw = os.environ.get("DONUT_SERVER_BUTLER_COLLECTIONS") or "LSSTCam/defaults"
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    if not names:
+        raise RuntimeError(
+            f"DONUT_SERVER_BUTLER_COLLECTIONS is set to {raw!r}, which names no "
+            "collections; unset it for the default (LSSTCam/defaults)."
+        )
+    return names
 
 
 def stamp_dir() -> str:
@@ -220,6 +281,12 @@ class PrepareKey(NamedTuple):
     task: tuple
     physical_filter: str
     refcat: frozenset
+    # Part of the key because it selects calibs: under the butler backend two
+    # prepares at different times can resolve to different datasets, and sharing
+    # one entry between them would be the silent wrong-config run this cache
+    # exists to prevent. Under files it never changes the calibs, so it only
+    # costs key-space -- which is the right way round for a correctness guard.
+    calib_time: str
 
 
 @dataclass
@@ -258,15 +325,19 @@ _PREPARED_CACHE: "OrderedDict[PrepareKey, PreparedEntry]" = OrderedDict()
 # most of the rebuild time for a small minority of the bytes, since they are
 # deserialization-bound rather than I/O-bound.
 #
-# So the filter-independent half is a single entry, loaded at most once and
-# never evicted: it is the small half by memory and cannot vary while
-# calib_dir() is fixed. None until the first prepare builds it.
-_DETECTOR_CALIB_CACHE: "DetectorCalibs | None" = None
+# So the filter-independent half gets a single slot: it is the small half by
+# memory and is identical across filters, so a second slot would buy nothing a
+# first does not. `(identity, DetectorCalibs)` -- the identity is the backend's,
+# and the slot is replaced when it changes, which under the files backend is
+# never (a fixed calib_dir() cannot vary) and under the butler backend means a
+# recertification. None until the first prepare builds it.
+_DETECTOR_CALIB_CACHE: "tuple[Any, DetectorCalibs] | None" = None
 
 # The filter-dependent half, on the same insertion-order-is-LRU idiom as
-# _PREPARED_CACHE and keyed on physical_filter alone. This is the bulk of the
+# _PREPARED_CACHE. Keyed on the backend's identity for this half, which under
+# the files backend *is* the physical_filter string. This is the bulk of the
 # calib memory, and so what CALIB_CACHE_CAP actually bounds.
-_FILTER_CALIB_CACHE: "OrderedDict[str, FilterCalibs]" = OrderedDict()
+_FILTER_CALIB_CACHE: "OrderedDict[Any, FilterCalibs]" = OrderedDict()
 
 # The prepare command that built each still-known key, kept forever (never
 # evicted alongside its PreparedEntry): a push-time cache miss must rebuild
@@ -298,6 +369,17 @@ class ConfigOverrideError(RuntimeError):
     A distinct type so the front-end can answer 400 rather than 500 for operator
     error. Only `str(exc)` crosses the Pipe, so without this the alternative is
     sniffing AttributeError / FieldValidationError / SyntaxError text.
+    """
+
+
+class CalibTimeError(RuntimeError):
+    """The supplied `calib_time` could not be parsed.
+
+    A distinct type for the same reason as ConfigOverrideError: operator error
+    deserves a 400, and the front-end sees only `str(exc)`. The front-end cannot
+    validate this itself -- parsing needs astropy, which it deliberately does
+    not import -- so shape validation there and parse validation here is the
+    split, and this is how the second half reports.
     """
 
 
@@ -485,96 +567,141 @@ def _prepare_key(command: dict) -> PrepareKey:
     dither within one pointing (same set) hits the cache -- matching
     RefCatStore's own reuse guard, which is keyed the same way.
 
-    `physical_filter` is subscripted, not `.get`: a caller that still sends the
-    old `band` field fails here, loudly, rather than keying the cache on None
-    and only failing later on a `flat_<det>_None.fits` that does not exist.
+    `physical_filter` and `calib_time` are subscripted, not `.get`: a caller that
+    still sends the old `band` field, or no time at all, fails here loudly rather
+    than keying the cache on None and only failing later on a
+    `flat_<det>_None.fits` that does not exist, or on a butler lookup that
+    quietly excludes every calibration collection.
     """
     task_key = override_key(command.get("config_overrides"))
     refcat_key = frozenset(
         refcat_store.shard_ids_for_pointing(command["boresight_ra"], command["boresight_dec"])
     )
-    return PrepareKey(task_key, command["physical_filter"], refcat_key)
+    return PrepareKey(
+        task_key, command["physical_filter"], refcat_key, command["calib_time"]
+    )
 
 
-def _ensure_detector_calibs() -> tuple["DetectorCalibs", bool, float]:
-    """Get-or-build the filter-independent calibs, with whether they were reused
-    and the seconds spent building. Loaded at most once per process -- see
-    `_DETECTOR_CALIB_CACHE`.
+def _ensure_detector_calibs(
+    backend, ids: "CalibIds"
+) -> tuple["DetectorCalibs", bool, float]:
+    """Get-or-build the filter-independent calibs for `ids`, with whether they
+    were reused and the seconds spent building.
 
-    Assignment happens only after `_build_detector_calibs` returns, so a failed
-    load leaves the cache empty and the next prepare retries rather than
-    serving a half-built set."""
+    One slot, keyed on the backend's identity for this half -- i.e. an LRU of
+    size 1. Under files that identity is a constant, so this loads exactly once
+    per process as it always has; under the butler a recertification changes the
+    UUID set and replaces the slot. The slot is the small half by memory and the
+    one that is identical across filters, so a second slot would buy nothing a
+    first does not.
+
+    Assignment happens only after the load returns, so a failed load leaves the
+    previous entry cached and the next prepare retries rather than serving a
+    half-built set."""
     global _DETECTOR_CALIB_CACHE
-    if _DETECTOR_CALIB_CACHE is not None:
-        return _DETECTOR_CALIB_CACHE, True, 0.0
+    if _DETECTOR_CALIB_CACHE is not None and _DETECTOR_CALIB_CACHE[0] == ids.detector:
+        return _DETECTOR_CALIB_CACHE[1], True, 0.0
 
-    detector, elapsed_s = _build_detector_calibs()
-    _DETECTOR_CALIB_CACHE = detector
+    t0 = time.monotonic()
+    detector = backend.load_detector(ids)
+    elapsed_s = time.monotonic() - t0
+    if _DETECTOR_CALIB_CACHE is not None:
+        _log.info("calib-cache: detector-half identity changed, replacing the slot")
+    _DETECTOR_CALIB_CACHE = (ids.detector, detector)
     return detector, False, elapsed_s
 
 
 def _ensure_filter_calibs(
-    physical_filter: str, detector: "DetectorCalibs"
+    backend, ids: "CalibIds", detector: "DetectorCalibs"
 ) -> tuple["FilterCalibs", bool, float]:
-    """Get-or-build the filter-dependent calibs for `physical_filter`, with
-    whether they were reused and the seconds spent building.
+    """Get-or-build the filter-dependent calibs for `ids`, with whether they
+    were reused and the seconds spent building.
+
+    Keyed on the backend's identity for this half, which under files *is* the
+    physical_filter string and under the butler is the resolved UUID set.
 
     `detector` is required rather than resolved here so the two halves cannot be
-    loaded in the wrong order: the flats are keyed by detector name, which only
-    the ptc headers know.
+    loaded in the wrong order: the flats are keyed by detector name, which on
+    the files path only the ptc headers know.
 
-    Evicts past CALIB_CACHE_CAP, oldest first. Insertion happens only after
-    `_build_filter_calibs` returns, so a failed load leaves the previous filters
-    cached."""
-    filtered = _FILTER_CALIB_CACHE.get(physical_filter)
+    Evicts past CALIB_CACHE_CAP, oldest first. Insertion happens only after the
+    load returns, so a failed load leaves the previous filters cached."""
+    filtered = _FILTER_CALIB_CACHE.get(ids.filtered)
     if filtered is not None:
-        _FILTER_CALIB_CACHE.move_to_end(physical_filter)
+        _FILTER_CALIB_CACHE.move_to_end(ids.filtered)
         return filtered, True, 0.0
 
-    filtered, elapsed_s = _build_filter_calibs(physical_filter, detector)
-    _FILTER_CALIB_CACHE[physical_filter] = filtered
+    t0 = time.monotonic()
+    filtered = backend.load_filter(ids, detector)
+    elapsed_s = time.monotonic() - t0
+    _FILTER_CALIB_CACHE[ids.filtered] = filtered
     while len(_FILTER_CALIB_CACHE) > CALIB_CACHE_CAP:
-        evicted_filter, _ = _FILTER_CALIB_CACHE.popitem(last=False)
+        evicted, _ = _FILTER_CALIB_CACHE.popitem(last=False)
         _log.info(
-            "calib-cache: evicted physical_filter %r (cap=%d, now holding %d)",
-            evicted_filter, CALIB_CACHE_CAP, len(_FILTER_CALIB_CACHE),
+            "calib-cache: evicted filter-half %r (cap=%d, now holding %d)",
+            evicted, CALIB_CACHE_CAP, len(_FILTER_CALIB_CACHE),
         )
     return filtered, False, elapsed_s
 
 
-def _ensure_calib(physical_filter: str) -> tuple["CalibSet", dict]:
-    """Get-or-build both calib halves for `physical_filter` and compose the
-    CalibSet view over them, reporting the pair in `_build_*`'s shared timing
-    shape so a reused calib is described with its real counts rather than
-    zeroed placeholders.
+def _ensure_calib(command: dict) -> tuple["CalibSet", dict]:
+    """Get-or-build both calib halves for one /prepare command and compose the
+    CalibSet view over them, reporting the pair in a shared timing shape so a
+    reused calib is described with its real counts rather than zeroed
+    placeholders.
+
+    Resolution runs on every call, before either cache is consulted, because it
+    is what *produces* the cache keys: asking the backend which datasets this
+    command means is the only way to know whether what is cached still answers
+    it. It is deliberately cheap and reads no pixels, so a hit pays the question
+    and not the answer.
 
     `elapsed_s` sums only what was actually built, and `reused` means *nothing*
     was: the per-half flags are what distinguish "a filter change reloaded the
     flats" from "a cold start reloaded everything".
     """
-    detector, detector_reused, detector_s = _ensure_detector_calibs()
-    filtered, filter_reused, filter_s = _ensure_filter_calibs(physical_filter, detector)
+    backend = calib_backend()
+
+    t0 = time.monotonic()
+    ids = backend.resolve(command)
+    resolve_s = time.monotonic() - t0
+
+    detector, detector_reused, detector_s = _ensure_detector_calibs(backend, ids)
+    filtered, filter_reused, filter_s = _ensure_filter_calibs(backend, ids, detector)
     calib = CalibSet(detector=detector, filtered=filtered)
     return calib, {
         "reused": detector_reused and filter_reused,
         "detector_reused": detector_reused,
         "filter_reused": filter_reused,
         "elapsed_s": detector_s + filter_s,
+        "resolve_s": resolve_s,
+        "backend": backend.name,
         "n_detectors": len(calib.detector_ids),
         "n_intrinsic_zernikes": len(calib.intrinsic_zernikes_by_name),
-        "physical_filter": physical_filter,
+        "physical_filter": calib.physical_filter,
+        "calib_time": command["calib_time"],
     }
 
 
-def _activate_entry(entry: "PreparedEntry") -> None:
-    """Make `entry` the one run_job/build_quantum_context see.
+def _activate_entry(entry: "PreparedEntry", command: dict) -> dict:
+    """Make `entry` the one run_job/build_quantum_context see, and return the
+    calib timings for it.
 
     The single place that touches the mirror globals, so every path that
     switches the live config -- a fresh prepare, a cache-hit prepare, or a
     push-time reload -- goes through here and cannot leave them half-updated.
+    It is also the only caller of `_ensure_calib`, so one prepare resolves the
+    calibs exactly once: resolution is a round trip to the registry under the
+    butler backend, and doing it both here and in `ensure_prepared` would double
+    every prepare's registry traffic to reach the same answer.
+
+    `command` is the prepare command this activation is for -- the live one on a
+    prepare, or the entry's original on a push-time reload. Which it is does not
+    change the calibs: the key pins `physical_filter` and `calib_time`, and those
+    are the only two fields the calibs depend on.
     """
     global _ACTIVE_KEY, _TASK, _TASK_DUMP, _REFCAT_STORE
-    calib, _ = _ensure_calib(entry.key.physical_filter)
+    calib, calib_timing = _ensure_calib(command)
     _ACTIVE_KEY = entry.key
     _TASK = entry.task
     _TASK_DUMP = entry.task_dump
@@ -582,6 +709,7 @@ def _activate_entry(entry: "PreparedEntry") -> None:
     _CALIB_STORE["physical_filter"] = calib.physical_filter
     _CALIB_STORE["calib"] = calib
     _REFCAT_STORE = entry.refcat_store
+    return calib_timing
 
 
 def _evict_lru() -> None:
@@ -596,7 +724,7 @@ def _evict_lru() -> None:
         )
 
 
-def _build_entry(key: tuple, command: dict) -> tuple["PreparedEntry", dict]:
+def _build_entry(key: "PrepareKey", command: dict) -> tuple["PreparedEntry", dict]:
     """Build a fresh PreparedEntry for `key` from `command`'s args.
 
     Used both for a cold /prepare and for a push-time reload of an evicted
@@ -609,7 +737,7 @@ def _build_entry(key: tuple, command: dict) -> tuple["PreparedEntry", dict]:
     task_timing = {
         "reused": False,
         "elapsed_s": time.monotonic() - t0,
-        "n_overrides": len(key[0]),
+        "n_overrides": len(key.task),
     }
 
     # Pay the pyarrow init here, not on push.
@@ -641,8 +769,6 @@ def ensure_prepared(command: dict) -> dict:
     key = _prepare_key(command)
     entry = _PREPARED_CACHE.get(key)
 
-    _, calib_timing = _ensure_calib(command["physical_filter"])
-
     if entry is None:
         entry, timings = _build_entry(key, command)
         _PREPARED_CACHE[key] = entry
@@ -654,36 +780,47 @@ def ensure_prepared(command: dict) -> dict:
             "task": {"reused": True, "elapsed_s": 0.0, "n_overrides": len(key.task)},
             "refcat": entry.refcat_store.ensure(command["boresight_ra"], command["boresight_dec"]),
         }
-    timings["calib"] = calib_timing
 
-    _activate_entry(entry)
+    timings["calib"] = _activate_entry(entry, command)
     return {"key": key, "timings": timings}
 
 
-def ensure_prepared_for_push(key: tuple) -> "PreparedEntry":
+def ensure_prepared_for_push(key) -> "PreparedEntry":
     """The PreparedEntry for `key`, for the push path. Reloads it from its
     original prepare command if it was evicted since, rather than silently
     running whatever entry happens to be active -- the exact hazard this cache
     replaced. Moves the entry to MRU either way, so an active job's config is
     not evicted out from under a straggling push.
-    """
-    entry = _PREPARED_CACHE.get(key)
-    if entry is not None:
-        _PREPARED_CACHE.move_to_end(key)
-        _activate_entry(entry)
-        return entry
 
+    `key` may arrive as a plain tuple -- the dispatcher rebuilds it from what
+    crossed the Pipe -- so it is coerced back to a PrepareKey. It would hash and
+    compare equal either way, but a rebuild on the evicted path reads the key by
+    name, and a bare tuple would only fail there: the rarest path, and the one
+    whose whole job is not to run under the wrong config.
+    """
+    key = PrepareKey(*key)
+    # Looked up before the cache, and required either way: activation resolves
+    # the calibs against the command this entry was prepared with, which is the
+    # whole point on this path -- a push must not pick up a later prepare's
+    # calibs any more than it picks up its task.
     command = _PREPARE_COMMANDS.get(key)
     if command is None:
         raise RuntimeError(
             f"no prepared config found for key {key!r}: it was never prepared on "
             "this coordinator (or the coordinator has restarted since)"
         )
+
+    entry = _PREPARED_CACHE.get(key)
+    if entry is not None:
+        _PREPARED_CACHE.move_to_end(key)
+        _activate_entry(entry, command)
+        return entry
+
     _log.info("prepared-cache: reloading evicted entry for push, key=%r", key)
     entry, _ = _build_entry(key, command)
     _PREPARED_CACHE[key] = entry
     _evict_lru()
-    _activate_entry(entry)
+    _activate_entry(entry, command)
     return entry
 
 
@@ -824,15 +961,13 @@ def _discover_detector_ids(calib_dir: str) -> list:
     return ids
 
 
-def _build_detector_calibs() -> tuple[DetectorCalibs, float]:
-    """Load the filter-independent calibs fresh from disk, with the seconds it
-    took. Always builds -- `_ensure_detector_calibs` is where reuse is decided,
-    so this need not guard itself.
+def _build_detector_calibs() -> DetectorCalibs:
+    """Load the filter-independent calibs fresh from disk. Always builds --
+    `_ensure_detector_calibs` is where reuse is decided and where the load is
+    timed, so this need not guard or time itself.
 
     Also where the detector-id list is established, since it comes from the
     ptc_*.fits filenames and so is itself filter-independent."""
-    t0 = time.monotonic()
-
     calibs = calib_dir()
     detector_ids = _discover_detector_ids(calibs)
 
@@ -857,27 +992,23 @@ def _build_detector_calibs() -> tuple[DetectorCalibs, float]:
             os.path.join(calibs, f"crosstalk_{det_id}.fits")
         )
 
-    detector = DetectorCalibs(
+    return DetectorCalibs(
         detector_ids=detector_ids,
         names_by_id=names_by_id,
         ptc_by_name=ptc_by_name,
         linearizer_by_name=linearizer_by_name,
         crosstalk_by_name=crosstalk_by_name,
     )
-    return detector, time.monotonic() - t0
 
 
 def _build_filter_calibs(
     physical_filter: str, detector: DetectorCalibs
-) -> tuple[FilterCalibs, float]:
-    """Load the filter-dependent calibs for `physical_filter` fresh from disk,
-    with the seconds it took.
+) -> FilterCalibs:
+    """Load the filter-dependent calibs for `physical_filter` fresh from disk.
 
     Takes `detector` only for its `names_by_id`: the flats are named by id on
     disk but keyed by name in memory, and the ptcs are what establish that
     mapping."""
-    t0 = time.monotonic()
-
     calibs = calib_dir()
     flat_by_name: dict = {}
     intrinsic_zernikes_by_name: dict = {}
@@ -900,12 +1031,281 @@ def _build_filter_calibs(
         if os.path.exists(iz_path):
             intrinsic_zernikes_by_name[name] = ipIsr.IsrCalib.readFits(iz_path)
 
-    filtered = FilterCalibs(
+    return FilterCalibs(
         physical_filter=physical_filter,
         flat_by_name=flat_by_name,
         intrinsic_zernikes_by_name=intrinsic_zernikes_by_name,
     )
-    return filtered, time.monotonic() - t0
+
+
+class CalibIds(NamedTuple):
+    """What identifies each calib half, as the active backend sees it.
+
+    This is the cache key for both halves, and it is the backend's answer rather
+    than anything derived from the /prepare command: under the butler a
+    recertification can change which datasets a given (filter, time) resolves to
+    without the filter changing at all, so keying on the filter string would
+    serve stale calibs indefinitely. Comparing identities *is* the staleness
+    check, which is why the backends need no separate is-stale call.
+
+    Both members must be hashable. Under the butler they are frozensets of
+    dataset UUIDs; under files the filter half is the physical_filter string and
+    the detector half is a constant, since a fixed calib_dir() cannot vary.
+    """
+
+    detector: Any
+    filtered: Any
+
+
+class FilesCalibBackend:
+    """Calibs as flat FITS files under calib_dir(), the default backend.
+
+    The testing path: needs no repo, no registry and nothing of the stack beyond
+    afw/ip_isr. It cannot answer "which calib was valid at time T" -- the
+    filename grammar has no slot for validity -- so `calib_time` is accepted and
+    ignored. That is sound here because the grammar also admits only one calib
+    per (type, detector[, physical_filter]), so there is never an ambiguity for a
+    timestamp to resolve.
+    """
+
+    name = "files"
+
+    def resolve(self, command: dict) -> CalibIds:
+        # The detector half is keyed on a constant: it is every ptc/linearizer/
+        # crosstalk file in a directory that does not change under us, so there
+        # is nothing for an identity to distinguish. Not None, which _ensure
+        # uses for "nothing cached".
+        return CalibIds(detector="files", filtered=command["physical_filter"])
+
+    def load_detector(self, ids: CalibIds) -> "DetectorCalibs":
+        return _build_detector_calibs()
+
+    def load_filter(self, ids: CalibIds, detector: "DetectorCalibs") -> "FilterCalibs":
+        return _build_filter_calibs(ids.filtered, detector)
+
+
+class ButlerCalibBackend:
+    """Calibs resolved through a real butler repo, as `pipetask run` would.
+
+    The whole point is fidelity to the offline pipeline, so resolution is
+    offloaded to the butler rather than reimplemented: the chained collection is
+    flattened to its concrete children *in order* and passed whole, with the
+    exposure's time as the timespan. Notably the chain is **not** filtered to its
+    CALIBRATION children:
+
+    - `AllDimensionsQuantumGraphBuilder` passes pipetask's `input_collections`
+      unfiltered; there is no collection_types= anywhere on that path.
+    - Rows from RUN/TAGGED collections get a synthetic unbounded validity range
+      (`Timespan(None, None)`) which overlaps everything, so an uncertified
+      dataset in a RUN satisfies any timespan.
+    - Find-first ranks purely by position in the sequence, with no preference
+      for CALIBRATION over RUN.
+
+    So a producer run early in the chain legitimately shadows a certification
+    later in it, and `LSSTCam/defaults` contains exactly such runs. That
+    fallback looks like a bug and is not: it is what the pipeline would have
+    used, which is the only answer this service is allowed to give. Filtering to
+    CALIBRATION would make us resolve calibs the pipeline does not, and in
+    /Users/jmeyers3/repo it resolves *nothing* at times when only the producer
+    runs answer.
+
+    Two traps, both deliberate:
+
+    - `timespan` is always a real instant, never None. For a calibration dataset
+      type `timespan=None` *excludes* the CALIBRATION collections rather than
+      relaxing the constraint, so the obvious "no constraint" shortcut silently
+      searches the wrong half of the chain.
+    - `CalibrationLookupError` (two overlapping validity ranges in one
+      CALIBRATION collection) propagates. Picking one would invent a policy the
+      pipeline declines to invent, and `crosstalk` in the local repo really does
+      have two open-ended spans -- so this is reachable, not theoretical.
+
+    The Butler is constructed per resolve and closed, never cached: the task
+    forks eight cutout workers per push, and an inherited live sqlite connection
+    is unsupported even where it appears to work. Construction is a small
+    fraction of the registry queries it enables, and resolution happens only on
+    /prepare, so there is nothing to win by holding one.
+    """
+
+    name = "butler"
+
+    # Both halves' dataset types, in the order DonutBlitzCornerConnections
+    # declares them. intrinsicZernikes has minimum=0 on the connection, so a
+    # miss is normal; the rest are required.
+    DETECTOR_TYPES = ("ptc", "linearizer", "crosstalk")
+    FILTER_TYPES = ("flat", "intrinsicZernikes")
+    OPTIONAL_TYPES = frozenset({"intrinsicZernikes"})
+
+    def resolve(self, command: dict) -> CalibIds:
+        """Resolve every calib to a DatasetRef and return the two UUID sets.
+
+        Stashes the refs so the subsequent load_* calls need not resolve again;
+        a cache hit discards them unused, which is the point of splitting
+        resolve from load -- a hit must not pay to read pixels.
+        """
+        physical_filter = command["physical_filter"]
+        timespan = _calib_timespan(command["calib_time"])
+
+        butler = Butler.from_config(butler_repo(), writeable=False)
+        try:
+            collections = _flatten_collections(butler, butler_collections())
+            detector_refs = self._find(
+                butler, collections, timespan, self.DETECTOR_TYPES, None
+            )
+            filter_refs = self._find(
+                butler, collections, timespan, self.FILTER_TYPES, physical_filter
+            )
+        finally:
+            # Drops the registry's sqlite fd, so nothing butler-shaped survives
+            # into the fork path.
+            butler.close()
+
+        self._detector_refs = detector_refs
+        self._filter_refs = filter_refs
+        self._physical_filter = physical_filter
+        return CalibIds(
+            detector=frozenset(ref.id for _, _, ref in detector_refs),
+            filtered=frozenset(ref.id for _, _, ref in filter_refs),
+        )
+
+    def _find(self, butler, collections, timespan, dataset_types, physical_filter):
+        """(dataset_type, detector_id, ref) for every calib that resolves.
+
+        One find_dataset per (type, detector) rather than a bulk query: pipetask's
+        own per-quantum path raises NotImplementedError for this task, because
+        `detector` is not among its (instrument, visit) dimensions. A
+        per-detector find_dataset bottoms out in the same SQL union and the same
+        find-first window function, so it is equivalent where pipetask has no
+        path at all.
+        """
+        found = []
+        for dataset_type in dataset_types:
+            for det_id in CORNER_DETECTORS:
+                data_id = {"instrument": INSTRUMENT, "detector": det_id}
+                if physical_filter is not None:
+                    data_id["physical_filter"] = physical_filter
+                ref = butler.find_dataset(
+                    dataset_type, data_id, collections=collections, timespan=timespan
+                )
+                if ref is None:
+                    if dataset_type in self.OPTIONAL_TYPES:
+                        continue
+                    raise RuntimeError(
+                        f"No {dataset_type} calib resolved for detector "
+                        f"{CORNER_DETECTOR_NAMES[det_id]} ({det_id})"
+                        + (
+                            f", physical_filter {physical_filter!r}"
+                            if physical_filter is not None
+                            else ""
+                        )
+                        + f" at {timespan} in collections {collections!r}."
+                    )
+                found.append((dataset_type, det_id, ref))
+        return found
+
+    def load_detector(self, ids: CalibIds) -> "DetectorCalibs":
+        by_type = self._get_all(self._detector_refs)
+        names_by_id = {d: CORNER_DETECTOR_NAMES[d] for d in sorted(CORNER_DETECTORS)}
+        return DetectorCalibs(
+            detector_ids=sorted(CORNER_DETECTORS),
+            names_by_id=names_by_id,
+            ptc_by_name=by_type["ptc"],
+            linearizer_by_name=by_type["linearizer"],
+            crosstalk_by_name=by_type["crosstalk"],
+        )
+
+    def load_filter(self, ids: CalibIds, detector: "DetectorCalibs") -> "FilterCalibs":
+        by_type = self._get_all(self._filter_refs)
+        return FilterCalibs(
+            physical_filter=self._physical_filter,
+            flat_by_name=by_type["flat"],
+            intrinsic_zernikes_by_name=by_type.get("intrinsicZernikes", {}),
+        )
+
+    def _get_all(self, refs) -> dict:
+        """{dataset_type: {detector_name: calib}} for already-resolved refs.
+
+        Keyed by detector *name* to match the files backend and what
+        build_quantum_context reads. The name comes from CORNER_DETECTOR_NAMES
+        rather than the loaded object's `_detectorName`, so flats -- which are
+        ExposureF and have no such attribute -- are keyed the same way as the
+        ip_isr calibs.
+        """
+        out: dict = {}
+        butler = Butler.from_config(butler_repo(), writeable=False)
+        try:
+            for dataset_type, det_id, ref in refs:
+                name = CORNER_DETECTOR_NAMES[det_id]
+                out.setdefault(dataset_type, {})[name] = butler.get(ref)
+        finally:
+            butler.close()
+        return out
+
+
+def _flatten_collections(butler, collections: list[str]) -> list[str]:
+    """`collections` expanded to its concrete children, order preserved.
+
+    Order is load-bearing: find-first ranks by position in this sequence and
+    nothing else, so flattening must not sort or de-order. Chains are excluded
+    from the result (they are replaced by their children) but a non-chain is
+    returned as itself, so a bare RUN works too.
+    """
+    flat = [
+        info.name
+        for info in butler.collections.query_info(
+            collections, flatten_chains=True, include_chains=False
+        )
+    ]
+    if not flat:
+        raise RuntimeError(
+            f"Collections {collections!r} resolved to nothing in "
+            f"{butler_repo()!r}; is the repo the one you meant?"
+        )
+    return flat
+
+
+def _calib_timespan(calib_time: str):
+    """The /prepare `calib_time` string as a butler Timespan at that instant.
+
+    Parsed here rather than in the front-end, which deliberately imports no
+    astropy. TAI because that is what VisitInfo.date and the exposure records
+    carry; a string with its own offset still parses correctly.
+
+    An instant, not the visit's full timespan as pipetask passes. The two differ
+    only when a validity boundary falls inside an exposure, where the range form
+    raises CalibrationLookupError for an ambiguity an instant resolves cleanly --
+    and an instant is the only thing the files path or a mid-exposure prepare
+    could supply.
+    """
+    from astropy.time import Time
+
+    try:
+        when = Time(calib_time, scale="tai")
+    except Exception as exc:
+        raise CalibTimeError(
+            f"calib_time {calib_time!r} is not a parseable time: {exc}"
+        ) from exc
+    # fromInstant rather than Timespan(when, when), which is empty and matches
+    # nothing: a zero-width span excludes its own endpoints.
+    return Timespan.fromInstant(when)
+
+
+def calib_backend():
+    """The configured calib backend, resolved per call like calib_dir().
+
+    Per call rather than at import for the same reason: importing this module
+    must need no data and no repo, and the tests set the variable per test.
+    """
+    kind = os.environ.get("DONUT_SERVER_CALIB_BACKEND") or "files"
+    if kind == "files":
+        return FilesCalibBackend()
+    if kind == "butler":
+        return ButlerCalibBackend()
+    raise RuntimeError(
+        f"DONUT_SERVER_CALIB_BACKEND is {kind!r}; valid values are 'files' "
+        "(the default, flat FITS under DONUT_SERVER_CALIB_DIR) and 'butler' "
+        "(resolved from DONUT_SERVER_BUTLER_REPO)."
+    )
 
 
 def reconstruct_exposures(layout: list) -> dict[str, Any]:
@@ -1391,11 +1791,13 @@ def coordinator_main(conn, shm_name: str) -> None:
                 except Exception as exc:
                     # Tagged so the front-end can answer 400 for operator error and
                     # 500 for everything else; only str(exc) crosses this Pipe.
-                    conn.send({
-                        "ok": False,
-                        "error": str(exc),
-                        "kind": "config_override" if isinstance(exc, ConfigOverrideError) else None,
-                    })
+                    if isinstance(exc, ConfigOverrideError):
+                        kind = "config_override"
+                    elif isinstance(exc, CalibTimeError):
+                        kind = "calib_time"
+                    else:
+                        kind = None
+                    conn.send({"ok": False, "error": str(exc), "kind": kind})
             elif cmd == "push":
                 try:
                     prepared_key = command.get("prepared_key")
@@ -1438,8 +1840,11 @@ if __name__ == "__main__":
         f"detectors={sorted(source.handles)}"
     )
 
-    boresight_ra, boresight_dec = client.read_boresight(source)
-    print(f"boresight -> ra={boresight_ra:.4f} dec={boresight_dec:.4f}")
+    boresight_ra, boresight_dec, calib_time = client.read_prepare_args(source)
+    print(
+        f"boresight -> ra={boresight_ra:.4f} dec={boresight_dec:.4f} "
+        f"calib_time={calib_time}"
+    )
 
     t0 = time.monotonic()
     blob = protocol.pack_blob(client.build_raw_parts(source))
@@ -1470,6 +1875,7 @@ if __name__ == "__main__":
         "physical_filter": physical_filter,
         "boresight_ra": boresight_ra,
         "boresight_dec": boresight_dec,
+        "calib_time": calib_time,
         "config_overrides": [],
     })
     prepare_resp = parent_conn.recv()

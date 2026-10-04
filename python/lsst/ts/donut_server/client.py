@@ -106,6 +106,11 @@ class RawSource:
     # Set when the pointing is available without reading pixels (the butler
     # registry knows it); None means read it off the first raw's VisitInfo.
     boresight: tuple[float, float] | None = None
+    # When the exposure was taken, as an ISO-8601 TAI string -- what /prepare
+    # resolves calibs against. Set from the registry when it is free; None means
+    # read it off a raw's VisitInfo, which `read_exposure_time` does alongside
+    # the boresight so the two share one open.
+    calib_time: str | None = None
 
 
 def discover_exposures(raw_dir: str) -> dict[int, tuple[str, dict[int, str]]]:
@@ -186,8 +191,9 @@ def resolve_from_butler(
     - Raws are dimensioned by `exposure`, not `visit`; the integer is the same
       one the file naming calls a visit.
     - `boresight` comes off the exposure record's `tracking_ra` /
-      `tracking_dec` (degrees), which keeps it off the pixel path entirely --
-      the alternative is reading the first raw's VisitInfo at a full 114 MB get.
+      `tracking_dec` (degrees), and `calib_time` off the same record's
+      timespan, which keeps both off the pixel path entirely -- the alternative
+      is reading the first raw's VisitInfo at a full 114 MB get.
 
     Two traps in the butler query API, verified against a scratch repo with
     LSSTCam registered, worth remembering if these queries are ever reworked:
@@ -220,27 +226,49 @@ def resolve_from_butler(
 
     physical_filter = _check_known_filter(visit, str(record.physical_filter))
 
+    # Midpoint, to match what VisitInfo.date gives the files path -- see
+    # read_prepare_args. `.isot` is TAI here because the record's timespan is.
+    timespan = record.timespan
+    midpoint = timespan.begin + (timespan.end - timespan.begin) / 2
+
     return RawSource(
         visit=visit,
         physical_filter=physical_filter,
         handles=handles,
         load=butler.get,
-        boresight=(record.tracking_ra, record.tracking_dec)
+        boresight=(record.tracking_ra, record.tracking_dec),
+        calib_time=midpoint.tai.isot,
     )
 
 
-def read_boresight(source: RawSource) -> tuple[float, float]:
-    """Boresight (ra, dec) in degrees for `source`.
+def read_prepare_args(source: RawSource) -> tuple[float, float, str]:
+    """(boresight_ra, boresight_dec, calib_time) for `source` -- everything
+    /prepare needs that is not the pixels.
 
-    Free if the source already knows the pointing; otherwise read off any one
-    raw's VisitInfo.
+    Both are free if the source already knows them (the butler registry does);
+    otherwise they are read off one raw's VisitInfo. Resolved together, in one
+    function, precisely so that fallback opens a single ~114 MB raw rather than
+    one per field.
+
+    `calib_time` is the exposure *midpoint*, which is what `VisitInfo.date`
+    holds; the butler path takes the midpoint of the exposure record's timespan
+    so the two paths cannot resolve calibs against different instants (verified
+    equal to sub-microsecond on the local repo and raws).
     """
-    if source.boresight is not None:
-        return source.boresight
+    if source.boresight is not None and source.calib_time is not None:
+        return source.boresight[0], source.boresight[1], source.calib_time
 
-    exp = source.load(source.handles[min(source.handles)])
-    boresight = exp.getInfo().getVisitInfo().boresightRaDec
-    return boresight.getRa().asDegrees(), boresight.getDec().asDegrees()
+    visit_info = (
+        source.load(source.handles[min(source.handles)]).getInfo().getVisitInfo()
+    )
+    if source.boresight is not None:
+        ra, dec = source.boresight
+    else:
+        boresight = visit_info.boresightRaDec
+        ra = boresight.getRa().asDegrees()
+        dec = boresight.getDec().asDegrees()
+    calib_time = source.calib_time or visit_info.date.toAstropy().tai.isot
+    return ra, dec, calib_time
 
 
 def build_raw_parts(source: RawSource) -> dict[str, bytes]:
@@ -277,8 +305,11 @@ def run_once(
         f"detectors={sorted(source.handles)}"
     )
 
-    boresight_ra, boresight_dec = read_boresight(source)
-    print(f"boresight -> ra={boresight_ra:.4f} dec={boresight_dec:.4f}")
+    boresight_ra, boresight_dec, calib_time = read_prepare_args(source)
+    print(
+        f"boresight -> ra={boresight_ra:.4f} dec={boresight_dec:.4f} "
+        f"calib_time={calib_time}"
+    )
 
     t0 = time.monotonic()
     resp = requests.post(
@@ -287,6 +318,7 @@ def run_once(
             "physical_filter": source.physical_filter,
             "boresight_ra": boresight_ra,
             "boresight_dec": boresight_dec,
+            "calib_time": calib_time,
             "config_overrides": config_overrides or [],
         },
         headers=headers,

@@ -1205,6 +1205,16 @@ async def prepare(body: dict):
         "physical_filter": _required_str(body, "physical_filter"),
         "boresight_ra": boresight_ra,
         "boresight_dec": boresight_dec,
+        # When the exposure was taken, as ISO-8601 TAI. Required, and validated
+        # for shape only: parsing it needs astropy, which this process
+        # deliberately never imports (see _stamp_path), so the coordinator does
+        # that half and reports a bad value with kind="calib_time".
+        #
+        # Required rather than optional because it selects calibs under the
+        # butler backend, and a prepare that omitted it would resolve against no
+        # time at all -- which in daf_butler means excluding every CALIBRATION
+        # collection, i.e. silently wrong calibs rather than an error.
+        "calib_time": _required_str(body, "calib_time"),
         # Sent even when empty, so _primed_args is never ambiguous about whether
         # a replayed prepare had overrides.
         "config_overrides": overrides,
@@ -1221,7 +1231,7 @@ async def prepare(body: dict):
         # 400 for a bad override, because it will fail identically forever; 500 would
         # tell a producer's retry logic "server broken, come back". The same
         # transient-vs-permanent distinction _RETRY_AFTER draws for 503s.
-        status = 400 if resp.get("kind") == "config_override" else 500
+        status = 400 if resp.get("kind") in ("config_override", "calib_time") else 500
         raise HTTPException(status, resp.get("error", "prepare failed"))
 
     JOBS[job_id] = JobRecord(

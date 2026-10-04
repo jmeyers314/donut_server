@@ -42,11 +42,15 @@ export DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
 Not in the repo (33 GB, git-ignored). Locate it yourself — each directory is found through its own
 environment variable, so the data need not live in the checkout:
 
-| variable | size | contents |
-|---|---|---|
-| `DONUT_SERVER_RAW_DIR` | 5.1 G | real corner-sensor raws, overscan present, ISR-ready |
-| `DONUT_SERVER_CALIB_DIR` | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per physical_filter |
-| `DONUT_SERVER_REFCAT_DIR` | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
+| variable | needed by | size | contents |
+|---|---|---|---|
+| `DONUT_SERVER_RAW_DIR` | **client** | 5.1 G | real corner-sensor raws, overscan present, ISR-ready |
+| `DONUT_SERVER_CALIB_DIR` | server | 4.8 G | ptc/linearizer/crosstalk per detector; flats and intrinsic Zernikes per physical_filter |
+| `DONUT_SERVER_REFCAT_DIR` | server | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
+
+`DONUT_SERVER_RAW_DIR` is read by `client.py` alone (and `--raw-dir` overrides
+it). The server never opens a raw — they arrive over shared memory on `/push` —
+so a server host needs neither the variable nor the 5.1 G.
 
 `DONUT_SERVER_STAMP_DIR` is the one output directory, and it is required too. It needs no data up
 front, only somewhere writable: the coordinator puts one `<job_id>.parquet` there per job, holding
@@ -59,8 +63,69 @@ export DONUT_SERVER_RAW_DIR=$PWD/raw
 export DONUT_SERVER_STAMP_DIR=$PWD/stamps
 ```
 
-Unset is a loud `RuntimeError` naming the variable, not a silent empty result. The data-dependent
-tests skip when unset, so `scons`/`pytest` still pass without the data — check the skip count.
+Unset is a loud `RuntimeError` naming the variable, not a silent empty result — but only in the
+process that needs it, and only when it needs it. A server with no `DONUT_SERVER_RAW_DIR` starts and
+serves jobs normally; one with no `DONUT_SERVER_CALIB_DIR` starts too, and fails at the first
+`/prepare` (unless `-b` put it on the butler backend, which needs no calib tree). The
+data-dependent tests skip when unset, so `scons`/`pytest` still pass without the data — check the
+skip count.
+
+### Calibs from a butler repo instead
+
+The calib loader is a backend, because the flat tree above cannot answer the question production
+needs answered: *which* calib was valid when this exposure was taken. Filenames carry no validity
+information, so the files path can only return whatever is on disk.
+
+**Naming a repo is what selects the butler backend**; with no repo, calibs come
+from the tree above:
+
+```zsh
+bin/donutServer.py -b /Users/jmeyers3/repo              # butler-resolved calibs
+bin/donutServer.py                                      # the flat FITS tree
+```
+
+| variable | flag | default | meaning |
+|---|---|---|---|
+| `DONUT_SERVER_BUTLER_REPO` | `-b`, `--butler-repo` | — | repo root or alias; giving it implies `=butler` |
+| `DONUT_SERVER_BUTLER_COLLECTIONS` | `-i`, `--butler-collections` | `LSSTCam/defaults` | comma-separated, highest priority first |
+| `DONUT_SERVER_CALIB_BACKEND` | — | `files` | `files` or `butler`; derived from the above, rarely set by hand |
+
+`-b`/`-i` are the short forms `donutClient.py` and `pipetask run` use for the
+same two things; `-j`/`-n` follow `pipetask run` too, for the process count and
+the cores one quantum may use. There is no `--calib-backend` flag: the repo is
+the only input the butler backend needs that the files one cannot use, so it
+carries the choice. `DONUT_SERVER_CALIB_BACKEND` remains the backend's own
+contract — the launcher derives it, and exporting it is how you pin a backend
+the flags cannot express.
+
+**A flag is a way of setting its variable**, which is the only transport that
+reaches the coordinator children, so precedence is the usual
+**flag > exported > default**. Passing `-b` therefore selects the butler backend
+even against an exported `DONUT_SERVER_CALIB_BACKEND=files`; a repo that arrives
+through the *environment* only defaults the backend, so an exported `=files` can
+still pin the files path while a repo stays exported for another run.
+
+Two shapes are argparse errors before the port is bound, rather than a server
+that comes up `ready` and then 500s on every prepare: collections with no repo
+(they would be silently ignored), and `=butler` with no repo to resolve from.
+Each error names whichever source it came from, flag or variable. That the repo
+*resolves* is not checked there — it would mean importing the stack into the web
+process — so the coordinator checks it at the first resolve. The startup banner
+names the calib source either way.
+
+`DONUT_SERVER_CALIB_DIR` is required only under `files`, which is why it stays the default: the tests
+and a laptop checkout need no repo, no registry and nothing of the stack beyond `afw`/`ip_isr`.
+
+Under `butler`, resolution is **offloaded to the butler** so it matches what `pipetask run` would
+have resolved for the same exposure and collection. The chain is flattened in order and passed
+*unfiltered*, with the exposure time as the timespan. One consequence looks like a bug and is not:
+a producer RUN early in the chain can satisfy a lookup that no CALIBRATION collection covers, because
+RUN rows get a synthetic unbounded validity range and find-first ranks purely by position. That is
+pipetask's own behaviour — filtering the chain to its CALIBRATION children would make this service
+resolve *nothing* at times the pipeline resolves fine.
+
+Both backends agree on the local data: same detectors, same `intrinsicZernikes` coverage, flats
+identical pixel-for-pixel. If they ever diverge, one of the two trees is stale.
 
 **These files are never pruned, and at a 30 s cadence they arrive at ~2.0 GB/hour** (16.7 MB a job,
 measured on the r_57 exposure below — the in-memory columns are ~21 MB and parquet compresses).
@@ -121,6 +186,11 @@ The calib guard is itself split: a *filter* change reloads only the flats and in
 (`filter_reused: false`), while the PTCs, linearizers and crosstalk — dimensioned by detector alone —
 are loaded once per process and stay (`detector_reused: true`).
 
+Each half is keyed on the *identity* the backend reports for it, not on the filter: under `butler`
+that is the set of resolved dataset ids, so a recertification invalidates the half it actually
+changed. Every prepare re-resolves (cheap, and reported as `resolve_s`) because the resolve is what
+produces the key — but a hit then reads no pixels.
+
 ### Three sharp edges
 
 - **`-C` is arbitrary code execution** in the coordinator, pre-fork, as the service user — `exec` is
@@ -140,9 +210,15 @@ are loaded once per process and stay (`detector_reused: true`).
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 133 tests
+python -m pytest tests/ -q                      # 166 tests; the butler-backend 9
+                                                # skip unless DONUT_SERVER_BUTLER_REPO is set
+scons                                           # same suite, but sconsUtils rebuilds the
+                                                # environment from an allowlist -- a
+                                                # DONUT_SERVER_* variable missing from
+                                                # tests/SConscript does not reach pytest
 python -m lsst.ts.donut_server.coordinator      # full prepare -> push, no FastAPI
 bin/donutServer.py                              # then, in another shell:
+                                                # (-b <repo> for butler-resolved calibs)
 bin/donutClient.py --visit 2026071300478 --wait 60
 bin/donutClient.py --visit 2026071300478 --wait 60 --images   # also saves the stamps
 bin/donutClient.py --visit 2026071300478 --wait 60 -c maxFitScatter=2.0
@@ -164,7 +240,8 @@ path, so any movement here means import order or thread clamping regressed:
   `reused: true` and ~0 s on a repeat. `calib` must stay `reused: true` across an override-only
   change — if it reloads, the two guards have been folded together
 - prepare `calib`: a *filter* change must report `detector_reused: true` and `filter_reused: false`.
-  If both go false, the two calib halves have been folded back together
+  If both go false, the two calib halves have been folded back together. Holds under either backend —
+  the detector half's datasets do not depend on the filter, so the butler resolves it to the same ids
 - `n_input_datasets: 208`
 - **63 donut rows** across 8 detectors, 28/29 groups fit
 - `donut_id` values are Gaia source ids (e.g. `6761235373898405888`) — the quickest confirmation the

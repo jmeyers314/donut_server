@@ -5,12 +5,20 @@ from lsst.sconsUtils import env, scripts
 
 # sconsUtils builds the test environment from an allowlist (state.py's
 # preserveVars), so these do not reach pytest on their own. Without them the
-# data-dependent refcat and codec tests skip rather than fail, and `scons`
-# reports success having never touched a shard.
+# data-dependent refcat, codec and butler-backend tests skip rather than fail,
+# and `scons` reports success having never touched a shard.
+#
+# DONUT_SERVER_STAMP_DIR is the exception and the reason to be careful here: it
+# has no skip guard, because it needs no data and _build_entry resolves it on
+# every prepare. Omitting it does not cost coverage, it fails the prepared-cache
+# tests outright under `scons` while `pytest` alone passes.
 for var in (
     "DONUT_SERVER_CALIB_DIR",
     "DONUT_SERVER_REFCAT_DIR",
     "DONUT_SERVER_RAW_DIR",
+    "DONUT_SERVER_STAMP_DIR",
+    "DONUT_SERVER_BUTLER_REPO",
+    "DONUT_SERVER_BUTLER_COLLECTIONS",
 ):
     if var in os.environ:
         env["ENV"][var] = os.environ[var]

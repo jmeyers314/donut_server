@@ -22,6 +22,9 @@ from lsst.ts.donut_server.server import JobRecord, JobState
 
 TOKEN = "test-token"
 
+# /prepare requires it, and its shape is all the front-end checks.
+CALIB_TIME = "2026-07-14T05:42:02.206"
+
 
 def auth():
     return {"Authorization": f"Bearer {TOKEN}"}
@@ -553,6 +556,7 @@ def test_health_fingerprints_the_config_without_echoing_a_C_body(monkeypatch):
         "physical_filter": "r_57",
         "boresight_ra": 283.666,
         "boresight_dec": -28.1326,
+        "calib_time": CALIB_TIME,
         "config_overrides": [
             {"kind": "value", "field": "maxFitScatter", "value": "2.0"},
             {"kind": "python", "name": "/home/op/tweaks.py", "text": SECRET_BODY},
@@ -611,8 +615,13 @@ def test_prepare_rejects_a_malformed_override_list_without_a_coordinator(
 
     resp = client.post(
         "/prepare",
-        json={"physical_filter": "r_57", "boresight_ra": 0.0, "boresight_dec": 0.0,
-              "config_overrides": overrides},
+        json={
+            "physical_filter": "r_57",
+            "boresight_ra": 0.0,
+            "boresight_dec": 0.0,
+            "calib_time": CALIB_TIME,
+            "config_overrides": overrides,
+        },
         headers=auth(),
     )
 

@@ -76,6 +76,12 @@ States: `PREPARED → RECEIVING → COMPUTING → DONE` (or `ERROR`).
    I/O-bound. `CalibSet` is the view composing the two halves back into one object for
    `build_quantum_context`. Also pays the one-time `DimensionUniverse` + task construction
    + pyarrow init. Raw-independent precompute belongs here.
+
+   Where calibs come from is a backend (`DONUT_SERVER_CALIB_BACKEND`): flat FITS files, or a real
+   butler repo. The backend answers an *identity* per half — the resolved dataset ids under the
+   butler — and that identity is what each cache is keyed on, so a recertification invalidates
+   exactly the half whose datasets changed. Every prepare re-resolves, because the resolve is what
+   produces the key; it reads no pixels, so a hit is still cheap.
 2. **push** (pixels ready): blob streamed into shared memory, layout handed to the coordinator, which
    rebuilds exposures, builds the butler, and runs the task. Blocks until done.
 3. **status** / **result** (JSON metadata, optional `?wait=N` long-poll) / **result table** (parquet).
@@ -85,16 +91,30 @@ States: `PREPARED → RECEIVING → COMPUTING → DONE` (or `ERROR`).
 All endpoints require `Authorization: Bearer <token>`, except `GET /health`, where it is optional so that a
 supervisor's probe can reach it.
 
-- `POST /prepare` — JSON `{physical_filter, boresight_ra, boresight_dec}`. `physical_filter` is the full
-  label (`r_57`), not the band (`r`): it is the token the flat and intrinsicZernikes filenames carry, and
-  **required** (400 if missing, not a string, or blank — shape only; whether calibs exist for the value is
-  the coordinator's answer to give, with the path it looked for). Boresight is in degrees and
+- `POST /prepare` — JSON `{physical_filter, boresight_ra, boresight_dec, calib_time}`. `physical_filter`
+  is the full label (`r_57`), not the band (`r`): it is the token the flat and intrinsicZernikes filenames
+  carry, and **required** (400 if missing, not a string, or blank — shape only; whether calibs exist for
+  the value is the coordinator's answer to give, with the path it looked for). Boresight is in degrees and
   **required** (400 if missing, non-numeric or non-finite — `json` parses a bare `NaN` token, so finiteness
-  is checked in the web process): it is what lets refcat shards preload before pixels exist. Returns
-  `job_id`, state, `timings: {calib: {...}, refcat: {...}}`; both sub-dicts carry the same keys whether the
-  work was done or reused, so the shape never changes. `calib` additionally carries `detector_reused` and
-  `filter_reused`, since its `reused` (true only when *neither* half was built) cannot by itself
-  distinguish a cold start from a filter change.
+  is checked in the web process): it is what lets refcat shards preload before pixels exist.
+  `calib_time` is when the exposure was taken, ISO-8601 TAI, and **required**: it is what the butler
+  backend resolves calibs against, and an absent time in `daf_butler` means excluding every CALIBRATION
+  collection rather than relaxing the constraint — i.e. silently wrong calibs rather than an error. Its
+  shape is checked here but it is *parsed* in the coordinator, since this process imports no astropy; a
+  value that parses nowhere comes back 400 tagged `calib_time`. The client sends the exposure
+  **midpoint** on both its paths (`VisitInfo.date` is already the midpoint; the butler path takes the
+  midpoint of the exposure record's timespan) so the two cannot resolve against different instants.
+  Returns `job_id`, state, `timings: {calib: {...}, refcat: {...}}`; both sub-dicts carry the same keys
+  whether the work was done or reused, so the shape never changes. `calib` additionally carries
+  `detector_reused` and `filter_reused`, since its `reused` (true only when *neither* half was built)
+  cannot by itself distinguish a cold start from a filter change, plus `backend` and `resolve_s`.
+
+  **Resolution defers to the butler.** The collection chain is flattened in order and passed
+  *unfiltered*, matching what `pipetask run` does: `AllDimensionsQuantumGraphBuilder` applies no
+  `collection_types` filter, RUN/TAGGED rows are given a synthetic unbounded validity range, and
+  find-first ranks purely by position in the sequence. So a producer RUN early in the chain can answer a
+  lookup no CALIBRATION collection covers. That reads like a bug and is the opposite: filtering to
+  CALIBRATION makes a lookup at an uncertified time resolve *nothing*, where the pipeline resolves fine.
 - `POST /push/{job_id}` — raw binary blob (below). Returns terminal state plus per-stage timings.
 - `GET /status/{job_id}`; `GET /result/{job_id}?wait=N` — JSON `ready`, `state`, `timings`, `summary`
   (row/detector/group counts, dropped columns), `table_url`; stays JSON so it remains long-pollable.

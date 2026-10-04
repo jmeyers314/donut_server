@@ -33,6 +33,11 @@ from lsst.ts.donut_server.server import (
 # Small enough that a test never touches the 513 MB production block.
 TEST_SHM_SIZE = 4096
 
+# /prepare requires it. Never parsed here -- the front-end validates its shape
+# only, and the fake coordinator does not resolve calibs at all -- so any
+# plausible ISO-8601 string serves.
+CALIB_TIME = "2026-07-14T05:42:02.206"
+
 # The fake only needs to be spawned, not to import afw + ts_wep, so bring-up is
 # well under a second; these bounds are loose enough for a loaded machine.
 READY_TIMEOUT_S = 30.0
@@ -563,7 +568,12 @@ def test_prepare_503s_with_a_reason_when_the_coordinator_is_degraded(monkeypatch
 
         resp = client.post(
             "/prepare",
-            json={"physical_filter": "r_57", "boresight_ra": 1.0, "boresight_dec": 2.0},
+            json={
+                "physical_filter": "r_57",
+                "boresight_ra": 1.0,
+                "boresight_dec": 2.0,
+                "calib_time": CALIB_TIME,
+            },
             headers=auth(),
         )
         assert resp.status_code == 503
@@ -577,7 +587,12 @@ def test_push_503s_and_marks_the_job_errored(monkeypatch):
     with make_client(monkeypatch, coord) as client:
         job_id = client.post(
             "/prepare",
-            json={"physical_filter": "r_57", "boresight_ra": 1.0, "boresight_dec": 2.0},
+            json={
+                "physical_filter": "r_57",
+                "boresight_ra": 1.0,
+                "boresight_dec": 2.0,
+                "calib_time": CALIB_TIME,
+            },
             headers=auth(),
         ).json()["job_id"]
 
@@ -615,7 +630,12 @@ def test_health_503s_while_starting(monkeypatch):
 def prepare(client, physical_filter="r_57"):
     return client.post(
         "/prepare",
-        json={"physical_filter": physical_filter, "boresight_ra": 1.0, "boresight_dec": 2.0},
+        json={
+            "physical_filter": physical_filter,
+            "boresight_ra": 1.0,
+            "boresight_dec": 2.0,
+            "calib_time": CALIB_TIME,
+        },
         headers=auth(),
     )
 
