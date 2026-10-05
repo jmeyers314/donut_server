@@ -324,7 +324,7 @@ def run_once(
         headers=headers,
         timeout=60,
     )
-    resp.raise_for_status()
+    raise_for_status(resp)
     prepare_data = resp.json()
     job_id = prepare_data["job_id"]
     print(
@@ -352,7 +352,7 @@ def run_once(
         headers={**headers, "Content-Type": "application/octet-stream"},
         timeout=300,
     )
-    resp.raise_for_status()
+    raise_for_status(resp)
     push_data = resp.json()
     print(f"push -> state={push_data['state']} ({time.monotonic() - t0:.3f}s)")
     for key, value in (push_data.get("timings") or {}).items():
@@ -362,7 +362,7 @@ def run_once(
     resp = requests.get(
         f"{host}/result/{job_id}", params={"wait": wait}, headers=headers, timeout=wait + 30
     )
-    resp.raise_for_status()
+    raise_for_status(resp)
     result_data = resp.json()
     print(
         f"result -> ready={result_data['ready']} state={result_data['state']} "
@@ -383,7 +383,7 @@ def run_once(
         return
     t0 = time.monotonic()
     resp = requests.get(f"{host}{result_data['table_url']}", headers=headers, timeout=60)
-    resp.raise_for_status()
+    raise_for_status(resp)
     print(f"  table -> {len(resp.content)} bytes parquet ({time.monotonic() - t0:.3f}s)")
     print_blitz_table(resp.content, columns)
 
@@ -407,7 +407,7 @@ def fetch_images(url: str, headers: dict, job_id: str) -> None:
         if attempt == 0:
             print("  images -> not written yet, waiting")
         time.sleep(IMAGES_RETRY_S)
-    resp.raise_for_status()
+    raise_for_status(resp)
 
     path = os.path.abspath(f"{job_id}.parquet")
     with open(path, "wb") as f:
@@ -506,6 +506,41 @@ def describe_overrides(digest: list) -> str:
         else:
             parts.append(f"-C {entry['name']} ({entry.get('lines')}L)")
     return "  ".join(parts)
+
+
+def raise_for_status(resp) -> None:
+    """`resp.raise_for_status()`, with the server's explanation in the message.
+
+    FastAPI puts the reason an endpoint refused in the body as `detail`, and
+    requests' own message carries only the status line and the URL -- so the bare
+    call turns "DONUT_SERVER_STAMP_DIR is not set" into a 500 with a traceback
+    and no cause, which is a round trip to /admin/jobs to recover something the
+    client was already holding.
+
+    Raises the same HTTPError with the same `response` attached, rather than
+    printing: the caller that cares about the distinction is
+    `report_transient_or_raise`, which needs the exception either way, and in
+    one-shot mode the traceback is the output.
+    """
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = None
+        try:
+            body = resp.json()
+        except ValueError:
+            # A 500 from a crashed worker, or a proxy's HTML -- truncated because
+            # an error page can be arbitrarily long.
+            text = (resp.text or "").strip()
+            detail = text[:500] if text else None
+        else:
+            if isinstance(body, dict):
+                detail = body.get("detail") or body.get("error") or body.get("reason")
+            if detail is None and body is not None:
+                detail = body
+        if detail in (None, ""):
+            raise
+        raise requests.HTTPError(f"{exc}: {detail}", response=resp) from exc
 
 
 def report_transient_or_raise(exc: requests.HTTPError) -> None:

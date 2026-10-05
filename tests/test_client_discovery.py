@@ -1,7 +1,10 @@
-"""Exposure selection is pure string logic -- no afw, no I/O, no raw files needed."""
+"""Client-side logic that needs no afw, no I/O and no raw files: exposure
+selection, -c/-C override parsing, and how a server's error body is surfaced."""
 import argparse
+import json
 
 import pytest
+import requests
 
 from lsst.ts.donut_server import client
 
@@ -143,3 +146,89 @@ def test_an_oversized_override_file_fails_during_parsing(parser, tmp_path):
 
     with pytest.raises(SystemExit):
         parser.parse_args(["-C", str(path)])
+
+
+# ------------------------------------------------------- error-body surfacing
+
+
+def make_response(status, body=b"", content_type="application/json"):
+    """A `requests.Response` built by hand.
+
+    Not FastAPI's TestClient: that one is httpx-backed, so its
+    `raise_for_status` raises `httpx.HTTPStatusError` and would exercise a path
+    the real client -- which uses `requests` -- never takes.
+    """
+    resp = requests.Response()
+    resp.status_code = status
+    resp.reason = "Internal Server Error"
+    resp.url = "http://127.0.0.1:8000/prepare"
+    resp._content = body if isinstance(body, bytes) else body.encode()
+    resp.headers["Content-Type"] = content_type
+    return resp
+
+
+def test_a_server_error_carries_the_servers_own_explanation():
+    """FastAPI's `detail` has to reach the message. Without it a misconfigured
+    data directory is a 500 and a traceback with no cause, recoverable only via
+    /admin/jobs -- which is the body the client was already holding."""
+    reason = "DONUT_SERVER_STAMP_DIR is not set; point it at a writable directory"
+    resp = make_response(500, json.dumps({"detail": reason}))
+
+    with pytest.raises(requests.HTTPError) as excinfo:
+        client.raise_for_status(resp)
+
+    assert reason in str(excinfo.value)
+    # Status and URL survive: this augments requests' message, not replaces it.
+    assert "500" in str(excinfo.value)
+    # The transient path reads `.response` off the exception, so it must persist.
+    assert excinfo.value.response is resp
+
+
+@pytest.mark.parametrize("key", ["detail", "error", "reason"])
+def test_any_of_the_three_body_shapes_is_found(key):
+    """`detail` is FastAPI's, but /health-style bodies say `reason` and a job
+    record says `error`; all three appear on real responses from this server."""
+    resp = make_response(500, json.dumps({key: "the cause"}))
+
+    with pytest.raises(requests.HTTPError, match="the cause"):
+        client.raise_for_status(resp)
+
+
+def test_a_non_json_body_is_surfaced_but_truncated():
+    """A proxy's HTML error page, or a crashed worker's plain text, still says
+    more than the status line -- but may be arbitrarily long."""
+    resp = make_response(502, "x" * 5000, content_type="text/html")
+
+    with pytest.raises(requests.HTTPError) as excinfo:
+        client.raise_for_status(resp)
+
+    assert len(str(excinfo.value)) < 1000
+
+
+def test_an_empty_body_leaves_the_message_alone():
+    """Nothing to add must mean no change, not a dangling separator."""
+    resp = make_response(500, b"")
+
+    with pytest.raises(requests.HTTPError) as excinfo:
+        client.raise_for_status(resp)
+
+    assert str(excinfo.value).endswith("http://127.0.0.1:8000/prepare")
+
+
+def test_a_success_is_a_no_op():
+    assert client.raise_for_status(make_response(200, json.dumps({"job_id": "x"}))) is None
+
+
+def test_the_transient_path_still_works_off_the_augmented_error(capsys):
+    """Loop mode must keep swallowing a 503: the augmented exception carries the
+    same `.response`, which is where `reason` and Retry-After are read from."""
+    resp = make_response(503, json.dumps({"reason": "coordinator restarting"}))
+    resp.headers["Retry-After"] = "5"
+
+    try:
+        client.raise_for_status(resp)
+    except requests.HTTPError as exc:
+        client.report_transient_or_raise(exc)
+
+    out = capsys.readouterr().out
+    assert "coordinator restarting" in out and "retry_after=5s" in out
