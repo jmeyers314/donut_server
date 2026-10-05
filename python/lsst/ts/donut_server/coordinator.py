@@ -146,10 +146,10 @@ def calib_dir() -> str:
 
 
 # The eight corner wavefront sensors, id -> full_name. SW0 is extra-focal, SW1
-# intra-focal. Verified against the `detector` dimension records in
-# /Users/jmeyers3/repo; scripts/export_blitz_repo.py has the same id list under
-# the name CORNER_DETECTORS, but scripts/ is not on the package path so this is
-# a deliberate second copy rather than an import.
+# intra-focal. Verified against the `detector` dimension records in LSSTCam;
+# scripts/export_blitz_repo.py has the same id list under the name
+# CORNER_DETECTORS, but scripts/ is not on the package path so this is a
+# deliberate second copy rather than an import.
 #
 # The files backend does not use this -- it discovers ids from the ptc_*.fits
 # filenames, which is authoritative for a tree that might hold a subset. The
@@ -1137,8 +1137,7 @@ class ButlerCalibBackend:
     fallback looks like a bug and is not: it is what the pipeline would have
     used, which is the only answer this service is allowed to give. Filtering to
     CALIBRATION would make us resolve calibs the pipeline does not, and in
-    /Users/jmeyers3/repo it resolves *nothing* at times when only the producer
-    runs answer.
+    LSSTCam it resolves *nothing* at times when only the producer runs answer.
 
     Two traps, both deliberate:
 
@@ -1152,8 +1151,11 @@ class ButlerCalibBackend:
       have two open-ended spans -- so this is reachable, not theoretical.
 
     The Butler is constructed per resolve and closed, never cached: the task
-    forks eight cutout workers per push, and an inherited live sqlite connection
-    is unsupported even where it appears to work. Construction is a small
+    forks eight cutout workers per push, and an inherited live registry
+    connection is unsupported even where it appears to work -- for the
+    PostgreSQL registry a production repo actually has, a libpq socket shared
+    between parent and child corrupts both sides' protocol state, and sqlite
+    (what a locally built repo gets) is no safer. Construction is a small
     fraction of the registry queries it enables, and resolution happens only on
     /prepare, so there is nothing to win by holding one.
     """
@@ -1223,8 +1225,8 @@ class ButlerCalibBackend:
                 butler, collections, timespan, self.FILTER_TYPES, physical_filter
             )
         finally:
-            # Drops the registry's sqlite fd, so nothing butler-shaped survives
-            # into the fork path.
+            # Drops the registry's connection, so nothing butler-shaped
+            # survives into the fork path.
             butler.close()
 
         self._detector_refs = detector_refs

@@ -12,6 +12,7 @@ resolution rule -- defer to the butler, do not filter the collection chain -- is
 this backend's whole reason to exist and the thing a later refactor would most
 plausibly "tidy up" into incorrectness.
 """
+import functools
 import os
 
 import pytest
@@ -116,6 +117,58 @@ def test_a_filter_change_reloads_only_the_filter_dependent_half():
     assert calib.detector is detector
 
 
+@functools.cache
+def calibs_in_chain_runs() -> frozenset[str]:
+    """Required calib types that a plain RUN in the configured chain carries.
+
+    The RUN-fallback test below asserts a property of the *repo*, not of this
+    code: that the collection chain includes the producer runs the calibs were
+    built in. A repo built by scripts/build_blitz_repo.py does, because its
+    discover_children chains every RUN it finds. A production repo's own
+    LSSTCam/defaults does not -- there the chained RUNs are raws, refcats and
+    skymaps, and the producer runs exist but are unchained -- so the fallback
+    has nothing to fall back to and the test is inapplicable rather than
+    failing.
+
+    Cached because it opens a Butler, and closed before returning for the same
+    fork-safety reason resolve() does it.
+    """
+    from lsst.daf.butler import Butler, MissingDatasetTypeError
+
+    backend = coordinator.ButlerCalibBackend
+    required = [
+        t
+        for t in backend.DETECTOR_TYPES + backend.FILTER_TYPES
+        if t not in backend.OPTIONAL_TYPES
+    ]
+    butler = Butler.from_config(coordinator.butler_repo(), writeable=False)
+    try:
+        flat = coordinator._flatten_collections(butler, coordinator.butler_collections())
+        runs = [
+            info.name
+            for info in butler.collections.query_info(flat)
+            if info.type.name == "RUN"
+        ]
+        present = set()
+        for dataset_type in required:
+            try:
+                # limit=1: an existence probe, not an inventory.
+                if butler.query_datasets(
+                    dataset_type,
+                    collections=runs,
+                    find_first=False,
+                    explain=False,
+                    limit=1,
+                ):
+                    present.add(dataset_type)
+            except MissingDatasetTypeError:
+                # Not registered at all, which is a stronger form of absent.
+                continue
+        return frozenset(present)
+    finally:
+        butler.close()
+
+
 def test_an_uncertified_era_falls_back_to_the_producer_run():
     """The decision this backend turns on, pinned.
 
@@ -126,10 +179,26 @@ def test_an_uncertified_era_falls_back_to_the_producer_run():
     the answer the offline pipeline would have used, which is the only one this
     service is allowed to give.
 
-    If this ever starts raising or returning nothing, someone has "fixed" the
-    backend by filtering the chain to its CALIBRATION children. In this repo
-    that makes a 2020 lookup resolve *nothing at all*.
+    If this ever starts raising or returning nothing *on a repo that chains its
+    producer runs*, someone has "fixed" the backend by filtering the chain to
+    its CALIBRATION children: in such a repo that makes a 2020 lookup resolve
+    nothing at all. The skip below is why that qualifier is there -- see
+    calibs_in_chain_runs.
     """
+    backend = coordinator.ButlerCalibBackend
+    required = frozenset(
+        t
+        for t in backend.DETECTOR_TYPES + backend.FILTER_TYPES
+        if t not in backend.OPTIONAL_TYPES
+    )
+    missing = required - calibs_in_chain_runs()
+    if missing:
+        pytest.skip(
+            f"{coordinator.butler_repo()!r} chains no RUN carrying "
+            f"{sorted(missing)}, so an uncertified lookup has no producer run "
+            "to fall back to; needs a repo whose chain includes them"
+        )
+
     ids = coordinator.calib_backend().resolve(prepare_command(calib_time=UNCERTIFIED_TIME))
 
     assert len(ids.detector) == 3 * N_DETECTORS
@@ -138,7 +207,7 @@ def test_an_uncertified_era_falls_back_to_the_producer_run():
 
 def test_a_resolve_leaves_no_butler_behind():
     """Fork safety. The task forks eight cutout workers per push, and an
-    inherited live sqlite connection is unsupported even where it appears to
+    inherited live registry connection is unsupported even where it appears to
     work -- so the Butler is per-resolve and closed, never cached.
 
     Asserted rather than left to the `finally` being right, because the failure
@@ -188,8 +257,13 @@ def test_a_mistyped_repo_path_is_a_fatal_config_error(monkeypatch):
     Before it, the server came up healthy on a repo that does not exist -- both
     flights spawned, /health read ready -- and every /prepare then 500'd, with
     the only explanation in the HTTP response body.
+
+    The typo is appended rather than substituted into REPO: a substitution only
+    mangles the paths it matches, and silently passed once REPO stopped being
+    one of them -- the suite ran against an alias (`/repo/main`) that the
+    substitution left untouched, so this asserted that the *real* repo fails.
     """
-    monkeypatch.setenv("DONUT_SERVER_BUTLER_REPO", REPO.replace("jmeyers3", "jmeyers"))
+    monkeypatch.setenv("DONUT_SERVER_BUTLER_REPO", REPO.rstrip("/") + "-mistyped")
     with pytest.raises(coordinator.CalibConfigError, match="not a usable butler repo"):
         coordinator.check_calib_config()
 

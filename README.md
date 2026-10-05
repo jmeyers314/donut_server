@@ -102,7 +102,7 @@ information, so the files path can only return whatever is on disk.
 from the tree above:
 
 ```zsh
-bin/donutServer.py -b /Users/jmeyers3/repo              # butler-resolved calibs
+bin/donutServer.py -b LSSTCam                           # butler-resolved calibs
 bin/donutServer.py                                      # the flat FITS tree
 ```
 
@@ -232,8 +232,10 @@ produces the key — but a hit then reads no pixels.
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 166 tests; the butler-backend 9
-                                                # skip unless DONUT_SERVER_BUTLER_REPO is set
+python -m pytest tests/ -q                      # 185 tests; the butler-backend 14
+                                                # skip unless DONUT_SERVER_BUTLER_REPO is set,
+                                                # and the RUN-fallback one also needs a repo
+                                                # whose chain includes the producer runs
 scons                                           # same suite, but sconsUtils rebuilds the
                                                 # environment from an allowlist -- a
                                                 # DONUT_SERVER_* variable missing from
