@@ -43,6 +43,14 @@ MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 # payload that MAX_PUSH_BYTES caps.
 SHM_SIZE = MAX_PUSH_BYTES + 1024 * 1024
 
+# Where a tmpfs-backed shm_open puts its blocks, when there is one. Checked for
+# existence rather than assumed: this is the Linux layout, and on macOS --
+# a supported dev platform -- POSIX shared memory is kernel-backed with no
+# mount to interrogate at all, so the capacity check below is skipped there.
+# The path is not configurable: CPython prefixes the block name with "/" and
+# hands it to shm_open, which resolves it under this mount wherever it exists.
+SHM_MOUNT = "/dev/shm"
+
 # Caps on a prepare's -c/-C override list. Bounded rather than trusted because an
 # accepted list is retained in _primed_args, replayed verbatim on every coordinator
 # restart, and echoed (in digest form) from /health, which the dashboard polls at
@@ -298,6 +306,10 @@ class Coord:
     @property
     def shm(self):
         return self._shm
+
+    @property
+    def shm_size(self) -> int:
+        return self._shm_size
 
     @property
     def state(self) -> CoordState:
@@ -843,6 +855,75 @@ def _fatal_config_handler(reason: str) -> None:
     os.kill(os.getpid(), signal.SIGTERM)
 
 
+class ShmTooSmall(RuntimeError):
+    """`SHM_MOUNT` cannot supply the shared blocks the flights will need.
+
+    Its own type, and raised rather than reported through `_fatal_config_handler`:
+    this happens inside the lifespan startup, before any flight has a child to
+    lose, so there is nothing yet to shut down gracefully -- letting it propagate
+    makes uvicorn abort startup and print it, which is the same operator-facing
+    outcome with none of the signal plumbing.
+    """
+
+
+def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
+    """Bytes available on `mount`, or None if there is nothing to measure.
+
+    None covers both "no such mount" (macOS, where POSIX shared memory is
+    kernel-backed) and a statvfs that fails for any reason: in neither case do we
+    know the capacity, and a guess would either refuse a working server or
+    promise capacity that is not there.
+    """
+    try:
+        st = os.statvfs(mount)
+    except OSError:
+        return None
+    # f_bavail, not f_bfree: the latter counts root-only reserve a server running
+    # as an ordinary user cannot have. For tmpfs they are equal, but this is also
+    # the correct read if SHM_MOUNT is ever something else.
+    return st.f_bavail * st.f_frsize
+
+
+def check_shm_capacity(n_flights: int, shm_size: int = SHM_SIZE) -> None:
+    """Fail startup if the shared blocks cannot be backed by real pages.
+
+    The failure this prevents is otherwise undiagnosable. `SharedMemory(create=
+    True)` only does shm_open + ftruncate, which on tmpfs reserves nothing and
+    succeeds however small the mount is; the mmap succeeds too. The shortfall is
+    discovered only when /push *writes* a page tmpfs cannot allocate, and the
+    kernel's sole recourse at that point is SIGBUS -- which kills the front-end
+    mid-request, so the producer sees a closed socket with no status and the
+    server leaves nothing behind but "Bus error (core dumped)".
+
+    Checked across the whole pool rather than per flight for the same reason the
+    runtime failure is late: a sparse block does not reduce f_bavail, so flight 0
+    reserving 513 MB leaves flight 1 measuring the same free space and finding it
+    ample. Only the sum is a real requirement.
+
+    A floor, not a reservation: nothing stops another process on the host taking
+    the space between here and the first push. It catches the standing
+    misconfiguration -- a 64 MB container default against a 513 MB block -- which
+    is the case that can never work rather than the one that got unlucky.
+    """
+    free = shm_free_bytes()
+    if free is None:
+        return
+    needed = n_flights * shm_size
+    if free >= needed:
+        return
+    mb = 1024 * 1024
+    raise ShmTooSmall(
+        f"{SHM_MOUNT} has {free / mb:.0f} MB available but this server needs "
+        f"{needed / mb:.0f} MB ({n_flights} "
+        f"flight{'s' if n_flights != 1 else ''} x {shm_size / mb:.0f} MB). "
+        "Each flight streams one push into a shared block of that size, and a "
+        "block short of pages kills the server with SIGBUS mid-push rather than "
+        f"failing the request. Give {SHM_MOUNT} more room (a container usually "
+        "defaults to 64 MB; --shm-size=2g or more), or run fewer flights with "
+        "--num-flights."
+    )
+
+
 class FlightPool:
     """N independent coordinator processes ("flights"), and the routing between
     them and the jobs they prepared.
@@ -1002,6 +1083,7 @@ class FlightPool:
         return max(c.generation for c in self.flights)
 
     async def start(self) -> None:
+        check_shm_capacity(len(self.flights), self.flights[0].shm_size)
         for coord in self.flights:
             await coord.start()
 

@@ -945,3 +945,63 @@ def test_num_flights_comes_from_the_environment(monkeypatch):
     assert server.num_flights() == 1
     monkeypatch.setenv("DONUT_SERVER_NUM_FLIGHTS", "two")
     assert server.num_flights() == 2
+
+
+# ----------------------------------------------------------- shm capacity check
+
+
+def test_shm_capacity_is_checked_against_the_whole_pool(monkeypatch):
+    """A 64 MB /dev/shm must refuse to start, naming both numbers.
+
+    Faked rather than measured: the real mount is ample on a dev box, and absent
+    entirely on macOS, so the branch that matters would never run.
+
+    The sum is what is checked, not the per-flight size: an ftruncate'd block is
+    sparse and does not reduce f_bavail, so a per-flight check would pass N times
+    over the same free space and still SIGBUS on the first push.
+    """
+    monkeypatch.setattr(server, "shm_free_bytes", lambda *a, **k: 64 * 1024 * 1024)
+
+    with pytest.raises(server.ShmTooSmall) as excinfo:
+        server.check_shm_capacity(2, 513 * 1024 * 1024)
+    message = str(excinfo.value)
+    assert "64 MB" in message and "1026 MB" in message
+    assert "2 flights" in message
+
+    # Ample for one flight, short for three: the shortfall is a property of the
+    # pool size, so the same mount must decide differently.
+    monkeypatch.setattr(server, "shm_free_bytes", lambda *a, **k: 600 * 1024 * 1024)
+    server.check_shm_capacity(1, 513 * 1024 * 1024)
+    with pytest.raises(server.ShmTooSmall):
+        server.check_shm_capacity(3, 513 * 1024 * 1024)
+
+
+def test_shm_capacity_check_is_skipped_when_there_is_no_mount_to_measure():
+    """macOS has no /dev/shm and kernel-backed POSIX shm with no mount to
+    statvfs. Unmeasurable must mean "proceed", not "refuse": the alternative
+    would make the server unstartable on a supported dev platform."""
+    assert server.shm_free_bytes("/nonexistent/for/this/test") is None
+
+
+def test_a_pool_whose_blocks_do_not_fit_refuses_to_start(monkeypatch):
+    """The check is wired into startup, not merely available.
+
+    Asserted through FlightPool.start() because that is the seam that has to call
+    it -- and it must raise *before* any child is spawned, since the whole point
+    is to replace a SIGBUS that happens much later.
+    """
+    monkeypatch.setattr(server, "shm_free_bytes", lambda *a, **k: 1024)
+    pool = server.FlightPool(
+        2,
+        target=fake_coordinator.main,
+        target_args=([],),
+        shm_size=TEST_SHM_SIZE,
+    )
+
+    async def body():
+        with pytest.raises(server.ShmTooSmall):
+            await pool.start()
+
+    asyncio.run(body())
+    assert all(c.shm is None for c in pool.flights)
+    assert all(c._spawns == 0 for c in pool.flights)

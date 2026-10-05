@@ -37,6 +37,28 @@ built launchers work. Running the `bin.src/` copies directly will fail for exact
 export DYLD_LIBRARY_PATH="$LD_LIBRARY_PATH"
 ```
 
+### Shared memory
+
+On Linux the server needs **513 MB of `/dev/shm` per flight** — 1 GB at the default
+`--num-flights 2`. Raws reach the coordinator through a shared block rather than the Pipe, one
+reusable block per flight, sized for the largest push the service accepts.
+
+```zsh
+df -h /dev/shm      # Avail must exceed 513 MB x flights
+```
+
+A container is the usual problem: Docker, Podman and Jupyter images default `/dev/shm` to 64 MB,
+which is not enough for even one flight. Start it with `--shm-size=2g`, or run fewer flights.
+`FlightPool.start()` checks this and refuses to start with a message naming both numbers, because
+the runtime failure it replaces is undiagnosable: tmpfs reserves nothing at allocation time, so an
+oversubscribed block is only discovered when a push writes a page that cannot be backed, and the
+kernel's only recourse then is `SIGBUS`. That kills the front-end mid-request — the producer sees a
+closed socket with no HTTP status, and the server prints `Bus error (core dumped)` and nothing else.
+
+Note that tmpfs pages count against a cgroup memory limit, so a container can have a large
+`/dev/shm` and still `SIGBUS`; the startup check cannot see that case. macOS has no `/dev/shm` and
+its POSIX shared memory is kernel-backed with no mount to measure, so the check is skipped there.
+
 ## Data
 
 Not in the repo (33 GB, git-ignored). Locate it yourself — each directory is found through its own
