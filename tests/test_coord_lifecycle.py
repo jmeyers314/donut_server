@@ -289,9 +289,12 @@ def test_a_fatal_config_error_is_not_retried():
             on_fatal=fatal.append,
         )
         async with started(coord):
-            await wait_for(
-                lambda: coord.state is CoordState.DEGRADED, READY_TIMEOUT_S, "DEGRADED"
-            )
+            # Waits for the on_fatal callback, not for DEGRADED: the state flips
+            # first and the callback fires after an awaited reap, so a waiter
+            # that stops at DEGRADED can read `fatal` while it is still empty.
+            # The callback is the strictly later signal, so it implies both.
+            await wait_for(lambda: fatal, READY_TIMEOUT_S, "the on_fatal callback")
+            assert coord.state is CoordState.DEGRADED
             # One spawn, not three: the retry ladder was skipped entirely.
             assert coord.spawns == 1
             assert fatal == [fake_coordinator.FATAL_REASON]
@@ -327,12 +330,15 @@ def test_fatal_config_error_takes_the_server_down():
         )
         await pool.start()
         try:
-            for coord in pool.flights:
-                await wait_for(
-                    lambda c=coord: c.state is CoordState.DEGRADED,
-                    READY_TIMEOUT_S,
-                    "DEGRADED",
-                )
+            # One report per flight, waited for directly rather than via each
+            # flight's DEGRADED: see the sibling test on why the state flip
+            # lands before the callback.
+            await wait_for(
+                lambda: len(fatal) == len(pool.flights),
+                READY_TIMEOUT_S,
+                "every flight's on_fatal callback",
+            )
+            assert all(c.state is CoordState.DEGRADED for c in pool.flights)
             # Both flights report: the handler, not the caller, is what
             # de-duplicates -- see _FATAL_REPORTED.
             assert fatal == [fake_coordinator.FATAL_REASON] * 2
