@@ -18,6 +18,7 @@ import math
 import multiprocessing as mp
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -229,6 +230,7 @@ class Coord:
         max_restart_attempts: int = MAX_RESTART_ATTEMPTS,
         backoff: tuple = RESTART_BACKOFF_S,
         on_restart: Optional[Callable[[dict], None]] = None,
+        on_fatal: Optional[Callable[[str], None]] = None,
         index: int = 0,
     ) -> None:
         # Which flight this is. Carried so a raised CoordinatorLost can name its
@@ -254,6 +256,10 @@ class Coord:
         self._max_restart_attempts = max_restart_attempts
         self._backoff = tuple(backoff)
         self._on_restart = on_restart
+        # Called instead of retrying when the child reports a fatal config error.
+        # A seam rather than a direct _shutdown_server() call so the lifecycle
+        # tests can observe the decision without taking pytest down with it.
+        self._on_fatal = on_fatal
 
         # A *dedicated* executor, not the default one: uvicorn's shutdown calls
         # loop.shutdown_default_executor(THREAD_JOIN_TIMEOUT) with
@@ -280,6 +286,10 @@ class Coord:
         self._primed_args: Optional[dict] = None
         self._loss_provoked_by: Optional[str] = None
         self._reprime_error: Optional[str] = None
+        # Set when the child reported a non-retryable config error. Distinct from
+        # _degraded_reason, which means "gave up after N attempts": this one was
+        # never retried, and /health should say which happened.
+        self._fatal_reason: Optional[str] = None
         # One slot, never per-job: the dump is ~77 KB and must not reach a JobRecord.
         self._config_snapshot: Optional[ConfigSnapshot] = None
 
@@ -316,6 +326,16 @@ class Coord:
     @property
     def degraded_reason(self) -> Optional[str]:
         return self._degraded_reason
+
+    @property
+    def fatal_reason(self) -> Optional[str]:
+        """Set only when bring-up hit a config error it refused to retry.
+
+        Separate from degraded_reason so /health distinguishes "this service is
+        misconfigured" from "the child keeps dying": the first wants an operator
+        editing a command line, the second wants a look at the traceback.
+        """
+        return self._fatal_reason
 
     @property
     def primed_args(self) -> Optional[dict]:
@@ -521,6 +541,23 @@ class Coord:
                 msg = await self._run_reader(
                     self._await_reply, self._conn, self._proc, HELLO_TIMEOUT_S
                 )
+                if msg.get("event") == "fatal":
+                    # The child found the service misconfigured -- a repo that
+                    # does not open, collections that name nothing. Retrying
+                    # cannot help: every replacement child reads the same
+                    # environment and would reach the same conclusion, so the
+                    # backoff loop would only delay the report by ~7 s and then
+                    # land in DEGRADED, which looks like a crash loop rather
+                    # than a typo. Report it and take the server down.
+                    reason = msg.get("error", "calib configuration is unusable")
+                    self._fatal_reason = reason
+                    self._degraded_reason = reason
+                    self._state = CoordState.DEGRADED
+                    await loop.run_in_executor(self._executor, self._reap)
+                    self._ready_event.set()
+                    if self._on_fatal is not None:
+                        self._on_fatal(reason)
+                    return
                 if msg.get("event") != "hello":
                     raise CoordinatorLost(f"expected hello, got {msg!r}")
             except CoordinatorLost as exc:
@@ -658,6 +695,12 @@ class Coord:
             # Nothing is in flight in DEGRADED, and there is no child to kill.
             self._restart_attempts = 0
             self._degraded_reason = None
+            # Cleared too, so a retry after the operator has fixed the
+            # environment is not reported as still-fatal. It cannot *succeed*
+            # without a fix -- the child re-reads the same environment, finds it
+            # still bad, and sets this again -- which is the point: the flag
+            # tracks the last bring-up, not a permanent verdict.
+            self._fatal_reason = None
             self._start_restart()
             return None
 
@@ -767,6 +810,39 @@ class Coord:
                 lock.release()
 
 
+# Set by the first flight to report a fatal config error, so the N-1 others
+# reporting the same thing neither duplicate the banner nor re-signal.
+_FATAL_REPORTED = threading.Event()
+
+
+def _fatal_config_handler(reason: str) -> None:
+    """Report a misconfiguration to whoever started the server, then stop it.
+
+    Printed to stderr, not logged: the audience is the operator watching the
+    terminal they just typed the command into, and this process configures no
+    logging handler at all (the coordinator child owns the pipeline log), so a
+    _log call here would reach the same stderr via logging.lastResort and say
+    it twice.
+
+    SIGTERM to our own process rather than sys.exit or os._exit: this runs on
+    the event loop, where sys.exit only unwinds one task, and os._exit would
+    skip uvicorn's lifespan shutdown -- which is what reaps the other flights'
+    children and unlinks their shared blocks. SIGTERM is the signal uvicorn
+    already installs a graceful handler for, so the existing shutdown path runs
+    exactly as it does for a Ctrl-C.
+    """
+    if _FATAL_REPORTED.is_set():
+        return
+    _FATAL_REPORTED.set()
+    print(f"\nFATAL: {reason}", file=sys.stderr)
+    print(
+        "The server cannot serve any request in this state; shutting down.",
+        file=sys.stderr,
+        flush=True,
+    )
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
 class FlightPool:
     """N independent coordinator processes ("flights"), and the routing between
     them and the jobs they prepared.
@@ -783,8 +859,16 @@ class FlightPool:
     """
 
     def __init__(self, n: int = 1, **coord_kwargs) -> None:
+        # Popped before the comprehension, not inside it: a pop per iteration
+        # would hand the caller's handler to flight 0 and the default to the rest.
+        on_fatal = coord_kwargs.pop("on_fatal", None) or _fatal_config_handler
         self.flights = [
-            Coord(index=i, on_restart=self._loss_handler(i), **coord_kwargs)
+            Coord(
+                index=i,
+                on_restart=self._loss_handler(i),
+                on_fatal=on_fatal,
+                **coord_kwargs,
+            )
             for i in range(n)
         ]
         # job_id -> flight index, written at /prepare and read at /push. Unbounded,
@@ -1551,6 +1635,9 @@ def _flight_health(coord: Coord) -> dict:
         # Python exception with a traceback in the log.
         "last_loss": coord.last_loss,
         "degraded_reason": coord.degraded_reason,
+        # Non-null means the service is misconfigured rather than unlucky, and
+        # the process is on its way down; see Coord.fatal_reason.
+        "fatal_reason": coord.fatal_reason,
         # alive without ready and with in_flight > 0, held for minutes, is the
         # wedged-but-alive signature that /admin/restart exists for.
         "in_flight": coord.in_flight,

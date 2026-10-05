@@ -113,3 +113,17 @@ def hang_before_hello(conn, shm_name: str, script=()) -> None:
     partway through its ~15 s of LSST imports."""
     while True:
         time.sleep(3600)
+
+
+FATAL_REASON = "DONUT_SERVER_BUTLER_REPO '/nope' is not a usable butler repo"
+
+
+def fatal_before_hello(conn, shm_name: str, script=()) -> None:
+    """Models a misconfigured service: reports a fatal config error, then dies.
+
+    Mirrors the real coordinator's check_calib_config branch -- the `fatal`
+    event in place of the hello, then an immediate exit -- which is what lets a
+    test assert the front-end never retries it.
+    """
+    conn.send({"ok": False, "event": "fatal", "error": FATAL_REASON})
+    os._exit(1)

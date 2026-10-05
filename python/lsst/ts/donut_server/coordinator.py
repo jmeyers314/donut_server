@@ -383,6 +383,18 @@ class CalibTimeError(RuntimeError):
     """
 
 
+class CalibConfigError(RuntimeError):
+    """The configured calib backend cannot work, whatever the request.
+
+    Raised only from `check_calib_config`, before the hello, and distinct from
+    the two above because it is not about one request: a mistyped repo path or a
+    collection chain that names nothing is wrong for every /prepare that will
+    ever arrive, so there is no child a restart could produce that would behave
+    differently. The front-end answers it by refusing to retry and taking the
+    server down -- see Coord._bring_up.
+    """
+
+
 class QuantumBundle(NamedTuple):
     """Everything runQuantum needs, plus the handles to read its output back."""
 
@@ -1070,6 +1082,25 @@ class FilesCalibBackend:
 
     name = "files"
 
+    def check(self) -> None:
+        """Startup check: the calib directory exists and holds something.
+
+        Only the directory, not the filenames: which calibs are required depends
+        on the exposure's physical_filter, which no startup check knows. A
+        missing ptc for one filter is a /prepare error; an empty or absent
+        directory is a server that cannot serve any filter.
+        """
+        d = calib_dir()
+        if not os.path.isdir(d):
+            raise CalibConfigError(
+                f"DONUT_SERVER_CALIB_DIR {d!r} is not a directory."
+            )
+        if not glob.glob(os.path.join(d, "*.fits")):
+            raise CalibConfigError(
+                f"DONUT_SERVER_CALIB_DIR {d!r} holds no .fits files; expected "
+                "ptc_*.fits, linearizer_*.fits, flat_*.fits (see README)."
+            )
+
     def resolve(self, command: dict) -> CalibIds:
         # The detector half is keyed on a constant: it is every ptc/linearizer/
         # crosstalk file in a directory that does not change under us, so there
@@ -1135,6 +1166,42 @@ class ButlerCalibBackend:
     DETECTOR_TYPES = ("ptc", "linearizer", "crosstalk")
     FILTER_TYPES = ("flat", "intrinsicZernikes")
     OPTIONAL_TYPES = frozenset({"intrinsicZernikes"})
+
+    def check(self) -> None:
+        """Startup check: the repo opens and the collections name something.
+
+        Deliberately stops short of resolving a calib. That needs a
+        physical_filter and a timespan, which belong to an exposure and not to a
+        server -- and a repo that is missing one filter's flat is still a repo
+        worth starting against. What this catches is the class of error where no
+        request could ever succeed: an unopenable repo (the mistyped path), and
+        a collection chain that flattens to nothing.
+
+        The Butler is opened and closed here exactly as `resolve` does it, so
+        nothing butler-shaped survives into the fork path; see the class
+        docstring.
+        """
+        try:
+            butler = Butler.from_config(butler_repo(), writeable=False)
+        except Exception as exc:
+            # The stack's own message already names the path and explains the
+            # alias fallback, so it is quoted rather than replaced.
+            raise CalibConfigError(
+                f"DONUT_SERVER_BUTLER_REPO {butler_repo()!r} is not a usable "
+                f"butler repo: {exc}"
+            ) from exc
+        try:
+            # Raises its own message naming the repo when the chain is empty.
+            _flatten_collections(butler, butler_collections())
+        except CalibConfigError:
+            raise
+        except Exception as exc:
+            raise CalibConfigError(
+                f"DONUT_SERVER_BUTLER_COLLECTIONS {butler_collections()!r} "
+                f"cannot be resolved in {butler_repo()!r}: {exc}"
+            ) from exc
+        finally:
+            butler.close()
 
     def resolve(self, command: dict) -> CalibIds:
         """Resolve every calib to a DatasetRef and return the two UUID sets.
@@ -1257,7 +1324,10 @@ def _flatten_collections(butler, collections: list[str]) -> list[str]:
         )
     ]
     if not flat:
-        raise RuntimeError(
+        # CalibConfigError rather than a bare RuntimeError: an empty chain is a
+        # property of the repo and the collection names, not of the request, so
+        # when check() hits it at startup it should be fatal rather than retried.
+        raise CalibConfigError(
             f"Collections {collections!r} resolved to nothing in "
             f"{butler_repo()!r}; is the repo the one you meant?"
         )
@@ -1610,6 +1680,36 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     }
 
 
+def check_calib_config() -> None:
+    """Fail now if the configured calib backend could never serve a request.
+
+    Called from coordinator_main before the hello, which is the earliest point
+    that can do this at all: the check needs daf_butler, and the front-end
+    deliberately imports no part of the stack (uvicorn.run imports the app
+    in-process, so an import there is an import into the server). donutServer.py
+    validates everything it can without the stack and says so explicitly; this
+    is the other half.
+
+    Before the hello specifically, because the hello's contract is "fully ready
+    to serve". A bad repo caught here therefore never reaches the state where
+    both flights are up and /health reports ready while every /prepare 500s --
+    which is exactly how a mistyped --butler-repo used to present.
+
+    Raising CalibConfigError rather than exiting: the front-end owns the
+    decision about what a non-retryable bring-up failure does to the process,
+    and it is the only side that can report it to whoever started the server.
+    """
+    try:
+        backend = calib_backend()
+    except RuntimeError as exc:
+        # An unknown DONUT_SERVER_CALIB_BACKEND, or a backend whose required
+        # variable is unset. Both are env typos with the same remedy as a bad
+        # repo, and donutServer.py's startup banner already warns about the
+        # first -- this is what makes the warning fatal instead of advisory.
+        raise CalibConfigError(str(exc)) from exc
+    backend.check()
+
+
 def _assert_single_threaded_blas() -> None:
     """Check that the env block at the top of this module actually bound.
 
@@ -1743,10 +1843,28 @@ def coordinator_main(conn, shm_name: str) -> None:
     _SHM = shared_memory.SharedMemory(name=shm_name, track=False)
     _SHM_VIEW = memoryview(_SHM.buf)
 
-    # Sent only once, and only after the BLAS assert and the shared block are
-    # both good -- so "hello" means fully ready to serve, not merely spawned.
-    # Without it the parent cannot distinguish a healthy child from one that is
-    # 15 s into importing afw + ts_wep, or one that is about to fail the assert.
+    # Before the hello, and reported over the Pipe rather than raised: a bad
+    # repo is the one startup failure the parent must be able to *explain*,
+    # since it is an operator typo and the operator is sitting at the terminal
+    # that started the server. Everything above here fails by propagating,
+    # whose traceback is the right surface for a bug; this is not a bug.
+    try:
+        check_calib_config()
+    except CalibConfigError as exc:
+        conn.send({"ok": False, "event": "fatal", "error": str(exc)})
+        # Explicit, rather than returning and letting the finally below run: the
+        # shared block's owner is the front-end, and a clean exit here races the
+        # parent's reap for no gain. The parent has the message already.
+        conn.close()
+        _SHM_VIEW.release()
+        _SHM.close()
+        os._exit(1)
+
+    # Sent only once, and only after the BLAS assert, the shared block and the
+    # calib config are all good -- so "hello" means fully ready to serve, not
+    # merely spawned. Without it the parent cannot distinguish a healthy child
+    # from one that is 15 s into importing afw + ts_wep, or one that is about to
+    # fail the assert.
     conn.send({"ok": True, "event": "hello", "pid": os.getpid()})
 
     # After the hello, deliberately. Everything above -- the single-thread

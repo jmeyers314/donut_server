@@ -172,3 +172,56 @@ def test_the_butler_backend_requires_a_repo(monkeypatch):
     monkeypatch.delenv("DONUT_SERVER_BUTLER_REPO", raising=False)
     with pytest.raises(RuntimeError, match="DONUT_SERVER_BUTLER_REPO"):
         coordinator.calib_backend().resolve(prepare_command())
+
+
+# ------------------------------------------------- the startup config check
+
+
+def test_check_passes_on_the_real_repo():
+    """The baseline for the three failure cases below: this repo is fine."""
+    coordinator.check_calib_config()
+
+
+def test_a_mistyped_repo_path_is_a_fatal_config_error(monkeypatch):
+    """The bug this check exists for: `-b /Users/jmeyers/repo` for jmeyers3.
+
+    Before it, the server came up healthy on a repo that does not exist -- both
+    flights spawned, /health read ready -- and every /prepare then 500'd, with
+    the only explanation in the HTTP response body.
+    """
+    monkeypatch.setenv("DONUT_SERVER_BUTLER_REPO", REPO.replace("jmeyers3", "jmeyers"))
+    with pytest.raises(coordinator.CalibConfigError, match="not a usable butler repo"):
+        coordinator.check_calib_config()
+
+
+def test_collections_naming_nothing_are_a_fatal_config_error(monkeypatch):
+    """The other way to configure a repo that can never resolve a calib: a real
+    repo, and collections it does not contain.
+
+    An unknown name raises out of query_info rather than reaching
+    _flatten_collections' empty-result branch, so both paths are wrapped. That
+    branch stays reachable for a chain that exists and is empty, which this
+    read-only repo has no way to offer.
+    """
+    monkeypatch.setenv("DONUT_SERVER_BUTLER_COLLECTIONS", "LSSTCam/no-such-collection")
+    with pytest.raises(coordinator.CalibConfigError, match="cannot be resolved"):
+        coordinator.check_calib_config()
+
+
+def test_an_unknown_backend_is_a_fatal_config_error(monkeypatch):
+    """calib_backend()'s own RuntimeError, retagged: donutServer.py's banner
+    warns that an unknown backend will fail, and this is what makes it fatal
+    at startup rather than at the first /prepare."""
+    monkeypatch.setenv("DONUT_SERVER_CALIB_BACKEND", "bogus")
+    with pytest.raises(coordinator.CalibConfigError, match="'files'.*'butler'"):
+        coordinator.check_calib_config()
+
+
+def test_the_check_leaves_no_butler_behind():
+    """Same fork-safety contract as a resolve: it runs before the hello, so a
+    Butler stashed on the backend would be live for every later fork."""
+    from lsst.daf.butler import Butler
+
+    backend = coordinator.calib_backend()
+    backend.check()
+    assert not any(isinstance(v, Butler) for v in vars(backend).values())

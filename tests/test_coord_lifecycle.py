@@ -267,6 +267,96 @@ def test_bounded_attempts_end_in_degraded():
     asyncio.run(body())
 
 
+def test_a_fatal_config_error_is_not_retried():
+    """A misconfigured service must fail fast, not look like a crash loop.
+
+    The distinction that matters: `exit_before_hello` above spawns
+    max_restart_attempts times before DEGRADED, because a child that merely died
+    might not die again. A child that *reported* a config error will reach the
+    same conclusion every time -- it re-reads the same environment -- so one
+    spawn is the whole budget, and the operator is told rather than left to read
+    a restart count.
+    """
+
+    async def body():
+        fatal: list = []
+        coord = Coord(
+            target=fake_coordinator.fatal_before_hello,
+            target_args=([],),
+            shm_size=TEST_SHM_SIZE,
+            max_restart_attempts=3,
+            backoff=(0.0, 0.0, 0.0),
+            on_fatal=fatal.append,
+        )
+        async with started(coord):
+            await wait_for(
+                lambda: coord.state is CoordState.DEGRADED, READY_TIMEOUT_S, "DEGRADED"
+            )
+            # One spawn, not three: the retry ladder was skipped entirely.
+            assert coord.spawns == 1
+            assert fatal == [fake_coordinator.FATAL_REASON]
+            # Reported as a misconfiguration, not as "gave up after N attempts".
+            assert coord.fatal_reason == fake_coordinator.FATAL_REASON
+            # Still answers requests rather than hanging on _ready_event, so a
+            # producer mid-flight gets a 503 instead of STARTUP_WAIT_S of silence.
+            with pytest.raises(CoordinatorUnavailable):
+                await coord.send_command({"cmd": "ping"})
+            assert coord.spawns == 1
+
+    asyncio.run(body())
+
+
+def test_fatal_config_error_takes_the_server_down():
+    """The default on_fatal signals the process; the pool wires it to every flight.
+
+    Asserted through the handler rather than by letting it run: the production
+    handler SIGTERMs this process, which under pytest would kill the test run.
+    """
+    assert server._fatal_config_handler is not None
+
+    async def body():
+        fatal: list = []
+        pool = server.FlightPool(
+            2,
+            target=fake_coordinator.fatal_before_hello,
+            target_args=([],),
+            shm_size=TEST_SHM_SIZE,
+            max_restart_attempts=1,
+            backoff=(0.0,),
+            on_fatal=fatal.append,
+        )
+        await pool.start()
+        try:
+            for coord in pool.flights:
+                await wait_for(
+                    lambda c=coord: c.state is CoordState.DEGRADED,
+                    READY_TIMEOUT_S,
+                    "DEGRADED",
+                )
+            # Both flights report: the handler, not the caller, is what
+            # de-duplicates -- see _FATAL_REPORTED.
+            assert fatal == [fake_coordinator.FATAL_REASON] * 2
+        finally:
+            await pool.aclose()
+
+    asyncio.run(body())
+
+
+def test_fatal_report_is_deduplicated():
+    """N flights find the same bad repo; the operator sees one banner and one signal."""
+    server._FATAL_REPORTED.clear()
+    signalled = []
+    try:
+        orig = server.os.kill
+        server.os.kill = lambda pid, sig: signalled.append((pid, sig))
+        server._fatal_config_handler("bad repo")
+        server._fatal_config_handler("bad repo")
+        assert signalled == [(os.getpid(), signal.SIGTERM)]
+    finally:
+        server.os.kill = orig
+        server._FATAL_REPORTED.clear()
+
+
 def test_a_successful_hello_resets_the_failure_counter():
     """So that unrelated crashes hours apart never accumulate into DEGRADED."""
 

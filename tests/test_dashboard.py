@@ -443,6 +443,7 @@ class FakeCoord:
     child_uptime_s = 12.5
     last_loss = None
     degraded_reason = None
+    fatal_reason = None
     in_flight = 0
     busy = False
 
