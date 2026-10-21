@@ -98,6 +98,9 @@ CLOSE_LOCK_WAIT_S = 2.0
 # -- so lining a job up with its log lines takes a clock, not an age.
 _BOOT_WALL = time.time() - time.monotonic()
 
+# /proc/<pid>/statm counts pages, not bytes. Resolved once: it cannot change.
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
 _STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 DASHBOARD_HTML = os.path.join(_STATIC, "dashboard.html")
 RESULTS_HTML = os.path.join(_STATIC, "results.html")
@@ -884,6 +887,32 @@ def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
     return st.f_bavail * st.f_frsize
 
 
+def rss_bytes(pid: Optional[int]) -> Optional[int]:
+    """Resident set size of `pid`, or None if it cannot be measured.
+
+    Read straight out of /proc rather than through psutil, which is not a
+    dependency of this package: one open-and-split of a two-field file, cheap
+    enough for a 1 Hz /health.
+
+    Deliberately *this process only*, not its process group. The blitz task forks
+    eight cutout workers per push whose pages are overwhelmingly copy-on-write
+    shares of the coordinator's own 4-6 GB, so a group sum would report 30+ GB of
+    memory that does not exist. The parent's RSS is both the honest number and the
+    one that moves when a filter's calibs land.
+
+    None covers a dead or never-spawned child, a pid that exited between the
+    /health handler reading it and this call, and any platform without /proc.
+    """
+    if pid is None:
+        return None
+    try:
+        with open(f"/proc/{pid}/statm", "rb") as f:
+            resident = int(f.read().split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return resident * _PAGE_SIZE
+
+
 def check_shm_capacity(n_flights: int, shm_size: int = SHM_SIZE) -> None:
     """Fail startup if the shared blocks cannot be backed by real pages.
 
@@ -1046,6 +1075,15 @@ class FlightPool:
             self._by_job[job_id] = coord.index
             return coord
         return self.flights[index]
+
+    def flight_of(self, job_id: str) -> Optional[int]:
+        """Which flight prepared `job_id`, or None if nothing routed it.
+
+        Unlike `for_push` this is a read: it never invents a route for a job that
+        has none, because the dashboard asking "whose job is this" must not change
+        where a later push goes.
+        """
+        return self._by_job.get(job_id)
 
     def queue_depth(self, coord: Coord) -> int:
         return self._queued[coord.index]
@@ -1710,6 +1748,10 @@ def _flight_health(coord: Coord) -> dict:
         "spawns": coord.spawns,
         "restart_attempts": coord.restart_attempts,
         "pid": coord.child_pid,
+        # The coordinator's own RSS, which on this service oscillates 4-6 GB as
+        # calibs land and are dropped. Excludes the task's fork workers on
+        # purpose; see rss_bytes.
+        "rss_bytes": rss_bytes(coord.child_pid),
         "child_uptime_s": coord.child_uptime_s,
         # last_loss.exitcode is the highest-value field here: -11 is a segfault
         # (a fork-safety regression), -9 is SIGKILL, which on a service that
@@ -1761,6 +1803,12 @@ async def health(request: Request, response: Response, authorization: str = Head
         {
             "n_flights": len(pool),
             "n_ready": n_ready,
+            # This process: the uvicorn front-end, which owns the job history and
+            # every shared block, and whose pid is the one to send a signal to.
+            # Its RSS is small and flat by design -- the parquet it retains is the
+            # only thing that grows -- so a front-end climbing alongside the
+            # flights is itself the finding.
+            "front_end": {"pid": os.getpid(), "rss_bytes": rss_bytes(os.getpid())},
             "flights": [_flight_health(c) for c in pool.flights],
             "jobs": _job_counts(),
         }
@@ -1842,6 +1890,9 @@ def _job_row(job_id: str, record: JobRecord, now: float) -> dict:
     summary = result.get("summary") or {}
     return {
         "job_id": job_id,
+        # Which lane ran it. Null for a job whose route the front-end no longer
+        # has, which is not an error -- see FlightPool.for_push.
+        "flight": pool.flight_of(job_id),
         "state": record.state.value,
         "age_s": now - record.created_at,
         "created_wall": _BOOT_WALL + record.created_at,

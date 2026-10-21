@@ -66,10 +66,21 @@
   .chip.off { border-color: var(--bad); color: var(--bad); }
   .loss { margin-top: 8px; color: var(--warn); max-width: 110ch; }
   .loss:empty { display: none; }
-  /* --- flights --- */
-  .flight { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; margin-bottom: 10px; }
+  /* --- flights ---
+     Side by side, because two lanes are read by comparing them: one at 5.8 GB
+     while the other sits at 1.2 GB is the kind of thing a vertical stack hides.
+     flex-wrap and a min-width mean 3+ flights wrap into rows rather than
+     squeezing every diagram until its labels collide. */
+  .lanes { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
+  .lanes > * { flex: 1 1 420px; min-width: 380px; }
+  .flight { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; }
   .fhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
   .ftitle { color: var(--ink); font-weight: 600; }
+  /* The per-flight job panel: same column geometry as the flight above it, so the
+     two sections line up and lane N is always in the same place on the page. */
+  .jobcol { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; }
+  .jobcol .note { display: block; margin-top: 2px; color: var(--dim); }
+  .jobcol .note b { color: var(--ink); font-weight: 600; }
   /* --- state machine diagrams --- */
   svg { display: block; max-width: 100%; height: auto; }
   .nbox { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; rx: 4; }
@@ -90,10 +101,13 @@
     border-bottom: 1px solid var(--line); white-space: nowrap;
   }
   td { padding: 3px 8px; border-bottom: 1px solid #232730; white-space: nowrap; }
+  tbody tr { cursor: pointer; }
   tbody tr:hover td { background: #21252d; }
-  /* The current job, marked rather than selected: it is chosen by what is in
-     flight, not by clicking. */
+  /* Two different things, deliberately not the same colour. `.sel` is the row the
+     detail panel is following on its own -- whatever is in flight, or the newest
+     job -- and `.pin` is a row the operator clicked, which stops that following. */
   tbody tr.sel td { background: #1b2735; }
+  tbody tr.pin td { background: #24303f; box-shadow: inset 0 0 0 1px var(--live); }
   td.num, th.num { text-align: right; }
   .s-DONE { color: var(--ok); }
   .s-ERROR { color: var(--bad); }
@@ -122,6 +136,10 @@
   <h1>donut_server</h1>
   <span class="host" id="host"></span>
   <span class="spacer"></span>
+  <!-- This process: the uvicorn front-end that owns the job history, the shared
+       blocks and every flight. Its pid is the one to signal, and it is the only
+       pid on this page that is not a coordinator child's. -->
+  <span class="host" id="frontend"></span>
   <span class="chip" id="poll">idle</span>
   <button id="restart">restart all flights</button>
 </header>
@@ -191,6 +209,13 @@
       <text class="nlabel" x="508" y="65">restarting</text>
     </g>
     <g class="node bad" id="c-degraded">
+      <!-- An SVG <title> is the hover text for its group, and the answer to the
+           question this state keeps prompting: degraded is not "slow" or
+           "unhealthy", it is this lane having given up. -->
+      <title>degraded: this flight gave up relaunching its coordinator — it has no
+child, serves no job, and stays this way until POST /admin/restart. Either
+bring-up failed max_restart_attempts times in a row, or the child reported a
+config error that retrying cannot fix. The other flights keep serving.</title>
       <rect class="nbox" x="678" y="40" width="120" height="40"/>
       <text class="nlabel" x="738" y="65">degraded</text>
     </g>
@@ -203,12 +228,21 @@
   <div class="loss" data-el="loss"></div>
   </div>
   </template>
-  <div id="flights"></div>
+  <div class="lanes" id="flights"></div>
 </section>
 
 <section>
-  <h2>Current job <span class="note" id="job-note"></span></h2>
-  <svg id="svg-job" viewBox="0 0 860 190" role="img" aria-label="job state machine">
+  <h2>Current job per flight <span class="note" id="job-note"></span></h2>
+  <!-- Cloned per flight exactly like #flight-tpl, and for the same reason: with N
+       lanes there are N jobs in flight at once, and one diagram could only ever
+       show one of them. ids are prefixed "jN-" at render time. -->
+  <template id="job-tpl">
+  <div class="jobcol">
+  <div class="fhead">
+    <span class="ftitle" data-el="title"></span>
+  </div>
+  <span class="note" data-el="note"></span>
+  <svg viewBox="0 0 860 190" role="img" aria-label="job state machine">
     <path class="edge" d="M94,10 L94,24" marker-end="url(#ar)"/>
     <text class="etext" x="30" y="9">POST /prepare</text>
     <path class="edge" d="M158,44 L206,44" marker-end="url(#ar)"/>
@@ -222,7 +256,6 @@
     <path class="edge" d="M360,98 L360,112" marker-end="url(#ar)"/>
     <path class="edge" d="M200,135 L300,135" marker-end="url(#ar)"/>
     <text class="etext" x="112" y="136">prepare failed</text>
-    <text class="etext" x="440" y="135">DONE and ERROR are terminal</text>
 
     <g class="node" id="j-PREPARED">
       <rect class="nbox" x="30" y="24" width="128" height="44"/>
@@ -245,6 +278,9 @@
       <text class="nlabel" x="360" y="139">ERROR</text>
     </g>
   </svg>
+  </div>
+  </template>
+  <div class="lanes" id="jobs-per-flight"></div>
 </section>
 
 <section>
@@ -252,11 +288,21 @@
   <div class="ctl">
     <label for="limit">limit</label>
     <input type="number" id="limit" value="50" min="1" max="500">
+    <!-- Hidden until a row is pinned: with nothing pinned there is nothing to
+         clear, and a permanently visible dead button invites the question of what
+         it would do. -->
+    <button id="unpin" style="display:none">unpin — follow the newest job</button>
   </div>
   <table>
     <thead><tr>
-      <th>job</th><th>state</th><th>created</th><th class="num">age</th>
-      <th class="num">runQuantum</th><th class="num">coord total</th><th class="num">blob</th>
+      <!-- `flight` rather than `blob`: the push size is the same ~308 MB on every
+           job, so the column never said anything, while which lane ran a job is
+           now what the two sections above are organized by. It is still in the
+           detail panel below for the one job that panel is about. -->
+      <th>job</th><th class="num">flight</th><th class="num">visit</th>
+      <th>state</th><th>created</th>
+      <th class="num">age</th>
+      <th class="num">runQuantum</th><th class="num">coord total</th>
       <th class="num">rows</th><th class="num">dets</th><th class="num">groups</th>
       <th class="num">parquet</th><th>results</th>
     </tr></thead>
@@ -344,6 +390,14 @@ const fmt = {
     if (n < 1048576) return (n / 1024).toFixed(0) + "KB";
     return (n / 1048576).toFixed(0) + "MB";
   },
+  // Separate from fmt.bytes, which tops out at MB: a coordinator sits at 4-6 GB,
+  // and "5734MB" is a number the operator has to divide before it means anything.
+  ram: (n) => {
+    if (n === null || n === undefined) return "–";
+    if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
+    if (n < 1073741824) return (n / 1048576).toFixed(0) + " MB";
+    return (n / 1073741824).toFixed(2) + " GB";
+  },
   num: (n) => (n === null || n === undefined) ? "–" : String(n),
   clock: (epoch) => epoch ? new Date(epoch * 1000).toTimeString().slice(0, 8) : "–",
 };
@@ -419,6 +473,15 @@ function renderFlights(h) {
   }
   el("coord-note").textContent =
     h.n_ready + "/" + h.n_flights + " ready" + (h.status === "partial" ? "  ·  partial" : "");
+  // The whole service's footprint, which is the number that matters against the
+  // host's RAM -- and the only place the front-end's own pid is shown.
+  const fe = h.front_end;
+  if (fe) {
+    const total = flights.reduce((a, f) => a + (f.rss_bytes || 0), 0) + (fe.rss_bytes || 0);
+    el("frontend").textContent =
+      "front-end pid " + fmt.num(fe.pid) + "  ·  " + fmt.ram(fe.rss_bytes) +
+      "  ·  total " + fmt.ram(total);
+  }
   for (const f of flights) renderCoord(f);
 }
 
@@ -445,6 +508,10 @@ function renderCoord(h) {
   const pairs = [
     ["gen", fmt.num(h.generation)], ["spawns", fmt.num(h.spawns)],
     ["attempts", fmt.num(h.restart_attempts)], ["pid", fmt.num(h.pid)],
+    // The coordinator's own RSS, not its process group's: the task's eight fork
+    // workers share these pages copy-on-write, so summing them would report
+    // tens of GB that do not exist (server.py rss_bytes).
+    ["rss", fmt.ram(h.rss_bytes)],
     ["up", fmt.age(h.child_uptime_s)], ["in-flight", fmt.num(h.in_flight)],
     // The backlog on this lane: prepares and pushes waiting on its lock. Sustained
     // depth on one flight while another sits idle means routing, not capacity.
@@ -500,15 +567,52 @@ function renderCoord(h) {
 // ------------------------------------------------------------------- jobs table
 
 let jobs = [];
-// The job every "this job" view follows: the one in flight, or the most recent.
-// Not user-selectable -- see currentJob().
+// The job the detail panel and the per-job log are about: a pinned row if there is
+// one, else whatever currentJob() picks. Only ever read, never assigned, outside
+// renderJobs.
 let current = null;
+// The job_id of a clicked row, or null to follow the newest job. An id rather than
+// a row or an index: rows are rebuilt from scratch every poll, and an index would
+// silently slide onto a different job the moment a new one is created.
+let pinned = null;
+
+// `job_id` null unpins. Clicking the pinned row again also unpins, which is the
+// gesture people try first and saves a trip to the button.
+function pin(job_id) {
+  pinned = (job_id === null || job_id === pinned) ? null : job_id;
+  el("unpin").style.display = pinned ? "" : "none";
+  // Repaint off the data already in hand rather than waiting up to a second for
+  // the next poll, so the click feels like it did something.
+  renderJobs(lastJobs);
+}
+
+el("unpin").onclick = () => pin(null);
+
+// Escape unpins too. Ignored while a number input has focus, where it is the
+// browser's own revert-the-edit key.
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape" || !pinned) return;
+  if (document.activeElement && document.activeElement.tagName === "INPUT") return;
+  pin(null);
+});
+
+// The last /admin/jobs body, kept so a click can re-render without a round-trip.
+let lastJobs = {jobs: [], counts: {}, total: 0, returned: 0};
 
 function renderJobs(d) {
+  lastJobs = d;
   jobs = d.jobs;
   const was = current;
-  current = currentJob(d);
-  paint("j-", JOB_STATES, current ? current.state : null);
+  // A pin wins, but only while that job is still in the page: `limit` is finite and
+  // the history grows, so a pinned job eventually falls off the end -- at which
+  // point following the newest again is better than an empty panel.
+  const held = pinned ? jobs.find((x) => x.job_id === pinned) : null;
+  if (pinned && !held) {
+    pinned = null;
+    el("unpin").style.display = "none";
+  }
+  current = held || currentJob(d);
+  renderJobLanes(d);
 
   const note = [d.total + " total"];
   // The per-state tallies, which used to sit inside the diagram's nodes. They belong
@@ -518,14 +622,6 @@ function renderJobs(d) {
   }
   if (d.returned < d.total) note.push("showing newest " + d.returned);
   el("jobs-note").textContent = note.join("  ·  ");
-  // The diagram's subtitle names the job it is about, and whether that job is still
-  // running or is simply the last one to have finished.
-  el("job-note").textContent = current
-    ? short(current.job_id) + "  " + current.state + "  " +
-      ((d.active_job_ids || []).includes(current.job_id)
-        ? "in flight " + fmt.secs(current.age_s)
-        : "(most recent, " + fmt.age(current.age_s) + " ago)")
-    : "no jobs yet";
 
   // The per-job log follows the current job, so it has to reload when that changes.
   if (logMode === "job" && current && (!was || was.job_id !== current.job_id)) {
@@ -537,16 +633,29 @@ function renderJobs(d) {
   body.textContent = "";
   for (const j of jobs) {
     const tr = put(body, "tr");
-    if (current && j.job_id === current.job_id) tr.className = "sel";
+    // Pinned beats followed, so a click on the row the panel was already following
+    // reads as pinned rather than looking like nothing happened.
+    if (j.job_id === pinned) tr.className = "pin";
+    else if (current && j.job_id === current.job_id) tr.className = "sel";
+    // On the row, not on each cell: the two links inside the results cell call
+    // stopPropagation, so opening a result does not also pin its row.
+    tr.onclick = () => pin(j.job_id);
+    tr.title = "click for this job's detail; click again to follow the newest";
     const t = j.push_timings || {};
     const s = j.summary || {};
+    const q = j.quantum || {};
     put(tr, "td", short(j.job_id));
+    put(tr, "td", fmt.num(j.flight), "num");
+    // The id an operator actually has in hand -- it is what they passed to
+    // donutClient --visit -- and the only column here that is not about the
+    // service's own bookkeeping. Absent until the push builds the quantum, so a
+    // PREPARED row legitimately has none.
+    put(tr, "td", fmt.num(q.visit), "num");
     put(tr, "td", j.state, "s-" + j.state);
     put(tr, "td", fmt.clock(j.created_wall));
     put(tr, "td", fmt.age(j.age_s), "num");
     put(tr, "td", fmt.secs(t.run_quantum_s), "num");
     put(tr, "td", fmt.secs(t.coordinator_total_s), "num");
-    put(tr, "td", fmt.bytes(t.blob_bytes), "num");
     put(tr, "td", fmt.num(s.n_rows), "num");
     put(tr, "td", fmt.num(s.n_detectors), "num");
     put(tr, "td", s.n_groups === undefined ? "–" : s.n_groups_succeeded + "/" + s.n_groups, "num");
@@ -596,6 +705,66 @@ function currentJob(d) {
   return jobs.find((x) => ids.has(x.job_id)) || jobs[0] || null;
 }
 
+// One job diagram per flight, built from #job-tpl. Same clone-and-prefix scheme as
+// flightPanel, and the same reason for caching: the ids are what paint() addresses.
+const jobPanels = new Map();
+
+function jobPanel(index) {
+  let panel = jobPanels.get(index);
+  if (panel) return panel;
+
+  const frag = el("job-tpl").content.cloneNode(true);
+  const prefix = "j" + index + "-";
+  for (const node of frag.querySelectorAll("[id]")) node.id = prefix + node.id;
+  const parts = {prefix};
+  for (const node of frag.querySelectorAll("[data-el]")) parts[node.dataset.el] = node;
+  el("jobs-per-flight").appendChild(frag);
+  jobPanels.set(index, parts);
+  return parts;
+}
+
+// The job each lane's diagram is about: whatever that lane has in flight, else the
+// last job it ran, so an idle lane shows its last outcome rather than going blank.
+// Rows arrive newest-first from /admin/jobs, so the first match is the newest one.
+function renderJobLanes(d) {
+  // Driven by /health's flight count rather than by the jobs: a lane that has
+  // never run anything still gets a panel, in its own fixed column.
+  const n = (health && health.n_flights) || 1;
+  if (jobPanels.size !== n) {
+    el("jobs-per-flight").textContent = "";
+    jobPanels.clear();
+  }
+  const active = new Set(d.active_job_ids || []);
+  let shown = 0;
+  for (let i = 0; i < n; i++) {
+    const parts = jobPanel(i);
+    const mine = jobs.filter((x) => x.flight === i);
+    const job = mine.find((x) => active.has(x.job_id)) || mine[0] || null;
+    paint(parts.prefix + "j-", JOB_STATES, job ? job.state : null);
+    parts.title.textContent = "flight " + i;
+    const note = parts.note;
+    note.textContent = "";
+    if (!job) {
+      note.textContent = "no jobs on this flight";
+      continue;
+    }
+    shown++;
+    put(note, "b", short(job.job_id));
+    note.appendChild(document.createTextNode("  " + job.state + "  " +
+      (active.has(job.job_id)
+        ? "in flight " + fmt.secs(job.age_s)
+        : "(last, " + fmt.age(job.age_s) + " ago)")));
+  }
+  // Only the jobs the front-end can still attribute to a lane are drawn above, so
+  // say when the newest rows are not among them rather than letting the panels
+  // look like the whole story.
+  const unrouted = jobs.filter((x) => x.flight === null || x.flight === undefined).length;
+  el("job-note").textContent = shown === 0 && !unrouted
+    ? "no jobs yet"
+    : (unrouted ? unrouted + " job" + (unrouted === 1 ? "" : "s") +
+                  " with no routing on record (front-end restarted)" : "");
+}
+
 const PHASES = [
   ["receive_s", "recv", "#4a86c7"], ["layout_s", "layout", "#5b7fa8"],
   ["decode_s", "decode", "#4ba36b"], ["butler_put_s", "put", "#5f9e78"],
@@ -607,12 +776,21 @@ function renderDetail() {
   const d = el("detail");
   d.textContent = "";
   const j = current;
-  if (!j) return;
+  if (!j) {
+    put(d, "div", "no jobs yet — this panel follows the newest one", "row");
+    return;
+  }
 
   const head = put(d, "div", "", "row");
   put(head, "b", j.job_id);
-  head.appendChild(document.createTextNode("  " + j.state + "  ·  created " +
-    fmt.clock(j.created_wall) + "  ·  " + fmt.age(j.age_s) + " ago"));
+  head.appendChild(document.createTextNode("  " + j.state +
+    (j.flight === null || j.flight === undefined ? "" : "  ·  flight " + j.flight) +
+    "  ·  created " + fmt.clock(j.created_wall) + "  ·  " + fmt.age(j.age_s) + " ago"));
+  // Which mode this panel is in. Without it a pinned panel on a quiet service is
+  // indistinguishable from an unpinned one, and the operator has no way to tell
+  // that it has stopped advancing.
+  put(head, "span", pinned ? "   pinned" : "   following newest",
+      pinned ? "chip on" : "chip");
 
   if (j.error) put(d, "div", j.error, "err");
 

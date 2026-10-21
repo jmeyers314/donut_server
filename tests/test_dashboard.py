@@ -180,6 +180,100 @@ def test_admin_jobs_is_newest_first_and_capped(monkeypatch):
     assert client.get("/admin/jobs?limit=0", headers=auth()).json()["limit"] == 1
 
 
+def test_admin_jobs_carries_the_quantum_detail_the_table_and_panel_render(monkeypatch):
+    """`visit` is a table column and the rest is the detail panel's content, so the
+    whole quantum dict has to survive into the row rather than being summarized.
+
+    A PREPARED job has no quantum at all -- it is built during the push -- and that
+    is a dash in the column, not a missing key the page would throw on.
+    """
+    done = JobRecord(job_id="done", state=JobState.DONE)
+    done.result = {
+        "summary": {"n_rows": 63},
+        "quantum": {"visit": 2026071300478, "exposure": 2026071300478,
+                    "band": "r", "physical_filter": "r_57", "group": "2026-07-13T00478",
+                    "n_raws": 8, "n_refcat_shards": 160, "n_input_datasets": 208},
+    }
+    jobs = {"done": done, "early": JobRecord(job_id="early", state=JobState.PREPARED)}
+    client = make_client(monkeypatch, jobs)
+
+    rows = {r["job_id"]: r for r in client.get("/admin/jobs", headers=auth()).json()["jobs"]}
+
+    assert rows["done"]["quantum"]["visit"] == 2026071300478
+    # The fields the detail panel lists, none of which are anywhere else in a row.
+    assert {"group", "n_raws", "n_refcat_shards", "n_input_datasets"} <= set(
+        rows["done"]["quantum"]
+    )
+    # The visit id is a 13-digit int, which is well inside JS's exact-integer range
+    # (2**53) -- unlike donut_id, which /admin/result stringifies for that reason.
+    assert rows["done"]["quantum"]["visit"] < 2**53
+    assert rows["early"]["quantum"] is None
+
+
+def test_rss_is_measured_for_a_live_pid_and_absent_otherwise(monkeypatch):
+    """The dashboard's RAM readout, and the three ways it legitimately has no number.
+
+    A nonexistent pid is not hypothetical: /health reads coord.child_pid and calls
+    this, so a child reaped between those two lines lands here, and that must be a
+    dash on the page rather than a 500 on the endpoint.
+    """
+    import os
+
+    mine = server.rss_bytes(os.getpid())
+    # This interpreter has imported fastapi and pyarrow, so anything under a few MB
+    # means the pages-to-bytes conversion was dropped.
+    assert mine is not None and mine > 4 * 1024 * 1024
+
+    assert server.rss_bytes(None) is None
+    # A pid no process can have: Linux caps pid_max at 2**22.
+    assert server.rss_bytes(2**30) is None
+
+
+def test_health_reports_the_front_end_pid_and_every_flights_rss(monkeypatch):
+    """The front-end's pid is the one an operator signals, and it is nowhere else in
+    the API -- /health's flights all carry *child* pids. The RSS fields are what make
+    the two numbers comparable: a front-end climbing alongside its flights is a
+    retention leak in the job history, not a coordinator problem."""
+    import os
+
+    client = make_client(monkeypatch)
+    live, dead = FakeCoord(), FakeCoord()
+    # This process stands in for a coordinator child, so one flight has a real
+    # measurement; the other's pid is one Linux can never issue (pid_max caps at
+    # 2**22), which is the reaped-child case.
+    live.child_pid = os.getpid()
+    dead.child_pid = 2**30
+    patch_pool(monkeypatch, live, dead)
+
+    body = client.get("/health", headers=auth()).json()
+
+    assert body["front_end"]["pid"] == os.getpid()
+    assert body["front_end"]["rss_bytes"] > 0
+    # Present on every flight either way, which is what the dashboard reads.
+    assert body["flights"][0]["rss_bytes"] > 0
+    assert body["flights"][1]["rss_bytes"] is None
+
+
+def test_admin_jobs_names_the_flight_that_ran_each_job(monkeypatch):
+    """The dashboard groups both its per-lane panels by this, and nothing else in the
+    API exposes the routing table. A job with no route reports null rather than
+    inventing one: unlike for_push, a read by the dashboard must not decide where a
+    later push goes."""
+    jobs = {
+        "routed": JobRecord(job_id="routed", state=JobState.COMPUTING),
+        "orphan": JobRecord(job_id="orphan", state=JobState.DONE),
+    }
+    client = make_client(monkeypatch, jobs)
+    pool = patch_pool(monkeypatch, FakeCoord(), FakeCoord())
+    pool._by_job["routed"] = 1
+
+    rows = {row["job_id"]: row["flight"] for row in
+            client.get("/admin/jobs", headers=auth()).json()["jobs"]}
+    assert rows == {"routed": 1, "orphan": None}
+    # And the read left the routing table alone.
+    assert pool._by_job == {"routed": 1}
+
+
 def test_admin_jobs_reports_the_job_in_flight(monkeypatch):
     """active_job_ids drives which node the job diagram highlights, and it must skip
     the terminal states rather than just taking the newest rows."""

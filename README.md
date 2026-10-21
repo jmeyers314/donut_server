@@ -232,7 +232,7 @@ produces the key — but a hit then reads no pixels.
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 185 tests; the butler-backend 14
+python -m pytest tests/ -q                      # 189 tests; the butler-backend 14
                                                 # skip unless DONUT_SERVER_BUTLER_REPO is set,
                                                 # and the RUN-fallback one also needs a repo
                                                 # whose chain includes the producer runs
@@ -253,6 +253,23 @@ The dashboard is at <http://127.0.0.1:8000/dashboard> and needs no credential: t
 loopback callers and serves the page to nobody else, so reaching it from another machine means an
 `ssh -L 8000:localhost:8000` tunnel. `DONUT_SERVER_TOKEN` is still what protects `/prepare` and
 `/push` from the network, so a producer on a *different* host does need `--token`.
+
+It lays the flights out side by side, with one job state machine per flight, since with
+`--num-flights 2` two jobs are in flight at once. `rss` on each flight is that coordinator's own
+resident size (4–6 GB in steady state), *not* its process group's: the task's eight cutout workers
+share those pages copy-on-write, so summing the group would report tens of GB that do not exist. The
+header carries the front-end's own pid — the one to signal — its RSS, and the total. A flight reading
+`degraded` has given up relaunching its coordinator: it holds no child and serves no job until
+`POST /admin/restart?flight=N`, either because bring-up failed `MAX_RESTART_ATTEMPTS` times running
+or because the child reported a config error retrying cannot fix. The other flights keep serving,
+which is the `partial` in `/health`.
+
+The job table's rows are clickable: a click **pins** that job, and the detail panel below — phase
+bar, prepare timings, summary, and the quantum (`visit`, `group`, `n_raws`, `n_refcat_shards`,
+`n_input_datasets`) — follows the pinned job instead of the newest one. Click the same row again,
+press Escape, or use the *unpin* button to go back to following. The pin never touches the per-flight
+state machines, which always show live state, and it releases itself if the pinned job falls off the
+end of `limit`.
 
 Acceptance criteria for the r_57 exposure — a packaging or refactoring change touches no compute
 path, so any movement here means import order or thread clamping regressed:
