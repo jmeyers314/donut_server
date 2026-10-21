@@ -97,7 +97,7 @@ from lsst.daf.butler import (
     Quantum,
     Timespan,
 )
-from lsst.daf.butler.formatters.parquet import astropy_to_arrow
+from lsst.daf.butler.formatters.parquet import arrow_to_astropy, astropy_to_arrow
 from lsst.pipe.base import QuantumContext
 from lsst.pipe.base._quantumContext import ExecutionResources
 from lsst.pipe.base.configOverrides import ConfigOverrides
@@ -106,6 +106,7 @@ from lsst.ts.wep.blitz.donutBlitzCorner import (
     DonutBlitzCornerConfig,
     DonutBlitzCornerTask,
 )
+from lsst.ts.wep.blitz.donutBlitzPlot import DonutBlitzPlotConfig, DonutBlitzPlotTask
 
 _log = logging.getLogger(__name__)
 
@@ -396,13 +397,17 @@ class CalibConfigError(RuntimeError):
 
 
 class QuantumBundle(NamedTuple):
-    """Everything runQuantum needs, plus the handles to read its output back."""
+    """Everything runQuantum needs, plus the handles to read its outputs back."""
 
     butler_qc: Any
     input_refs: Any
     output_refs: Any
     butler: Any
-    output_ref: Any
+    # One ref per OUTPUT_NAMES entry, keyed by connection name. A dict rather than
+    # the former single `output_ref`, since the selection tables are read back the
+    # same way `cornerResults` is -- and a caller that wants only the one asks for
+    # it by name instead of relying on position.
+    output_refs_by_name: dict
     timings: dict
 
 
@@ -466,7 +471,17 @@ def apply_overrides(config, spec: list[dict] | None) -> None:
 WIRED_INPUTS = frozenset(
     {"raws", "ptc", "linearizer", "crosstalk", "flat", "intrinsicZernikes", "refCat"}
 )
-WIRED_OUTPUTS = frozenset({"cornerResults"})
+# `detectorImages` and `selectionOverlays` are here because the focal-plane
+# selection plot needs them, and the plot flights draw it from disk -- see
+# PLOT_TABLES and plot_flight_main. They share `cornerResults`' (instrument, visit)
+# data id, so wiring them is one more ref each.
+WIRED_OUTPUTS = frozenset({"cornerResults", "detectorImages", "selectionOverlays"})
+
+# The visit-dimensioned outputs build_quantum_context builds refs for, in the
+# order the plot task's `run` takes them. `cornerResults` leads because it is the
+# one a client waits for; the other two exist only for the selection plot and are
+# written by the deferred step.
+OUTPUT_NAMES = ("cornerResults", "detectorImages", "selectionOverlays")
 
 
 def _check_connections(config) -> None:
@@ -540,6 +555,14 @@ def build_task(spec: list[dict] | None) -> tuple[Any, str]:
     No explicit config.validate() -- Task.__init__ already calls it.
     """
     config = DonutBlitzCornerConfig()
+    # Before apply_overrides, not after: this is a change of *default*, so
+    # `-c doSelectionOutput=False` still wins. The service needs these two tables
+    # for the focal-plane selection plot, and upstream defaults them off because
+    # persisting them to a real butler costs ~17 MB a visit. Here "persisting"
+    # means a dict insert into the in-memory butler, and the task builds the
+    # payload either way (see the field's own docstring), so the only real cost
+    # is the deferred parquet -- which is what the plot flights read.
+    config.doSelectionOutput = True
     apply_overrides(config, spec)
     _check_connections(config)
     _check_timeouts(config)
@@ -869,7 +892,16 @@ def write_stamp_table(job_id: str, table) -> str:
     """
     # No makedirs here: _build_entry already created the directory, and a push
     # cannot reach this without a prepare having succeeded first.
-    final = os.path.join(stamp_dir(), f"{job_id}.parquet")
+    return _write_parquet(os.path.join(stamp_dir(), f"{job_id}.parquet"), table)
+
+
+def _write_parquet(final: str, table) -> str:
+    """Serialize `table` to `final` atomically. Returns the path.
+
+    The tmp-plus-replace half of write_stamp_table, factored out because the
+    selection tables are written on the same terms and the atomicity is the whole
+    contract -- see write_stamp_table on why existence must mean completeness.
+    """
     tmp = f"{final}.tmp"
     payload = to_parquet(table)
     with open(tmp, "wb") as f:
@@ -878,6 +910,55 @@ def write_stamp_table(job_id: str, table) -> str:
         os.fsync(f.fileno())
     os.replace(tmp, final)
     return final
+
+
+# The deferred selection tables, as {connection name: filename suffix}. Separate
+# files rather than one, because DonutBlitzPlotTask.run takes them as two
+# independent optional arguments and either can legitimately be missing.
+PLOT_TABLES = {
+    "detectorImages": "detector_images",
+    "selectionOverlays": "selection_overlays",
+}
+
+
+def plotting_enabled() -> bool:
+    """Whether anything will ever read the deferred selection tables.
+
+    These exist solely for the focal-plane plot, and `detectorImages` is the
+    largest file this service writes -- 34.7 MB a job, measured, against 18.4 MB
+    for the stamps. Writing it under `--num-plot-flights 0` would be ~4 GB/hour of
+    pure waste, so the same variable the front-end sizes its pool from is read
+    here to skip it.
+
+    Read per call rather than at import for the same reason as the data
+    directories: no import-time environment capture. Unparseable or absent means
+    enabled, matching server.num_plot_flights' own default of 1.
+    """
+    try:
+        return int(os.environ.get("DONUT_SERVER_NUM_PLOT_FLIGHTS", "1")) > 0
+    except ValueError:
+        return True
+
+
+def selection_path(job_id: str, kind: str, directory: str | None = None) -> str:
+    """Where one deferred selection table for `job_id` lives.
+
+    `kind` is a PLOT_TABLES value. `directory` defaults to stamp_dir(); the plot
+    flight passes it explicitly so a single resolve serves a whole job.
+    """
+    return os.path.join(directory or stamp_dir(), f"{job_id}.{kind}.parquet")
+
+
+def plot_dir(job_id: str, directory: str | None = None) -> str:
+    """Where `job_id`'s rendered PNGs live.
+
+    One directory per job rather than a flat tree with composite filenames: a job
+    has six files, and `rm -rf` of one job's plots should not need a glob. The
+    front-end computes this same path from the environment -- see
+    server._plot_path, and the rule there that the variable, not this function,
+    is the shared contract.
+    """
+    return os.path.join(directory or stamp_dir(), "plots", job_id)
 
 
 @dataclass
@@ -1412,10 +1493,14 @@ def build_quantum_context(
     universe, task = require_task()
     conns = task.config.connections.ConnectionsClass(config=task.config)
     input_names = list(conns.inputs) + list(conns.prerequisiteInputs)
-    out_name = "cornerResults"
+    # Whichever of OUTPUT_NAMES this config actually declares. The connections
+    # class `del`s detectorImages/selectionOverlays when doSelectionOutput is
+    # False (donutBlitzCorner.py), so a `-c doSelectionOutput=False` run wires
+    # cornerResults alone and simply produces no selection plot.
+    out_names = [name for name in OUTPUT_NAMES if hasattr(conns, name)]
 
     dtypes = {}
-    for name in input_names + [out_name]:
+    for name in input_names + out_names:
         conn = getattr(conns, name)
         dtypes[name] = DatasetType(
             conn.name,
@@ -1503,11 +1588,16 @@ def build_quantum_context(
             refs[name].append(ref)
             payload[ref] = obj
 
+    # All three visit-dimensioned outputs share one data id -- they are three
+    # views of the same visit -- so it is standardized once against the first of
+    # them and reused.
     visit_did = data_id(
-        out_name, instrument=INSTRUMENT, visit=exposure_id, day_obs=day_obs,
+        out_names[0], instrument=INSTRUMENT, visit=exposure_id, day_obs=day_obs,
         physical_filter=physical_filter, band=band,
     )
-    out_ref = DatasetRef(dtypes[out_name], visit_did, run=RUN)
+    out_refs = {
+        name: DatasetRef(dtypes[name], visit_did, run=RUN) for name in out_names
+    }
 
     # put() is a bare dict insert, so this is ~1 ms for the whole input set and
     # shares the CalibSet objects rather than copying them. The deep copy lands
@@ -1528,7 +1618,7 @@ def build_quantum_context(
         # is empty: omitting one makes buildDatasetRefs raise KeyError on its
         # dataset type name.
         inputs={dtypes[name]: refs[name] for name in input_names},
-        outputs={dtypes[out_name]: [out_ref]},
+        outputs={dtypes[name]: [out_refs[name]] for name in out_names},
     )
     input_refs, output_refs = conns.buildDatasetRefs(quantum)
     refs_s = time.perf_counter() - t0
@@ -1556,7 +1646,7 @@ def build_quantum_context(
         input_refs=input_refs,
         output_refs=output_refs,
         butler=butler,
-        output_ref=out_ref,
+        output_refs_by_name=out_refs,
         timings=timings,
     )
 
@@ -1635,11 +1725,30 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     run_quantum_s = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    full_table = bundle.butler.get(bundle.output_ref)
+    full_table = bundle.butler.get(bundle.output_refs_by_name["cornerResults"])
     keep = [name for name in full_table.colnames if name not in IMAGE_COLUMNS]
     table = full_table[keep]
     parquet_bytes = to_parquet(table)
     serialize_s = time.perf_counter() - t0
+
+    # The focal-plane selection plot's two inputs, read back the same way. Absent
+    # when a `-c doSelectionOutput=False` run left those connections unwired, in
+    # which case the plot flight draws the other two plots and skips this one --
+    # which is exactly what DonutBlitzPlotTask.run does with them as None.
+    #
+    # Also skipped when no plot flight will ever read them. Gated *here* and not
+    # only at the write, because the get() is what materializes ~35 MB and
+    # _DEFERRED would then hold it for the whole inter-visit gap before
+    # discarding it unwritten -- retaining exactly what the gate exists to avoid.
+    selection = (
+        {
+            name: bundle.butler.get(ref)
+            for name, ref in bundle.output_refs_by_name.items()
+            if name != "cornerResults"
+        }
+        if plotting_enabled()
+        else {}
+    )
 
     # Summarize the slimmed table, so `columns` describes exactly what the
     # client receives.
@@ -1655,13 +1764,14 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     # on; everything it is needed for can wait ~20 s for the next exposure.
     _DEFERRED["job_id"] = job_id
     _DEFERRED["table"] = full_table
+    _DEFERRED["selection"] = selection
 
     # Reclaim this job's cycles now rather than whenever the automatic collector
     # next fires: the ~900 MB of exposures should be gone well before the next
     # exposure arrives (~30 s cadence). full_table is deliberately not among them
     # -- dropping the local name leaves _DEFERRED's ~21 MB reference, which is the
     # point -- but the exposures and the butler holding them still go now.
-    del bundle, full_table, table, exposures
+    del bundle, full_table, table, exposures, selection
     t0 = time.perf_counter()
     collected = gc.collect()
     gc_s = time.perf_counter() - t0
@@ -1801,6 +1911,7 @@ def _run_deferred() -> None:
     """
     table = _DEFERRED.pop("table", None)
     job_id = _DEFERRED.pop("job_id", None)
+    selection = _DEFERRED.pop("selection", None) or {}
     if table is None:
         return
     try:
@@ -1813,11 +1924,241 @@ def _run_deferred() -> None:
     except Exception:
         # exc_info, because this is the only record that will ever exist of it.
         _log.exception("job %s: deferred image write failed", job_id)
-    finally:
-        # Explicit, so the ~21 MB goes now rather than on the next job's dict
-        # assignment -- which would otherwise hold two tables at once.
-        del table
-        _DEFERRED.clear()
+
+    # A separate try, so a failed stamp write does not cost the selection tables
+    # or vice versa: they feed different consumers (a client's --images against
+    # the focal-plane plot) and neither is worth the other.
+    #
+    # `selection` is already empty when plotting is off -- run_job never fetches
+    # the tables -- so this loop simply finds nothing rather than needing its own
+    # gate. That is the difference between ~75 MB and ~29 MB a job.
+    for name, kind in PLOT_TABLES.items():
+        subtable = selection.get(name)
+        if subtable is None:
+            continue
+        try:
+            t0 = time.perf_counter()
+            path = _write_parquet(selection_path(job_id, kind), subtable)
+            _log.info(
+                "job %s: wrote %s (%.1f MB) in %.3fs",
+                job_id, path, os.path.getsize(path) / 1e6, time.perf_counter() - t0,
+            )
+        except Exception:
+            _log.exception("job %s: deferred %s write failed", job_id, kind)
+
+    # Explicit, so the ~38 MB goes now rather than on the next job's dict
+    # assignment -- which would otherwise hold two jobs' tables at once.
+    del table, selection
+    _DEFERRED.clear()
+
+
+# ------------------------------------------------------------------ plot flights
+
+# The three figures DonutBlitzPlotTask.run returns, as {Struct attribute: our
+# file stem}. The stems are the names the HTTP routes expose, so they are also
+# the whitelist the front-end validates a requested name against -- see
+# server.PLOT_NAMES, which must stay in step with this.
+PLOT_FIGURES = {
+    "donutDiagPlot": "donut",
+    "wfDiagPlot": "wavefront",
+    "selectionDiagPlot": "selection",
+}
+
+# Long edge of the thumbnail, in pixels. The full-res figures are 10-20 Mpx at
+# the task's own dpi=200-300, which is 3.5-7.2 MB each (measured) -- far too much
+# for three inline <img>s on a page an operator opens casually. 1200 is wide
+# enough to read the layout and pick the plot you actually want.
+#
+# Note the thumbnails are not the cheap half: savefig re-rasterizes every artist
+# at each dpi, so the six writes measured ~10 s against ~5 s to build the figures.
+# Halving THUMB_PX would barely help; dropping thumbnails entirely is what would,
+# at the cost of making the results page fetch ~18 MB to show three images.
+THUMB_PX = 1200
+
+# How long render_plots waits for the coordinator's deferred tables to appear.
+#
+# Not a guess at a filesystem: it closes a real race. The front-end enqueues a
+# job the moment the push reply lands, and the coordinator writes these tables
+# *after* that reply -- so a free plot flight can arrive first. The write itself
+# is ~0.5 s for both tables, but it queues behind nothing and starts immediately,
+# so anything beyond a couple of seconds means it failed rather than that it is
+# slow. Generous regardless, because waiting costs only this flight's own time.
+TABLE_WAIT_S = 30.0
+
+
+def _await_table(path: str, timeout: float = TABLE_WAIT_S) -> bool:
+    """Wait for `path` to exist. True if it appeared, False on timeout.
+
+    Polled rather than watched: inotify would need a Linux-only dependency to
+    save a handful of 50 ms sleeps on a path that is almost always already there.
+    Existence is sufficient because every writer here is tmp-plus-replace, so a
+    visible path is a complete file (see write_stamp_table).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if os.path.exists(path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _figure_dpi_for_width(fig, px: int) -> float:
+    """The dpi that renders `fig` `px` wide. Width, not height: all three plots
+    are wider than they are tall, or square."""
+    width_in = fig.get_size_inches()[0]
+    return max(1.0, px / width_in)
+
+
+def render_plots(job_id: str, directory: str | None = None) -> dict:
+    """Draw `job_id`'s diagnostic figures from its deferred tables on disk.
+
+    The whole point of the plot flights: ~17 s of matplotlib that must not happen
+    anywhere near the push path. Reads the tables back rather than receiving them
+    over a Pipe, because the coordinator has already written them for its own
+    reasons and a backlog of job ids therefore costs no memory.
+
+    A missing stamp table is an error -- the caller asked for a job whose results
+    were never written, or were deleted. A missing *selection* table is not: it is
+    what a `-c doSelectionOutput=False` run leaves behind, and `run` takes those
+    two as optional precisely so the other two plots still draw.
+
+    Returns a digest for the log and the reply: which figures were written, and
+    what each cost.
+    """
+    directory = directory or stamp_dir()
+    stamps = os.path.join(directory, f"{job_id}.parquet")
+    t0 = time.perf_counter()
+    if not _await_table(stamps):
+        raise FileNotFoundError(
+            f"no result table for job {job_id} at {stamps} after "
+            f"{TABLE_WAIT_S:.0f}s; it was never written or has been deleted, and "
+            "the plots cannot be drawn without it"
+        )
+
+    catalog = arrow_to_astropy(pyarrow.parquet.read_table(stamps))
+    # Waited for too, but not required: both tables are written in the same
+    # deferred step as the stamps, so by the time that one exists these either
+    # exist or were never going to (a `-c doSelectionOutput=False` run). The wait
+    # is therefore short -- it only has to cover the gap between the three
+    # writes, not the gap since the push.
+    optional = {}
+    for name, kind in PLOT_TABLES.items():
+        path = selection_path(job_id, kind, directory)
+        found = _await_table(path, timeout=1.0)
+        optional[name] = (
+            arrow_to_astropy(pyarrow.parquet.read_table(path)) if found else None
+        )
+    read_s = time.perf_counter() - t0
+
+    # A bare task, not the corner task's `plot` subtask: this process never builds
+    # a DonutBlitzCornerTask, and the plot task's config carries nothing the
+    # corner config would have set. Rebuilt per job rather than held, since it is
+    # cheap next to 17 s of drawing and keeps this function stateless.
+    task = DonutBlitzPlotTask(config=DonutBlitzPlotConfig())
+
+    t0 = time.perf_counter()
+    plots = task.run(
+        catalog,
+        detector_images=optional["detectorImages"],
+        selection_overlays=optional["selectionOverlays"],
+    )
+    draw_s = time.perf_counter() - t0
+
+    target = plot_dir(job_id, directory)
+    os.makedirs(target, exist_ok=True)
+
+    t0 = time.perf_counter()
+    written = {}
+    for attr, stem in PLOT_FIGURES.items():
+        figure = getattr(plots, attr, None)
+        # None where that plot had nothing to draw -- an ordinary outcome per
+        # putPlots, not a failure. The manifest simply reports it absent.
+        if figure is None:
+            continue
+        sizes = {}
+        for suffix, dpi in (
+            ("full", None),
+            ("thumb", _figure_dpi_for_width(figure, THUMB_PX)),
+        ):
+            path = os.path.join(target, f"{stem}.{suffix}.png")
+            tmp = f"{path}.tmp"
+            # dpi=None means "the figure's own", which is the task's deliberate
+            # 200 or 300 -- savefig's default would silently override it.
+            figure.savefig(tmp, format="png", dpi=dpi or figure.get_dpi())
+            os.replace(tmp, path)
+            sizes[suffix] = os.path.getsize(path)
+        written[stem] = sizes
+    write_s = time.perf_counter() - t0
+
+    _log.info(
+        "job %s: drew %d plot(s) %s -- read %.3fs draw %.3fs write %.3fs",
+        job_id, len(written), ",".join(sorted(written)), read_s, draw_s, write_s,
+    )
+    return {
+        "job_id": job_id,
+        "written": written,
+        "skipped": sorted(set(PLOT_FIGURES.values()) - set(written)),
+        "timings": {"read_s": read_s, "draw_s": draw_s, "write_s": write_s},
+    }
+
+
+def plot_flight_main(conn) -> None:
+    """Serial command loop for a plot flight. Sibling of `coordinator_main`.
+
+    Deliberately a separate process family rather than more work in the
+    coordinator: drawing measured ~17 s, and `_run_deferred` runs inside the
+    coordinator's serial loop, which does not return to `recv()` until it
+    finishes -- so doing this there would delay the *next* visit's prepare by 17 s.
+
+    Takes no shared-memory name: raw pixels never come here. The tables it needs
+    are already on disk, which is also what lets the front-end's queue hold job
+    ids instead of payloads.
+
+    Unlike the coordinator this has no `prepare`, no calib or refcat caches, and
+    no task to prime -- so there is no fatal-config handshake either. The hello is
+    sent as soon as the imports are done, which is the only startup cost it has.
+    """
+    # Same reason as the coordinator: matplotlib does not fork, but a wedged plot
+    # flight must still be reapable as a group, and server._signal_child tries
+    # killpg first for every child it owns.
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
+
+    assert threading.active_count() == 1, "plot flight must be single-threaded at fork time"
+    _assert_single_threaded_blas()
+
+    conn.send({"ok": True, "event": "hello", "pid": os.getpid()})
+
+    # After the hello, for the same reason as the coordinator: a startup failure
+    # above belongs on the inherited stderr, not in a file nobody is tailing yet.
+    log_path = configure_logging()
+    _log.info("plot flight ready, pid %d, logging to %s", os.getpid(), log_path)
+
+    while True:
+        try:
+            command = conn.recv()
+        except EOFError:
+            break
+
+        cmd = command.get("cmd")
+        if cmd == "shutdown":
+            conn.send({"ok": True})
+            break
+        elif cmd == "plot":
+            job_id = command.get("job_id")
+            try:
+                conn.send({"ok": True, "result": render_plots(job_id)})
+            except Exception as exc:
+                # Reported, never raised: a figure that cannot be drawn must not
+                # cost the flight its process, since the next job is very likely
+                # fine and the front-end has nothing better to do than respawn.
+                _log.exception("job %s: plotting failed", job_id)
+                conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        else:
+            conn.send({"ok": False, "error": f"unknown cmd {cmd!r}"})
 
 
 def coordinator_main(conn, shm_name: str) -> None:

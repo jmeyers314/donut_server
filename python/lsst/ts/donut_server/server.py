@@ -17,11 +17,13 @@ import itertools
 import math
 import multiprocessing as mp
 import os
+import re
 import signal
 import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -30,7 +32,7 @@ from multiprocessing import shared_memory
 from multiprocessing.connection import wait as mp_wait
 from typing import Any, Callable, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
 from lsst.ts.donut_server import logtail
@@ -158,6 +160,24 @@ def _stamp_path(job_id: str) -> Optional[str]:
     if not directory:
         return None
     return os.path.join(directory, f"{job_id}.parquet")
+
+
+def _plot_path(job_id: str, name: str, size: str) -> Optional[str]:
+    """Where one rendered PNG would be, or None when the output dir is unset.
+
+    Mirrors coordinator.plot_dir, and reads the environment directly for the same
+    reason _stamp_path does: the shared contract is the variable, not the
+    function, because importing coordinator would pull 778 MB of LSST stack into
+    this process.
+
+    `name` and `size` are **not** sanitized here -- every caller must have already
+    checked them against PLOT_NAMES/PLOT_SIZES, which is what keeps a URL segment
+    from reaching the filesystem as a path.
+    """
+    directory = os.environ.get("DONUT_SERVER_STAMP_DIR")
+    if not directory:
+        return None
+    return os.path.join(directory, "plots", job_id, f"{name}.{size}.png")
 
 
 @dataclass
@@ -478,8 +498,12 @@ class Coord:
         # Spawn, never fork: this process is async/threaded.
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = mp.Pipe()
+        # The block's name is passed only when there is one. A plot flight has no
+        # shared block -- raw pixels never reach it -- so its target takes the
+        # connection alone; see PlotFlight.
+        block = () if self._shm is None else (self._shm.name,)
         self._proc = ctx.Process(
-            target=target, args=(child_conn, self._shm.name) + self._target_args
+            target=target, args=(child_conn,) + block + self._target_args
         )
         self._proc.start()
         # Drop the parent's copy of the child end: a socketpair reaches EOF only
@@ -1144,13 +1168,297 @@ def num_flights() -> int:
     return max(1, n)
 
 
+# ------------------------------------------------------------------ plot flights
+
+# The file stems coordinator.PLOT_FIGURES writes, which are also the only names
+# /result/{job_id}/plot/{name} will serve. A whitelist, not a sanitizer: `name`
+# arrives from a URL, and membership here is the single check that keeps it from
+# reaching the filesystem as a path.
+PLOT_NAMES = ("donut", "wavefront", "selection")
+PLOT_SIZES = ("full", "thumb")
+
+# How long a drain loop waits after finding its flight unusable, before taking
+# the same job again. The flight's own bring-up has a backoff; this is the one
+# that keeps _drain from spinning, because _ensure_usable refuses a RESTARTING or
+# DEGRADED flight instantly rather than waiting. Sized against a ~30 s cadence:
+# long enough that a terminally degraded flight costs nothing, short enough that
+# a restart (~19 s) is picked up on the next tick or two.
+PLOT_RETRY_S = 10.0
+
+# How many times one job may be put back because its flight had no usable child,
+# before it is failed instead. Bounded so a job cannot be retried forever: a
+# DEGRADED flight is recoverable only via /admin/restart?pool=plot, and until
+# someone does that the honest report is an error the page can show, not a
+# `queued` the page polls indefinitely. At PLOT_RETRY_S this gives a restart
+# (~19 s) several chances before giving up.
+PLOT_MAX_RETRIES = 6
+
+# How many failure messages PlotQueue remembers. Only read by the manifest, one
+# job at a time, so this is a memory bound and nothing else.
+PLOT_ERROR_CAP = 256
+
+# coordinator.PLOT_TABLES' values. Duplicated rather than imported for the usual
+# reason -- importing coordinator pulls the LSST stack into this process -- and
+# needed here only so the backfill scan can tell a job's result table from the two
+# selection tables sitting beside it under the same prefix.
+_SELECTION_KINDS = ("detector_images", "selection_overlays")
+
+# What this service accepts as a job id in a path segment. Every id it mints is a
+# uuid4, but these arrive from a URL, and one of them is about to be joined onto
+# a filesystem path -- so the shape is checked rather than assumed. Hyphens and
+# hex only: no dots, no separators, so neither ".." nor "/" can survive.
+_JOB_ID_OK = re.compile(r"[0-9a-zA-Z_-]{1,64}")
+
+
+def num_plot_flights() -> int:
+    """How many plot processes to run. Same environment transport as num_flights.
+
+    Defaults to 1: drawing measured ~17 s against a ~30 s per-flight cadence, so
+    one lane keeps up with a single Zernike flight and falls behind two. Raising
+    this trades cores for backlog -- see PlotQueue on why falling behind is
+    tolerated rather than prevented.
+    """
+    try:
+        n = int(os.environ.get("DONUT_SERVER_NUM_PLOT_FLIGHTS", "1"))
+    except ValueError:
+        n = 1
+    return max(0, n)
+
+
+class PlotFlight(Coord):
+    """A `Coord` that runs `plot_flight_main` and owns no shared block.
+
+    Subclassed rather than reimplemented: everything this needs from Coord --
+    spawn, the hello handshake, bounded restart with backoff, the terminal
+    DEGRADED state, killpg reaping, and the /health projection -- is already
+    there and already tested. The two differences are that there is no 513 MB
+    block to create (raw pixels never come here; the tables are on disk) and
+    nothing to re-prime, since a plot flight holds no config.
+    """
+
+    def _resolve_target(self):
+        if self._target is not None:
+            return self._target
+        from lsst.ts.donut_server import coordinator
+
+        self._target = coordinator.plot_flight_main
+        return self._target
+
+    async def start(self) -> None:
+        # Coord.start() creates the shared block first; this deliberately does
+        # not, leaving _shm None -- which is what makes _spawn_child pass the
+        # connection alone, and makes aclose()'s unlink a no-op.
+        self._state = CoordState.STARTING
+        self._startup_task = asyncio.create_task(self._bring_up())
+
+    async def _reprime(self) -> None:
+        """Nothing to replay: a plot flight is stateless between jobs."""
+        return
+
+
+class PlotQueue:
+    """Job ids waiting to be drawn, newest first, and the flights that drain them.
+
+    **LIFO, and uncapped.** Newest-first because a backlog's most recent entry is
+    the one an operator is most likely looking at, so that is what should be drawn
+    when a flight frees up. Uncapped because observing has gaps in which a backlog
+    drains, and dropping work would mean choosing, at enqueue time, which job will
+    never be viewable.
+
+    The consequence is accepted rather than prevented: with one flight at ~17 s a
+    job against a ~15 s arrival rate, continuous observing grows the queue and its
+    *tail* -- the oldest entries -- may never be reached. `depth` is on /health so
+    that saturation is visible rather than silent, and `--num-plot-flights` is the
+    dial. The tail costs nothing but a string: the 38 MB a job needs is already on
+    disk, written by the coordinator for its own reasons.
+
+    Not persisted. The queue dies with the front-end exactly as JOBS does;
+    POST /admin/plots/backfill rebuilds it from what is on disk.
+    """
+
+    def __init__(self, flights: list[PlotFlight]) -> None:
+        self.flights = flights
+        # A list used as a stack, plus a set for O(1) dedupe. Both are needed: a
+        # job already queued must not be enqueued twice by a page poll, and a job
+        # already *drawing* must not be enqueued behind itself either.
+        self._stack: list[str] = []
+        self._queued: set[str] = set()
+        self._drawing: dict[int, str] = {}
+        self._wake = asyncio.Event()
+        self._drains: list[asyncio.Task] = []
+        # Terminal outcomes, for the manifest: a job whose plotting failed should
+        # say so rather than reading as "never asked for".
+        #
+        # Bounded, unlike JOBS, which is paged instead. A front-end whose plot
+        # flight is wedged or whose disk filled would otherwise accumulate one
+        # entry per failure for the life of the process -- small individually,
+        # unbounded in aggregate, and the oldest are the least interesting.
+        # OrderedDict so the eviction is FIFO; see _record_error.
+        self._errors: OrderedDict[str, str] = OrderedDict()
+        # Consecutive "no usable child" retries per job, cleared on any terminal
+        # outcome. Never larger than the number of jobs in flight across the
+        # pool, so it needs no bound of its own.
+        self._retries: dict[str, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._stack)
+
+    @property
+    def drawing(self) -> dict[int, str]:
+        return dict(self._drawing)
+
+    def state_of(self, job_id: str) -> Optional[str]:
+        """Where `job_id` is in this queue, or None if it is not in it at all."""
+        if job_id in self._drawing.values():
+            return "drawing"
+        if job_id in self._queued:
+            return "queued"
+        return None
+
+    def error_of(self, job_id: str) -> Optional[str]:
+        return self._errors.get(job_id)
+
+    def _record_error(self, job_id: str, message: str) -> None:
+        """Remember why `job_id` could not be drawn, evicting the oldest if full."""
+        self._errors.pop(job_id, None)  # re-insert at the end, so it is newest
+        self._errors[job_id] = message
+        while len(self._errors) > PLOT_ERROR_CAP:
+            self._errors.popitem(last=False)
+
+    def enqueue(self, job_id: str) -> bool:
+        """Push `job_id` to the front of the line. False if it was not queued.
+
+        A pool with no flights refuses rather than accumulating: nothing would
+        ever drain it, and a queued-forever job makes the results page poll for a
+        plot that is never coming. `--num-plot-flights 0` is a supported
+        configuration, so this is the ordinary path, not an error -- the routes
+        turn it into a 409 and the manifest reports `absent`.
+        """
+        if not self.flights:
+            return False
+        if job_id in self._queued or job_id in self._drawing.values():
+            return False
+        self._queued.add(job_id)
+        self._stack.append(job_id)
+        # A retry clears a previous failure, so the manifest stops reporting an
+        # error the moment the job is genuinely pending again.
+        self._errors.pop(job_id, None)
+        self._wake.set()
+        return True
+
+    def _take(self) -> Optional[str]:
+        """The newest queued job, or None. LIFO: pop the end."""
+        while self._stack:
+            job_id = self._stack.pop()
+            if job_id in self._queued:
+                self._queued.discard(job_id)
+                return job_id
+        return None
+
+    async def start(self) -> None:
+        for flight in self.flights:
+            await flight.start()
+        self._drains = [
+            asyncio.create_task(self._drain(flight)) for flight in self.flights
+        ]
+
+    async def _drain(self, flight: PlotFlight) -> None:
+        """One flight's whole working life: take the newest job, draw it, repeat.
+
+        Every failure is swallowed into `_errors`. A plot that cannot be drawn
+        must not end this loop, or one bad job would cost the flight for the rest
+        of the process's life -- and nobody is blocked on a plot.
+        """
+        while True:
+            job_id = self._take()
+            if job_id is None:
+                # clear() then re-check, in that order, and this is what makes a
+                # shared Event safe for N flights. An Event wakes every waiter,
+                # so one flight can clear a set() that another flight's work
+                # caused -- the re-check is what stops that becoming a lost
+                # wakeup. The invariant: a flight only sleeps having seen an
+                # empty stack *after* clearing, so any enqueue before the clear
+                # left an item the re-check finds, and any enqueue after it sets
+                # the event again.
+                self._wake.clear()
+                if not self._stack:
+                    await self._wake.wait()
+                continue
+
+            self._drawing[flight.index] = job_id
+            try:
+                resp = await flight.send_command({"cmd": "plot", "job_id": job_id})
+                self._retries.pop(job_id, None)
+                if not resp.get("ok"):
+                    self._record_error(job_id, resp.get("error", "plotting failed"))
+            except asyncio.CancelledError:
+                # Shutdown, so this is bookkeeping for the benefit of whatever
+                # inspects the queue between the cancel and the exit -- the
+                # process is going down and nothing reads it afterwards. Put back
+                # rather than dropped so `depth` never under-reports work that
+                # was taken but not done.
+                self._queued.add(job_id)
+                self._stack.append(job_id)
+                raise
+            except (CoordinatorLost, CoordinatorUnavailable) as exc:
+                # The flight has no usable child: it died mid-draw, is restarting,
+                # or has given up entirely (DEGRADED). Crucially _ensure_usable
+                # raises *immediately* for the latter two, so without a backoff
+                # this loop would spin at full speed -- taking the whole queue,
+                # failing each job in microseconds, and burning a core for as long
+                # as the flight stayed down.
+                #
+                # Retried a bounded number of times, then failed. Nothing about
+                # the job went wrong, so a retry is right -- but DEGRADED is
+                # terminal until /admin/restart?pool=plot, and an unbounded retry
+                # would leave the job reporting `queued` for as long as nobody
+                # noticed. An error the page can show is the honest report.
+                tries = self._retries.get(job_id, 0) + 1
+                if tries >= PLOT_MAX_RETRIES:
+                    self._retries.pop(job_id, None)
+                    self._record_error(
+                        job_id, f"gave up after {tries} attempts: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    self._retries[job_id] = tries
+                    self._queued.add(job_id)
+                    self._stack.append(job_id)
+                    self._errors.pop(job_id, None)
+                await asyncio.sleep(PLOT_RETRY_S)
+            except Exception as exc:
+                # A real failure to draw this job -- a corrupt table, a figure that
+                # raised. Recorded against the job, which keeps it until retried,
+                # and the loop moves on to the next one.
+                self._retries.pop(job_id, None)
+                self._record_error(job_id, f"{type(exc).__name__}: {exc}")
+            finally:
+                self._drawing.pop(flight.index, None)
+
+    async def aclose(self) -> None:
+        for task in self._drains:
+            task.cancel()
+        for task in self._drains:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._drains = []
+        for flight in self.flights:
+            await flight.aclose()
+
+
 pool = FlightPool(num_flights())
+plot_pool = PlotQueue(
+    [PlotFlight(index=i) for i in range(num_plot_flights())]
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await pool.start()
+    await plot_pool.start()
     yield
+    await plot_pool.aclose()
     await pool.aclose()
 
 
@@ -1563,6 +1871,12 @@ async def _receive_and_dispatch(
     record.table_parquet = result.pop("table_parquet", None)
     record.result = result
     record.push_timings = timings
+    # Enqueued, not awaited: the tables this needs are written by the
+    # coordinator's deferred step, which runs *after* the reply we just received,
+    # so the plot flight will find them by the time it gets there -- and if it
+    # races ahead, render_plots raises FileNotFoundError and the job can be
+    # retried from the page. Pushing to a LIFO means this newest job is next.
+    plot_pool.enqueue(job_id)
     return {
         "job_id": job_id,
         "state": record.state,
@@ -1657,6 +1971,240 @@ async def result_images(job_id: str):
     )
 
 
+@app.get("/result/{job_id}/plots", dependencies=[Depends(check_auth)])
+async def result_plots(response: Response, job_id: str):
+    """Which diagnostic figures exist for this job, and why not if they do not.
+
+    The manifest the results page polls. It reports *state* rather than just
+    presence because every absence here has a different remedy: `queued` and
+    `drawing` resolve themselves, `error` wants the log, and `absent` wants
+    someone to ask for the plots (POST /admin/plots/{job_id}).
+
+    Not gated on the job being DONE. A plot can legitimately outlive the front-end
+    that computed it -- the PNGs are on disk and JOBS is not -- so a job this
+    process has never heard of still gets its files reported rather than a 404.
+    """
+    # Validated like every other job-id route here: this one joins `job_id` onto
+    # the stamp dir too, and while a single path segment holds no separator, an
+    # unchecked one still probes for the existence and size of files outside the
+    # plots tree.
+    if not _JOB_ID_OK.fullmatch(job_id):
+        raise HTTPException(400, "malformed job id")
+
+    response.headers.update(_NO_STORE)
+    record = JOBS.get(job_id)
+
+    figures = {}
+    for name in PLOT_NAMES:
+        sizes = {}
+        for size in PLOT_SIZES:
+            path = _plot_path(job_id, name, size)
+            if path is not None and os.path.exists(path):
+                stat = os.stat(path)
+                sizes[size] = {
+                    "bytes": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "url": f"/result/{job_id}/plot/{name}?size={size}",
+                }
+        if sizes:
+            figures[name] = sizes
+
+    queue_state = plot_pool.state_of(job_id)
+    error = plot_pool.error_of(job_id)
+    # Order matters, and `error` comes before `ready` deliberately. A *failed
+    # redraw* of a job that already has figures would otherwise report "ready"
+    # and the operator would read six stale PNGs as current -- the figures on
+    # disk are from the previous successful draw, and the thing they just asked
+    # for did not happen. Pending still outranks both: a redraw in flight should
+    # keep the page polling rather than settle on either verdict.
+    if queue_state is not None:
+        state = queue_state
+    elif error is not None:
+        state = "error"
+    elif figures:
+        state = "ready"
+    else:
+        state = "absent"
+
+    return {
+        "job_id": job_id,
+        "state": state,
+        "error": error,
+        "figures": figures,
+        # So the page can say "3rd in line" rather than only "queued", and can
+        # tell a disabled plot pool from a saturated one.
+        "queue_depth": len(plot_pool),
+        "n_plot_flights": len(plot_pool.flights),
+        "job_state": None if record is None else record.state,
+    }
+
+
+@app.get("/result/{job_id}/plot/{name}", dependencies=[Depends(check_auth)])
+async def result_plot(job_id: str, name: str, size: str = "full"):
+    """One rendered PNG.
+
+    `name` and `size` are checked against closed whitelists *before* either
+    reaches `_plot_path`. That is the whole defence: both arrive from a URL, and
+    `job_id` too, so without it a crafted path segment would read any file the
+    service user can. 400 rather than 404 for an unknown name -- it is a malformed
+    request, not a missing figure.
+    """
+    if name not in PLOT_NAMES:
+        raise HTTPException(400, f"unknown plot {name!r}; expected one of {list(PLOT_NAMES)}")
+    if size not in PLOT_SIZES:
+        raise HTTPException(400, f"unknown size {size!r}; expected one of {list(PLOT_SIZES)}")
+    # A job id is a uuid everywhere this service mints one, but it arrives here as
+    # a URL segment like the others, so it gets the same treatment rather than
+    # being trusted for its shape.
+    if not _JOB_ID_OK.fullmatch(job_id):
+        raise HTTPException(400, "malformed job id")
+
+    path = _plot_path(job_id, name, size)
+    if path is None or not os.path.exists(path):
+        # 409 for the same reason /result/{job_id}/images answers 409: for the ~17 s
+        # after a job is DONE this is the ordinary state, not a failure. The
+        # manifest above says which it is.
+        raise HTTPException(409, f"no {name} plot for job {job_id} yet")
+    return FileResponse(path, media_type="image/png")
+
+
+@app.post("/admin/plots/{job_id}", dependencies=[Depends(check_auth)])
+async def admin_plot_job(response: Response, job_id: str):
+    """Draw (or redraw) one job's plots.
+
+    How a job gets plotted when nothing enqueued it automatically: the queue is
+    in-memory, so a front-end restart drops it, and `--num-plot-flights 0` never
+    had one. Also the retry path for a job whose plotting failed.
+
+    202, not 200: this returns as soon as the id is on the stack, which is the
+    only thing it can honestly report. `queued: false` means the job was already
+    pending, not that the request failed.
+    """
+    if not _JOB_ID_OK.fullmatch(job_id):
+        raise HTTPException(400, "malformed job id")
+    if not plot_pool.flights:
+        raise HTTPException(
+            409,
+            "no plot flights are running; start the server with "
+            "--num-plot-flights 1 or more",
+        )
+    queued = plot_pool.enqueue(job_id)
+    response.status_code = 202
+    response.headers.update(_NO_STORE)
+    return {
+        "job_id": job_id,
+        "queued": queued,
+        "state": plot_pool.state_of(job_id),
+        "queue_depth": len(plot_pool),
+    }
+
+
+def _scan_for_missing_plots(limit: int) -> tuple[int, list[str]]:
+    """How many jobs are on disk, and which of them have no plots.
+
+    Shared by the two routes below, which differ only in what they do with the
+    answer: the GET reports it, the POST enqueues it. Keeping one scan means the
+    dashboard's "12 missing" and the number the button acts on cannot disagree.
+
+    Returns the candidate count -- every job in the directory, not just the
+    `limit` examined -- alongside the missing ids newest-first.
+    """
+    directory = os.environ.get("DONUT_SERVER_STAMP_DIR")
+    if not directory:
+        raise HTTPException(409, "DONUT_SERVER_STAMP_DIR is not set; nothing to scan")
+
+    # Sync file I/O on the event loop, unlike the log and table routes. Justified
+    # by scale rather than by nature: this is one listdir plus a stat per entry on
+    # a directory with hundreds of files, and the alternative -- a threadpool hop
+    # -- would need the routes to be sync `def`, which would then hold a worker
+    # for the whole scan. The GET is polled rather than operator-triggered, which
+    # is why the dashboard runs it on a 5 s loop rather than the 1 Hz the rest of
+    # the page uses, and refreshes it on the events that can change the answer.
+    candidates = []
+    try:
+        for entry in os.scandir(directory):
+            if not entry.is_file() or not entry.name.endswith(".parquet"):
+                continue
+            job_id = entry.name[: -len(".parquet")]
+            # The selection tables live in the same directory and share the
+            # prefix, so they would otherwise read as two more jobs.
+            if any(job_id.endswith(f".{kind}") for kind in _SELECTION_KINDS):
+                continue
+            candidates.append((entry.stat().st_mtime, job_id))
+    except OSError as exc:
+        raise HTTPException(409, f"cannot scan {directory}: {exc}") from exc
+
+    candidates.sort(reverse=True)
+    missing = [
+        job_id
+        for _, job_id in candidates[:limit]
+        # "No plots" means no full-res donut plot: it is the one figure every job
+        # with any rows produces, so its absence is the cheapest reliable test.
+        if not os.path.exists(_plot_path(job_id, "donut", "full") or "")
+    ]
+    return len(candidates), missing
+
+
+@app.get("/admin/plots", dependencies=[Depends(check_auth)])
+async def admin_plot_survey(response: Response, limit: int = 200):
+    """What the POST below would do, without doing it.
+
+    Exists so the dashboard's backfill note is live rather than frozen at
+    whatever the last click returned: `missing` falls as the queue drains and
+    rises as new jobs finish, and a number that only moves on click reads as
+    current when it is not.
+
+    Unlike the POST this does not require a plot flight. The scan is read-only,
+    and "14 missing" is exactly what an operator running `--num-plot-flights 0`
+    wants to see before deciding to restart with a flight.
+    """
+    limit = max(1, min(JOBS_PAGE_MAX, limit))
+    scanned, missing = _scan_for_missing_plots(limit)
+
+    response.headers.update(_NO_STORE)
+    return {
+        "scanned": scanned,
+        "missing": len(missing),
+        "queue_depth": len(plot_pool),
+    }
+
+
+@app.post("/admin/plots", dependencies=[Depends(check_auth)])
+async def admin_plot_backfill(response: Response, limit: int = 200):
+    """Enqueue every job that has a result table on disk but no plots.
+
+    The bulk form of the per-job route above, for the case a front-end restart
+    dropped a backlog: clicking one job at a time is not a workflow. Driven off
+    the disk rather than off JOBS, so it also covers jobs computed by a previous
+    process.
+
+    Enqueued oldest-first so that the LIFO stack pops *newest*-first -- the push
+    order has to be inverted for the drain order to come out useful. `limit`
+    bounds how many are taken, newest by mtime, since a long-lived stamp dir can
+    hold hundreds of jobs and the oldest are the least likely to be wanted.
+    """
+    if not plot_pool.flights:
+        raise HTTPException(
+            409,
+            "no plot flights are running; start the server with "
+            "--num-plot-flights 1 or more",
+        )
+    limit = max(1, min(JOBS_PAGE_MAX, limit))
+    scanned, missing = _scan_for_missing_plots(limit)
+
+    # Reversed, so the newest of them is pushed last and popped first.
+    queued = [job_id for job_id in reversed(missing) if plot_pool.enqueue(job_id)]
+
+    response.status_code = 202
+    response.headers.update(_NO_STORE)
+    return {
+        "scanned": scanned,
+        "missing": len(missing),
+        "queued": len(queued),
+        "queue_depth": len(plot_pool),
+    }
+
+
 def _config_is_stale(coord: Coord, snap: ConfigSnapshot) -> bool:
     """Whether the cached dump might not describe the coordinator running right now.
 
@@ -1723,7 +2271,14 @@ def _job_counts() -> dict:
     return counts
 
 
-def _flight_health(coord: Coord) -> dict:
+def _flight_health(coord: Coord, queue_depth: Optional[int] = None) -> dict:
+    """One flight's /health projection. Serves both pools.
+
+    `queue_depth` is passed rather than looked up because a plot flight's index
+    names a lane in a different pool: `pool.queue_depth(coord)` keys on the index
+    alone, so a plot flight would silently report the backlog of the *Zernike*
+    flight that happens to share its number.
+    """
     snap = coord.config_snapshot
     return {
         "index": coord.index,
@@ -1766,7 +2321,7 @@ def _flight_health(coord: Coord) -> dict:
         # wedged-but-alive signature that /admin/restart exists for.
         "in_flight": coord.in_flight,
         "busy": coord.busy,
-        "queue_depth": pool.queue_depth(coord),
+        "queue_depth": queue_depth,
     }
 
 
@@ -1809,15 +2364,36 @@ async def health(request: Request, response: Response, authorization: str = Head
             # only thing that grows -- so a front-end climbing alongside the
             # flights is itself the finding.
             "front_end": {"pid": os.getpid(), "rss_bytes": rss_bytes(os.getpid())},
-            "flights": [_flight_health(c) for c in pool.flights],
+            "flights": [_flight_health(c, pool.queue_depth(c)) for c in pool.flights],
             "jobs": _job_counts(),
+            # Reusing _flight_health rather than a parallel projection: a plot
+            # flight *is* a Coord, so every field it reports means the same thing.
+            # The config and prime fields are simply always null, since a plot
+            # flight holds no config -- which is itself worth seeing.
+            # The pool-wide depth on every row, not a per-flight split: one LIFO
+            # stack feeds every plot flight, so there is no per-lane backlog.
+            "plot_flights": [
+                _flight_health(c, len(plot_pool)) for c in plot_pool.flights
+            ],
+            "plot_queue": {
+                "depth": len(plot_pool),
+                # By flight index, so the dashboard can label the row that is busy
+                # rather than just counting.
+                "drawing": {str(k): v for k, v in plot_pool.drawing.items()},
+            },
         }
     )
     return body
 
 
 @app.post("/admin/restart", dependencies=[Depends(check_auth)])
-async def admin_restart(response: Response, flight: int | None = None):
+async def admin_restart(
+    response: Response,
+    flight: int | None = None,
+    # `pool` in the query string; renamed in Python because the module-global
+    # `pool` is the Zernike FlightPool and shadowing it here would be a trap.
+    pool_name: str = Query("zernike", alias="pool"),
+):
     """Recover a wedged-but-alive coordinator, and the only way out of DEGRADED.
 
     There is deliberately no automatic command timeout: a generous bound cannot be
@@ -1829,14 +2405,28 @@ async def admin_restart(response: Response, flight: int | None = None):
     one. `?flight=N` targets a single lane -- the usual case now, since a wedge is
     a property of one child and restarting the healthy lanes alongside it would
     throw away their warm caches and any job they are computing.
+
+    `?pool=plot` targets the plot flights instead, and it is not optional
+    completeness: `Coord` treats DEGRADED as terminal *until* a restart, so
+    without a way to name them here a plot flight that exhausted its attempts
+    would stay down for the life of the process, with its drain loop retrying a
+    job forever and the results page polling `queued` just as long.
     """
-    if flight is not None and not 0 <= flight < len(pool):
-        raise HTTPException(400, f"flight must be in 0..{len(pool) - 1}, got {flight}")
-    targets = pool.flights if flight is None else [pool.flights[flight]]
+    if pool_name not in ("zernike", "plot"):
+        raise HTTPException(400, f"pool must be 'zernike' or 'plot', got {pool_name!r}")
+    flights = pool.flights if pool_name == "zernike" else plot_pool.flights
+    if not flights:
+        raise HTTPException(409, f"no {pool_name} flights are running")
+    if flight is not None and not 0 <= flight < len(flights):
+        raise HTTPException(
+            400, f"flight must be in 0..{len(flights) - 1} for pool {pool_name!r}, got {flight}"
+        )
+    targets = flights if flight is None else [flights[flight]]
     reason = "operator requested restart via /admin/restart"
     response.status_code = 202
     return {
         "restarting": True,
+        "pool": pool_name,
         "flights": [
             {
                 "index": coord.index,

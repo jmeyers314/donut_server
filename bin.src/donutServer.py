@@ -43,6 +43,12 @@ def main() -> None:
         help="cores the task may fork over per push, not divided between flights "
         "(default 8; DONUT_SERVER_NUM_WORKERS)",
     )
+    parser.add_argument(
+        "--num-plot-flights",
+        type=int,
+        help="processes drawing diagnostic plots, off the Zernike path; 0 disables "
+        "plotting entirely (default 1; DONUT_SERVER_NUM_PLOT_FLIGHTS)",
+    )
     # Giving a repo is what selects the butler calib backend -- there is no
     # --calib-backend flag, because the repo is the only thing that backend needs
     # that the files one cannot use. Short forms match donutClient.py's -b/-i,
@@ -71,6 +77,7 @@ def main() -> None:
     for flag, var in (
         (args.num_flights, "DONUT_SERVER_NUM_FLIGHTS"),
         (args.num_workers, "DONUT_SERVER_NUM_WORKERS"),
+        (args.num_plot_flights, "DONUT_SERVER_NUM_PLOT_FLIGHTS"),
         (args.butler_repo, "DONUT_SERVER_BUTLER_REPO"),
         (args.butler_collections, "DONUT_SERVER_BUTLER_COLLECTIONS"),
     ):
@@ -153,6 +160,7 @@ def main() -> None:
     print(
         f"Flights: {os.environ.get('DONUT_SERVER_NUM_FLIGHTS', '2')}"
         f"  workers/push: {os.environ.get('DONUT_SERVER_NUM_WORKERS', '8')}"
+        f"  plot flights: {os.environ.get('DONUT_SERVER_NUM_PLOT_FLIGHTS', '1')}"
     )
 
     # Which calibs are in use, for the same reason -- and since the backend is

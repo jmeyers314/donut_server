@@ -81,6 +81,19 @@
   .jobcol { border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; }
   .jobcol .note { display: block; margin-top: 2px; color: var(--dim); }
   .jobcol .note b { color: var(--ink); font-weight: 600; }
+  /* --- plot flights ---
+     Deliberately one compact row each, with no state-machine diagram: a plot
+     flight has the same five states as a coordinator, but nothing is blocked on
+     it and the only questions are "is it up" and "how far behind". The full
+     treatment above would imply it mattered as much as a Zernike lane. */
+  #plotrows { display: flex; flex-direction: column; gap: 4px; }
+  .prow {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px;
+    color: var(--dim);
+  }
+  .prow b { color: var(--ink); font-weight: 600; }
+  .prow .jid { color: var(--live); }
   /* --- state machine diagrams --- */
   svg { display: block; max-width: 100%; height: auto; }
   .nbox { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; rx: 4; }
@@ -281,6 +294,15 @@ config error that retrying cannot fix. The other flights keep serving.</title>
   </div>
   </template>
   <div class="lanes" id="jobs-per-flight"></div>
+</section>
+
+<section>
+  <h2>Plot flights <span class="note" id="plot-note"></span></h2>
+  <div class="ctl">
+    <button id="backfill">backfill missing plots</button>
+    <span class="note" id="backfill-note"></span>
+  </div>
+  <div id="plotrows"></div>
 </section>
 
 <section>
@@ -564,6 +586,162 @@ function renderCoord(h) {
   }
 }
 
+// ----------------------------------------------------------------- plot flights
+
+// One row per plot flight, rebuilt each poll rather than cached like the flight
+// panels above: a row is a handful of spans, not an SVG, so there is nothing
+// worth the bookkeeping of reusing it.
+// Which job each plot flight was drawing at the last health poll, as one string.
+// Null rather than "" so the first poll does not read as a change: an idle pool
+// at startup should not trigger a scan the 5 s loop is about to do anyway.
+let lastBusy = null;
+
+function renderPlotFlights(h) {
+  const rows = el("plotrows");
+  const flights = h.plot_flights || [];
+  const q = h.plot_queue || {depth: 0, drawing: {}};
+
+  // The headline is the backlog, because that is the number that decides whether
+  // --num-plot-flights needs raising. Depth is pool-wide: one LIFO stack feeds
+  // every lane, so there is no per-flight split to report.
+  const parts = [];
+  // Counted rather than assumed: a pool whose every flight is degraded has
+  // length but draws nothing, and enqueueing into it only grows a backlog that
+  // sits there -- so it reads as "not being drawn" too, and the button is off.
+  const live = flights.filter((f) => f.status !== "degraded").length;
+  if (!flights.length) {
+    parts.push("none running — plots are not being drawn");
+  } else {
+    parts.push(flights.length + (flights.length === 1 ? " flight" : " flights"));
+    if (!live) parts.push("all degraded — nothing is being drawn; restart below");
+    else if (live < flights.length) parts.push(live + " still drawing");
+    parts.push(q.depth + " queued");
+    // Said once here rather than on every row, and only when it is load-bearing.
+    if (q.depth) parts.push("newest drawn first");
+  }
+  el("plot-note").textContent = parts.join("  ·  ");
+  el("backfill").disabled = !live;
+
+  // A draw that just finished turned a "missing" into a plotted job without any
+  // job count changing, so the jobs poll's trigger cannot see it. The signature
+  // is the busy set changing: a flight that was drawing something and now is
+  // not has either written six PNGs or recorded an error, and both move the
+  // scan. Joined with a separator no job id can contain.
+  const busy = flights.map((f) => (q.drawing || {})[String(f.index)] || "").join(" ");
+  if (busy !== lastBusy) {
+    lastBusy = busy;
+    pollPlotSurvey();
+  }
+
+  rows.textContent = "";
+  for (const f of flights) {
+    const row = put(rows, "div", "", "prow");
+    put(row, "b", "plot " + f.index);
+    put(row, "span", f.ready ? "ready" : f.status,
+        "chip " + (f.ready ? "on" : "off"));
+
+    // Busy/idle as a chip, exactly as the compute flights report it above --
+    // including the convention that idle is an unstyled chip rather than a red
+    // one, because an idle plot flight is a healthy plot flight.
+    const job = (q.drawing || {})[String(f.index)];
+    put(row, "span", job ? "busy" : "idle", "chip " + (job ? "on" : ""));
+
+    // Which job, which is the one thing this section exists to answer that
+    // /health's flight list cannot: the id, not just that something is drawing.
+    if (job) {
+      const s = put(row, "span", "drawing ");
+      const a = put(s, "a", job.slice(0, 8), "jid");
+      a.href = "/results/" + encodeURIComponent(job);
+      a.target = "_blank";
+    }
+
+    for (const [k, v] of [["pid", fmt.num(f.pid)], ["rss", fmt.ram(f.rss_bytes)],
+                          ["up", fmt.age(f.child_uptime_s)],
+                          ["spawns", fmt.num(f.spawns)]]) {
+      const s = put(row, "span", k + " ");
+      put(s, "b", v);
+    }
+    // Only when there is something wrong: a plot flight in steady state should be
+    // one quiet line.
+    if (f.degraded_reason) put(row, "span", f.degraded_reason, "err");
+    else if (f.last_loss && f.last_loss.reason) {
+      put(row, "span", "last loss: " + f.last_loss.reason, "err");
+    }
+    // Offered only when it is the remedy. A DEGRADED plot flight holds no child
+    // and draws nothing until restarted, and this is the only way to do it --
+    // a bare /admin/restart reaches the compute flights alone.
+    if (f.status === "degraded") {
+      const btn = put(row, "button", "restart");
+      btn.onclick = () => armRestart(f.index, btn, "plot");
+    }
+  }
+}
+
+// The scan is a disk walk, so it is not on the 1 Hz health loop -- but it does
+// have to be live: `missing` falls as the queue drains and rises as new jobs
+// finish, and a number that only moved on click would read as current when it is
+// not. Polled slowly, and refreshed outright on the two events that change it.
+//
+// `null` means "not scanned yet", which is distinct from a scan that found
+// nothing missing -- the first should say nothing, the second should say so.
+let survey = null;
+
+function renderBackfill() {
+  // The queue depth is deliberately absent: it is in the section header above,
+  // live from /health at 1 Hz, and repeating it here would be a second copy of
+  // the same number going stale at a different rate.
+  if (survey === null) {
+    el("backfill-note").textContent = "";
+  } else if (survey.error) {
+    el("backfill-note").textContent = survey.error;
+  } else {
+    const parts = [survey.scanned + " on disk"];
+    parts.push(survey.missing ? survey.missing + " missing plots" : "all plotted");
+    el("backfill-note").textContent = parts.join("  ·  ");
+  }
+}
+
+async function pollPlotSurvey() {
+  let d;
+  try {
+    d = await api("/admin/plots");
+  } catch (e) {
+    return;  // transport hiccup; the next tick retries and the note holds
+  }
+  if (!d) return;
+  // A 409 body carries `detail` and no counts -- an unset stamp dir, or a
+  // directory that cannot be read. Worth saying: it is the reason the numbers
+  // are missing, and it is not something the next poll will fix.
+  survey = d.detail ? {error: d.detail} : d;
+  renderBackfill();
+}
+
+el("backfill").onclick = async () => {
+  const btn = el("backfill");
+  btn.disabled = true;
+  el("backfill-note").textContent = "scanning…";
+  try {
+    const r = await fetch("/admin/plots", {method: "POST", cache: "no-store"});
+    if (!r.ok) {
+      let detail = "";
+      try { detail = (await r.json()).detail || ""; } catch (e) { /* not json */ }
+      survey = {error: "failed: " + (detail || r.status)};
+      renderBackfill();
+      return;
+    }
+    const d = await r.json();
+    // The POST answers the same counts as the survey, so adopt them rather than
+    // waiting up to 5 s for the next poll to catch up with the click.
+    survey = d;
+    renderBackfill();
+  } finally {
+    // Re-enabled by the next poll if there are flights; this just releases the
+    // click guard.
+    btn.disabled = false;
+  }
+  pollHealth();
+};
+
 // ------------------------------------------------------------------- jobs table
 
 let jobs = [];
@@ -599,6 +777,11 @@ document.addEventListener("keydown", (ev) => {
 // The last /admin/jobs body, kept so a click can re-render without a round-trip.
 let lastJobs = {jobs: [], counts: {}, total: 0, returned: 0};
 
+// DONE+ERROR at the last jobs poll, watched rather than diffed per-job: the
+// backfill scan's counts are about what is on disk, and this count changing is
+// exactly when a table was written. -1 so the first poll scans.
+let lastSettled = -1;
+
 function renderJobs(d) {
   lastJobs = d;
   jobs = d.jobs;
@@ -622,6 +805,17 @@ function renderJobs(d) {
   }
   if (d.returned < d.total) note.push("showing newest " + d.returned);
   el("jobs-note").textContent = note.join("  ·  ");
+
+  // A job reaching DONE wrote a stamp table, so the backfill scan's "on disk"
+  // just changed and its "missing" has too until the plot lands. Rescan now
+  // rather than leaving it to the 5 s loop: this is the moment the operator is
+  // watching. ERROR counted alongside, since a job that failed before writing a
+  // table still ends the window in which the numbers were right.
+  const settled = (d.counts.DONE || 0) + (d.counts.ERROR || 0);
+  if (settled !== lastSettled) {
+    lastSettled = settled;
+    pollPlotSurvey();
+  }
 
   // The per-job log follows the current job, so it has to reload when that changes.
   if (logMode === "job" && current && (!was || was.job_id !== current.job_id)) {
@@ -924,6 +1118,7 @@ async function pollHealth() {
   if (!h) return;
   health = h;
   renderFlights(h);
+  renderPlotFlights(h);
 }
 
 async function pollJobs() {
@@ -960,10 +1155,16 @@ setInterval(() => {
   chip.className = "chip " + (lastOk && age < 5 ? "on" : "off");
 }, 250);
 
-document.addEventListener("visibilitychange", () => { if (visible()) { pollHealth(); pollJobs(); } });
+document.addEventListener("visibilitychange", () => {
+  if (visible()) { pollHealth(); pollJobs(); pollPlotSurvey(); }
+});
 
 loop(pollHealth, 1000);
 loop(pollJobs, 1000);
+// Slower than the rest of the page on purpose: this one walks the stamp
+// directory. The event-driven refreshes above are what keep it feeling live, and
+// this loop is the floor under them.
+loop(pollPlotSurvey, 5000);
 loop(() => { if (el("log-auto").checked) return pollLog(false); }, 2000);
 
 // ------------------------------------------------------------- restart control
@@ -985,17 +1186,24 @@ function disarm() {
 }
 
 // index === null restarts every flight, which is what the bare endpoint means.
-async function armRestart(index, button) {
+// `poolName` defaults to the compute flights, which is every caller but the plot
+// rows: a restart there is the only way out of DEGRADED for a plot flight, and
+// it risks nothing an operator needs warning about -- at worst one plot redraws.
+async function armRestart(index, button, poolName) {
   const mine = armed && armed.button === button;
   disarm();
   if (!mine) {
     const label = button.textContent;
-    button.textContent = "confirm — " + atRisk(index);
+    button.textContent = "confirm — " +
+      (poolName === "plot" ? "restart plot flight " + index + "?" : atRisk(index));
     button.classList.add("armed");
     armed = {button, label, timer: setTimeout(disarm, 5000)};
     return;
   }
-  const query = index === null ? "" : "?flight=" + index;
+  const params = [];
+  if (index !== null) params.push("flight=" + index);
+  if (poolName) params.push("pool=" + poolName);
+  const query = params.length ? "?" + params.join("&") : "";
   const d = await api("/admin/restart" + query, {method: "POST"});
   if (d) {
     banner("restart", "restart requested — " + (d.flights || []).map(

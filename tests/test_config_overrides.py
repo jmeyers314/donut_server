@@ -20,8 +20,51 @@ def python(text, name="<test>"):
 def test_no_overrides_builds_a_default_task():
     task, dump = coordinator.build_task([])
 
+    # Still False, and must stay so: the plot *connections* survive when it is
+    # True, which puts three outputs build_quantum_context wires no refs for into
+    # the connection set -- see test_saveplots_is_rejected_at_prepare. The plot
+    # flights call DonutBlitzPlotTask.run directly instead.
     assert task.config.savePlots is False
+    # Flipped from the upstream default by build_task: the focal-plane selection
+    # plot needs these two tables, and here "persisting" them means a dict insert
+    # into the in-memory butler.
+    assert task.config.doSelectionOutput is True
     assert dump.startswith("import ")
+
+
+def test_doselectionoutput_wires_the_selection_connections():
+    """The three visit-dimensioned outputs this service builds refs for. Without
+    detectorImages/selectionOverlays in WIRED_OUTPUTS this build would raise."""
+    task, _ = coordinator.build_task([])
+    conns = task.config.connections.ConnectionsClass(config=task.config)
+
+    assert set(conns.outputs) == {
+        "cornerResults", "detectorImages", "selectionOverlays"
+    }
+    assert set(conns.outputs) <= coordinator.WIRED_OUTPUTS
+
+
+def test_doselectionoutput_can_still_be_turned_off():
+    """A change of default, not a forced value: the config is applied before the
+    overrides, so an operator can still opt out -- and then gets two plots
+    instead of three rather than an error."""
+    task, _ = coordinator.build_task([value("doSelectionOutput", "False")])
+    conns = task.config.connections.ConnectionsClass(config=task.config)
+
+    assert task.config.doSelectionOutput is False
+    assert set(conns.outputs) == {"cornerResults"}
+
+
+def test_saveplots_is_rejected_at_prepare():
+    """Since ts_wep f5ce1351 the three plots are butler Output datasets, so
+    savePlots=True leaves three connections this service builds no refs for.
+
+    Rejected at prepare, where it can still reach a client, rather than as a
+    KeyError mid-push. The remedy is not to turn this on: the plot flights draw
+    the same figures off the result table, off the Zernike critical path.
+    """
+    with pytest.raises(coordinator.ConfigOverrideError, match="Plot"):
+        coordinator.build_task([value("savePlots", "True")])
 
 
 def test_a_value_override_is_applied():

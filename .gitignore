@@ -4,6 +4,11 @@
 /raw/
 /ref_cat/
 
+# The output tree, if DONUT_SERVER_STAMP_DIR points into the checkout -- which the
+# README's own example does. ~75 MB a job and unpruned, so a stray `git add -A`
+# after an afternoon of testing would otherwise try to stage several GB.
+/stamps/
+
 # Dumped eups environment: 113 lines of machine-absolute paths, and the obvious
 # place someone later parks DONUT_SERVER_TOKEN. A fresh clone has none; see README.
 /.env

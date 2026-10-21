@@ -82,6 +82,22 @@
   }
   .vec span { color: var(--dim); white-space: nowrap; }
   .vec b { color: var(--ink); font-weight: 400; }
+  /* --- plots --- */
+  .err { color: var(--bad); }
+  #plots { padding: 8px 14px; border-bottom: 1px solid var(--line); }
+  #plots .head { display: flex; align-items: center; gap: 10px; color: var(--dim); }
+  #plots .head b { color: var(--ink); font-weight: 600; }
+  .figs { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .fig {
+    border: 1px solid var(--line); border-radius: 3px; background: var(--panel);
+    padding: 6px; max-width: 32%; min-width: 220px;
+  }
+  .fig .cap { color: var(--dim); display: flex; gap: 8px; align-items: baseline; }
+  .fig .cap b { color: var(--ink); font-weight: 600; }
+  /* The thumbnail is ~1200px wide; let it scale to whatever the card gives it
+     rather than fixing a height, since the three plots have different aspects. */
+  .fig img { display: block; width: 100%; height: auto; margin-top: 4px; background: #000; }
+  .fig a { text-decoration: none; }
   #picker {
     display: none; position: absolute; right: 14px; top: 46px; z-index: 8;
     background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
@@ -108,6 +124,7 @@
 <div id="picker"></div>
 <div class="banner" id="banner"></div>
 <div class="meta" id="meta"></div>
+<div id="plots"></div>
 <div class="bar">
   <span class="dim" id="page"></span>
   <button id="prev">← prev</button>
@@ -347,6 +364,129 @@ function renderPicker() {
   }
 }
 
+// ------------------------------------------------------------------ plots
+
+// The three figures, in the order they are most useful: the donut stamps first
+// (what the selection actually kept), then the fits, then the focal plane.
+const FIGURES = [
+  ["donut", "donuts", "per-detector stamps with selection and fit stats"],
+  ["wavefront", "wavefront", "data, model, residual and Zernikes per fit"],
+  ["selection", "focal plane", "the selection funnel over binned post-ISR images"],
+];
+
+// Polling stops as soon as the state is terminal, so a finished job costs one
+// request. 2 s rather than 1: drawing takes ~17 s, so a faster poll only adds
+// requests without telling the operator anything new.
+const PLOT_POLL_MS = 2000;
+let plotTimer = null;
+let plotState = null;
+
+// Cache-busted per render, not per load: an <img> for a path that 409'd would
+// otherwise be cached as broken, and a redraw writes the same six paths again.
+let plotNonce = 0;
+
+function renderPlots(p) {
+  const box = el("plots");
+  box.textContent = "";
+  if (!p) return;
+
+  const head = put(box, "div", "", "head");
+  put(head, "b", "plots");
+
+  const figures = p.figures || {};
+  const have = Object.keys(figures).length;
+
+  // Each state gets a sentence that says what is happening and what, if
+  // anything, the operator should do -- not a bare status word.
+  let note;
+  if (p.state === "ready") {
+    note = have + " of 3 drawn";
+  } else if (p.state === "drawing") {
+    note = "drawing now — takes about 17s";
+  } else if (p.state === "queued") {
+    note = p.queue_depth > 1
+      ? "queued, " + p.queue_depth + " jobs waiting (newest drawn first)"
+      : "queued";
+  } else if (p.state === "error") {
+    // Said explicitly when figures exist anyway: those are from an earlier
+    // successful draw, and "plotting failed" above three rendered thumbnails
+    // needs to say which of the two the operator is looking at.
+    note = have
+      ? "redraw failed, showing the previous " + have + ": " + p.error
+      : "plotting failed: " + p.error;
+  } else if (!p.n_plot_flights) {
+    note = "no plot flights running — restart the server with --num-plot-flights 1";
+  } else {
+    note = "not drawn yet";
+  }
+  put(head, "span", note, p.state === "error" ? "err" : "dim");
+
+  // Offered whenever nothing is pending: that covers both "never drawn" and
+  // "drawn, but you want them again after a config change".
+  if (p.n_plot_flights && p.state !== "queued" && p.state !== "drawing") {
+    const btn = put(head, "button", have ? "redraw" : "draw plots");
+    btn.onclick = async () => {
+      btn.disabled = true;
+      const r = await fetch("/admin/plots/" + encodeURIComponent(JOB), {method: "POST"});
+      if (!r.ok) { banner("could not queue plots: " + r.status); btn.disabled = false; return; }
+      pollPlots();
+    };
+  }
+
+  if (!have) return;
+  plotNonce++;
+  const figs = put(box, "div", "", "figs");
+  for (const [name, label, doc] of FIGURES) {
+    const sizes = figures[name];
+    if (!sizes) continue;
+    const card = put(figs, "div", "", "fig");
+    const cap = put(card, "div", "", "cap");
+    put(cap, "b", label);
+    // The full-res size, because that is what the click costs -- several MB.
+    const full = sizes.full;
+    if (full) put(cap, "span", (full.bytes / 1048576).toFixed(1) + " MB full");
+    card.title = doc;
+
+    const link = put(card, "a");
+    link.href = "/result/" + encodeURIComponent(JOB) + "/plot/" + name + "?size=full";
+    link.target = "_blank";
+    const img = document.createElement("img");
+    // Falls back to full-res if the thumbnail is somehow missing: a visible
+    // multi-MB image beats an empty card.
+    img.src = "/result/" + encodeURIComponent(JOB) + "/plot/" + name +
+              "?size=" + (sizes.thumb ? "thumb" : "full") + "&v=" + plotNonce;
+    img.alt = label + " diagnostic plot";
+    img.loading = "lazy";
+    link.appendChild(img);
+  }
+}
+
+async function pollPlots() {
+  if (plotTimer) { clearTimeout(plotTimer); plotTimer = null; }
+  // Deliberately not through api(): a 409 here is the ordinary "not yet" state
+  // and must not raise the page's error banner.
+  let p = null;
+  try {
+    const r = await fetch("/result/" + encodeURIComponent(JOB) + "/plots",
+                          {cache: "no-store"});
+    if (r.ok) p = await r.json();
+  } catch (e) { /* handled below: a failed fetch reschedules */ }
+
+  if (p) {
+    plotState = p.state;
+    renderPlots(p);
+  }
+  // Keep polling while something is in flight -- or while we have no answer at
+  // all. That second case is load-bearing: plotState starts null, so a page
+  // opened during a blip (or a restart) would otherwise never reschedule and sit
+  // with an empty plots box until a manual reload. "absent" and "ready" really
+  // are terminal; nothing changes them until someone presses the button.
+  const pending = plotState === "queued" || plotState === "drawing";
+  if (pending || plotState === null) {
+    plotTimer = setTimeout(pollPlots, PLOT_POLL_MS);
+  }
+}
+
 // ------------------------------------------------------------------ load
 
 async function load() {
@@ -397,6 +537,7 @@ el("dl").onclick = async () => {
 };
 
 load();
+pollPlots();
 </script>
 </body>
 </html>

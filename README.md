@@ -76,7 +76,8 @@ so a server host needs neither the variable nor the 5.1 G.
 
 `DONUT_SERVER_STAMP_DIR` is the one output directory, and it is required too. It needs no data up
 front, only somewhere writable: the coordinator puts one `<job_id>.parquet` there per job, holding
-the full result table including the per-donut stamps.
+the full result table including the per-donut stamps, plus two smaller tables and a `plots/`
+subdirectory of rendered PNGs — see [Diagnostic plots](#diagnostic-plots).
 
 ```zsh
 export DONUT_SERVER_CALIB_DIR=$PWD/calib
@@ -150,7 +151,9 @@ Both backends agree on the local data: same detectors, same `intrinsicZernikes` 
 identical pixel-for-pixel. If they ever diverge, one of the two trees is stale.
 
 **These files are never pruned, and at a 30 s cadence they arrive at ~2.0 GB/hour** (16.7 MB a job,
-measured on the r_57 exposure below — the in-memory columns are ~21 MB and parquet compresses).
+measured on the r_57 exposure below — the in-memory columns are ~21 MB and parquet compresses). With
+plotting on, the two extra tables and six PNGs take a job from ~18 MB to **~75 MB, so ~8.9 GB/hour**
+— see [Diagnostic plots](#diagnostic-plots), which is also where to look if that is too much.
 Deleting old
 ones is an operator or cron job; nothing in the service does it. They are also safe to delete at any
 time — the Zernikes a client waits for are served from the front-end's memory and never read back
@@ -220,19 +223,105 @@ produces the key — but a hit then reads no pixels.
   can reach 127.0.0.1 can run code here without a token. That is a widening of the existing
   concession that a shell user on this host is already trusted, from "can spend your CPU" to "can run
   code", so weigh it before exposing the port.
-- **`-c savePlots=True` writes PNGs into the server's working directory** (two per job, unpruned,
-  named only for the visit) and puts plot time on the push critical path. `DonutBlitzPlotTask` is
-  designed to be run later from the retained in-memory table instead; prefer that.
+- **`-c savePlots=True` is a 400 at prepare**, and wanting it is a sign you want the plot flights
+  below instead. Since ts_wep `f5ce1351` the three diagnostic plots are butler `Output` datasets, so
+  turning this on leaves three output connections this service builds no refs for — the same
+  rejection `-c doZernikesOutput=True` gets. The plots are drawn anyway, off the critical path; see
+  [Diagnostic plots](#diagnostic-plots).
 - **An override can be rejected.** Anything that perturbs the task's *connection set* (notably
   `-c doZernikesOutput=True`, which adds a second output this service builds no ref for) is a **400
   at prepare**, not a mysterious `KeyError` mid-push. Likewise a positive `hangTimeout` at or below
   `unitTimeout`, which would make the watchdog abort the coordinator on every ordinary job. In both
   cases the previously good config keeps serving.
 
+`-c doSelectionOutput=False` is accepted and costs you one plot. The service flips that field's
+upstream default to True, because the focal-plane selection plot needs the two tables it governs and
+"persisting" them here means a dict insert into the in-memory butler. Turning it back off wires
+`cornerResults` alone, and the focal-plane plot is then skipped while the other two still draw.
+
+## Diagnostic plots
+
+Every finished job's three diagnostic figures are drawn automatically and shown on
+`/results/<job_id>`, the page the dashboard's job table links to. Thumbnails inline, full-res on
+click.
+
+They are **not** drawn by the coordinator. Plotting measured ~16 s a job on the r_57 exposure (0.6 s
+reading the tables, 5 s building the figures, 10 s writing the six PNGs) against a ~30 s cadence, and the
+deferred hook that writes the stamps runs inside the coordinator's serial command loop — which does
+not return to `recv()` until it finishes, so drawing there would delay the *next* visit's `/prepare`
+by 17 s. Instead a separate pool of **plot flights** draws them:
+
+```zsh
+bin/donutServer.py --num-plot-flights 2    # default 1; 0 disables plotting entirely
+```
+
+The queue between the two is **LIFO and uncapped**, which is a deliberate pair of choices:
+
+- **Newest first**, because when a flight frees up the most recently finished job is the one someone
+  is most likely looking at.
+- **Uncapped**, because observing has gaps in which a backlog drains, and a cap would mean choosing
+  at enqueue time which job never becomes viewable. The cost of a queued entry is a job id — the
+  ~38 MB it needs is already on disk.
+
+The consequence is accepted rather than prevented: at one flight (~16 s a job) against two Zernike
+flights in steady state (~15 s a job), **the queue grows during continuous observing and its oldest
+entries may never be drawn.** `plot_queue.depth` is on `/health` and on the dashboard so saturation
+is visible rather than silent; `--num-plot-flights` is the dial.
+
+The queue lives in the front-end's memory and dies with it, exactly as `JOBS` does. Two ways back:
+
+- `POST /admin/plots/<job_id>` — one job, also the retry path for a failed draw. The results page's
+  "draw plots" button.
+- `POST /admin/plots` — scan `DONUT_SERVER_STAMP_DIR` for jobs with a result table but no plots and
+  enqueue them all, newest first. The dashboard's "backfill missing plots" button.
+- `GET /admin/plots` — the same scan without the enqueue, which is what that button's
+  "*N* on disk · *M* missing plots" note polls. Needs no plot flight, so it still answers under
+  `--num-plot-flights 0`.
+
+A plot flight is a `Coord` like a compute flight, so it restarts and degrades the same way — and
+`degraded` is terminal until a restart, which for these needs **`POST /admin/restart?pool=plot`**
+(the bare route still means the compute flights, as it always did). The dashboard offers the button
+on a degraded plot row. A job whose flight has no usable child is retried a few times and then
+recorded as an error rather than left queued forever, so the results page always settles on
+something an operator can act on.
+
+### What it costs on disk
+
+Output lands in `$DONUT_SERVER_STAMP_DIR/plots/<job_id>/`, six PNGs a job (three figures × full and
+a ~1200 px thumbnail), and drawing needs two more parquet files written by the same deferred step as
+the stamps. **All of it is unpruned, like the stamps.** Measured on the r_57 exposure:
+
+| file | size |
+|---|---|
+| `<job_id>.parquet` (the stamps, pre-existing) | 18.4 MB |
+| `<job_id>.detector_images.parquet` | **34.7 MB** |
+| `<job_id>.selection_overlays.parquet` | 0.03–0.15 MB |
+| `plots/<job_id>/*.png` (six files) | 21.3 MB |
+
+That is ~75 MB a job against ~18 MB before, so **the disk rate roughly quadruples, to ~8.9 GB/hour**
+at a 30 s cadence. The binned post-ISR images in `detector_images` are the bulk of it, and they
+exist only for the focal-plane plot. Two ways to spend less:
+
+- `-c doSelectionOutput=False` — no `detector_images`, no focal-plane plot, two figures instead of
+  three. Takes a job to ~29 MB.
+- `--num-plot-flights 0` — no plots, no PNGs, and no extra tables either: the coordinator reads the
+  same variable and skips writing what nothing will read. Back to ~18 MB, the pre-plotting rate.
+
+Everything here is safe to delete at any time; losing a plot costs only that plot, and
+`POST /admin/plots` redraws it from the stamp table — provided *that* has not been deleted too.
+
+Two endpoints serve the results page, both answering **409 while a plot does not exist yet** — the
+ordinary state for the ~17 s after a job reports DONE, exactly as `/result/<job_id>/images` does:
+
+- `GET /result/<job_id>/plots` — the manifest: which figures exist, their sizes, and the queue state
+  (`queued`, `drawing`, `ready`, `error`, `absent`).
+- `GET /result/<job_id>/plot/<name>?size=full|thumb` — the PNG. `name` is one of `donut`,
+  `wavefront`, `selection`.
+
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 189 tests; the butler-backend 14
+python -m pytest tests/ -q                      # 252 tests; the butler-backend 14
                                                 # skip unless DONUT_SERVER_BUTLER_REPO is set,
                                                 # and the RUN-fallback one also needs a repo
                                                 # whose chain includes the producer runs
@@ -270,6 +359,16 @@ bar, prepare timings, summary, and the quantum (`visit`, `group`, `n_raws`, `n_r
 press Escape, or use the *unpin* button to go back to following. The pin never touches the per-flight
 state machines, which always show live state, and it releases itself if the pinned job falls off the
 end of `limit`.
+
+Below the per-flight job panels, **plot flights** get one compact row each — no state machine, since
+nothing is blocked on a plot and the only questions are whether it is up and how far behind. Each row
+carries the same `ready` and `busy`/`idle` chips the compute flights use, plus which job it is drawing
+(linked to that job's results page). The section header carries the queue depth; a `queued` count that
+only grows means plotting cannot keep up at this cadence, so raise `--num-plot-flights`.
+
+The backfill button's note is live, not frozen at the last click: it re-scans every 5 s — slower than
+the 1 Hz the rest of the page polls at, because it walks the stamp directory — and immediately
+whenever a job settles or a draw finishes, the two events that move the numbers.
 
 Acceptance criteria for the r_57 exposure — a packaging or refactoring change touches no compute
 path, so any movement here means import order or thread clamping regressed:
