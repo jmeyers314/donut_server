@@ -67,6 +67,18 @@ def main() -> None:
         "first; only meaningful with --butler-repo "
         "(default LSSTCam/defaults; DONUT_SERVER_BUTLER_COLLECTIONS)",
     )
+    # Default-on, with a flag to get the raw log back. One open dashboard is
+    # ~2.5 access lines a second, which buries the one line a push emits -- and
+    # the lines it hides are the ones that carry no information: a successful
+    # GET on a route whose whole job is to be polled.
+    parser.add_argument(
+        "--access-log-polls",
+        action="store_true",
+        help="log the dashboard's successful polls too (/health, /admin/jobs, "
+        "/admin/log, /admin/plots, /admin/exposures); they are dropped by "
+        "default so compute activity is visible. Errors on those routes are "
+        "always logged",
+    )
     args = parser.parse_args()
 
     # These flags *are* a way of setting the environment variables, which is the
@@ -200,6 +212,16 @@ def main() -> None:
         print(f"  donutClient.py --host http://{args.host}:{args.port} --token {token} --visit <visit>")
 
     import uvicorn
+
+    if not args.access_log_polls:
+        # Imports the app's module in this process, which uvicorn.run is about to
+        # do anyway by string. The filter is attached to the "uvicorn.access"
+        # logger, which survives uvicorn's own dictConfig, so installing it here
+        # rather than after run() -- where there is no "after" -- works.
+        from lsst.ts.donut_server import server as _server
+
+        _server.quiet_dashboard_polls()
+        print("Dashboard polls are not in the access log (--access-log-polls shows them)")
 
     # By import string rather than by object: uvicorn resolves it after its own
     # setup, and this is the form that supports --reload if it is ever wanted.

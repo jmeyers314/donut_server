@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import ipaddress
 import itertools
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -111,6 +112,75 @@ RESULTS_HTML = os.path.join(_STATIC, "results.html")
 # list is paged. Newest first, since that is what a dashboard reads.
 JOBS_PAGE_DEFAULT = 50
 JOBS_PAGE_MAX = 500
+
+# The dashboard's timer-driven GETs. One open page issues a /health and an
+# /admin/jobs every second, an /admin/log every two and an /admin/plots every
+# five -- about 2.5 access-log lines a second, which buries the one line a push
+# emits and makes the terminal useless for watching compute. Dropped from the
+# access log by _PollFilter below.
+#
+# Paths rather than route names, matched exactly against the part before "?":
+# every one of these is a GET whose query string varies per request
+# (since_size=, limit=, bytes=), so a substring match would be the fragile
+# version of this.
+_POLL_PATHS = frozenset(
+    {
+        "/health",
+        "/admin/jobs",
+        "/admin/log",
+        "/admin/plots",
+        "/admin/exposures",
+    }
+)
+
+
+class _PollFilter(logging.Filter):
+    """Drop successful dashboard polls from uvicorn's access log.
+
+    Narrow on purpose, in three ways, because an access log that hides things is
+    worse than a noisy one:
+
+    - Only the paths in _POLL_PATHS, so a /prepare, a /push, a /results or a
+      plot fetch is always logged.
+    - Only 2xx. A 503 from /health is the service telling you it is not ready
+      and a 401 is a lockout; both are the reason someone is reading this log.
+    - Only GET, since POST /admin/plots is an operator pressing backfill.
+
+    Anything whose shape is not the 5-arg access record uvicorn emits is kept,
+    rather than guessed at: a uvicorn that changes its call signature should
+    make this filter inert, not silently start dropping real lines.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) != 5:
+            return True
+        _client, method, path, _http_version, status = args
+        if method != "GET" or not isinstance(status, int) or not 200 <= status < 300:
+            return True
+        if not isinstance(path, str):
+            return True
+        return path.split("?", 1)[0] not in _POLL_PATHS
+
+
+def quiet_dashboard_polls(enabled: bool = True) -> None:
+    """Install (or remove) _PollFilter on uvicorn's access logger.
+
+    Attached to the *logger* rather than to a handler, which is what makes the
+    call order irrelevant: uvicorn's dictConfig replaces the handlers on
+    "uvicorn.access" but keeps the logger object and its filters (measured
+    against uvicorn 0.53, and `disable_existing_loggers` is False in its
+    LOGGING_CONFIG), so the launcher can install this before `uvicorn.run`.
+
+    A function rather than an import-time side effect because importing this
+    module must not silently reconfigure logging for the tests and for
+    coordinator's smoke runs, which share it.
+    """
+    logger = logging.getLogger("uvicorn.access")
+    for existing in [f for f in logger.filters if isinstance(f, _PollFilter)]:
+        logger.removeFilter(existing)
+    if enabled:
+        logger.addFilter(_PollFilter())
 
 
 class JobState(str, Enum):

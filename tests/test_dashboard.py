@@ -11,6 +11,7 @@ none of the routes under test touch one.
 from __future__ import annotations
 
 import io
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -448,6 +449,105 @@ def test_log_slice_is_capped(monkeypatch, tmp_path):
     assert body["found"] is True
     assert body["truncated"] is True
     assert body["returned_bytes"] == logtail.SLICE_MAX_BYTES
+
+
+# ------------------------------------------------------------- access log filter
+
+def access_record(method="GET", path="/health", status=200):
+    """A record shaped exactly as uvicorn's access logger emits one.
+
+    The 5-arg tuple is uvicorn's own call signature (h11_impl.py: client,
+    method, path-with-query, http_version, status), and the filter reads those
+    positions -- so building the record by hand here is what pins this test to
+    that contract rather than to a formatted string.
+    """
+    return logging.LogRecord(
+        name="uvicorn.access", level=logging.INFO, pathname=__file__, lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("127.0.0.1:19340", method, path, "1.1", status),
+        exc_info=None,
+    )
+
+
+def test_the_poll_filter_drops_only_successful_dashboard_polls():
+    """The whole point is that it hides nothing an operator needs. A filter that
+    over-matched would silently swallow the 503 that says the coordinator is down,
+    on the very route someone would be watching for it."""
+    f = server._PollFilter()
+
+    # The 1 Hz traffic, including the query strings these actually carry.
+    for path in ("/health", "/admin/jobs?limit=50", "/admin/plots",
+                 "/admin/log?bytes=65536&since_size=1332252",
+                 "/admin/exposures"):
+        assert f.filter(access_record(path=path)) is False, path
+
+    # Everything the service exists to do is still logged.
+    for path in ("/prepare", "/push/j1", "/results/j1", "/result/j1/table",
+                 "/result/j1/plot/donut?size=full", "/dashboard", "/config"):
+        assert f.filter(access_record(path=path)) is True, path
+
+    # A failure on a polled route is the reason to be reading this log at all:
+    # 503 is "not ready", 401 is a lockout, 500 is a bug.
+    for status in (401, 403, 500, 503):
+        assert f.filter(access_record(status=status)) is True, status
+
+    # And a POST to a path that is polled by GET -- pressing backfill.
+    assert f.filter(access_record(method="POST", path="/admin/plots")) is True
+    # A redirect is not a success, and is worth seeing on a route like this.
+    assert f.filter(access_record(status=307)) is True
+
+
+def test_the_poll_filter_keeps_anything_it_does_not_recognize():
+    """Fail open, not closed. If uvicorn changes its access-record signature this
+    filter must go inert rather than start dropping real lines -- a silent hole in
+    the access log is far worse than the noise it was added to remove."""
+    f = server._PollFilter()
+
+    for args in ((), ("just-a-string",), ("a", "b", "c"),
+                 ("127.0.0.1", "GET", "/health", "1.1", 200, "extra")):
+        record = access_record()
+        record.args = args
+        assert f.filter(record) is True, args
+
+    # A pre-formatted message with no args at all, which is how uvicorn's *error*
+    # logger emits -- and that logger must never be touched by this.
+    record = access_record()
+    record.args = None
+    assert f.filter(record) is True
+
+    # Nonsense in the typed positions is kept rather than guessed at.
+    for args in (("c", "GET", "/health", "1.1", "200"),
+                 ("c", "GET", None, "1.1", 200)):
+        record = access_record()
+        record.args = args
+        assert f.filter(record) is True, args
+
+
+def test_quiet_dashboard_polls_installs_one_filter_and_can_be_undone():
+    """Idempotent because it is reachable twice in a process -- and a logger
+    accumulating a filter per call would be a leak that also makes the off switch
+    not work."""
+    logger = logging.getLogger("uvicorn.access")
+    before = list(logger.filters)
+    try:
+        server.quiet_dashboard_polls()
+        server.quiet_dashboard_polls()
+        installed = [f for f in logger.filters if isinstance(f, server._PollFilter)]
+        assert len(installed) == 1
+
+        server.quiet_dashboard_polls(False)
+        assert not [f for f in logger.filters if isinstance(f, server._PollFilter)]
+    finally:
+        # This is process-global state, so leaving it changed would leak into
+        # whatever test runs next.
+        logger.filters = before
+
+
+def test_importing_the_server_does_not_filter_anything_by_itself():
+    """The tests and coordinator's smoke runs import this module, and neither
+    should have its logging quietly reconfigured as a side effect of that."""
+    logger = logging.getLogger("uvicorn.access")
+    assert not [f for f in logger.filters if isinstance(f, server._PollFilter)]
 
 
 # ------------------------------------------------------------------ results view

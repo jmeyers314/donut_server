@@ -383,6 +383,12 @@ The backfill button's note is live, not frozen at the last click: it re-scans ev
 the 1 Hz the rest of the page polls at, because it walks the stamp directory — and immediately
 whenever a job settles or a draw finishes, the two events that move the numbers.
 
+An open dashboard is about 2.5 requests a second, so its **successful** polls (`/health`,
+`/admin/jobs`, `/admin/log`, `/admin/plots`, `/admin/exposures`) are dropped from uvicorn's access
+log — otherwise they bury the one line a push emits and the terminal is useless for watching compute.
+Only those paths, only GET, and only 2xx: a 503 from `/health`, a 401, a POST to `/admin/plots` and
+everything on the compute path are all still logged. `--access-log-polls` turns the filter off.
+
 Acceptance criteria for the r_57 exposure — a packaging or refactoring change touches no compute
 path, so any movement here means import order or thread clamping regressed:
 
