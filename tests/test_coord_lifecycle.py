@@ -856,6 +856,37 @@ def test_health_is_partial_when_one_flight_is_down(monkeypatch):
         assert prepare(client).json()["flight"] == 0
 
 
+def test_a_flight_counts_the_exposures_it_completed_and_keeps_the_count(monkeypatch):
+    """The dashboard's per-lane throughput number, and the two things it must get
+    right: only a *completed* push counts, and a restart does not reset it.
+
+    Surviving the restart is the deliberate part. The counter is about what the
+    service has served since the front-end came up -- a number an operator reads
+    to see whether a lane is pulling its weight -- and one that zeroed on every
+    respawn would answer a different question while looking like that one.
+    """
+    # Commands are prepare, push, prepare, push -- and the fourth crashes the child.
+    with make_client(monkeypatch, make_coord([None, None, None, "crash"])) as client:
+        coord = server.pool.flights[0]
+        poll_until(lambda: coord.state is CoordState.READY, what="READY")
+        assert coord.exposures == 0
+
+        job = prepare(client).json()["job_id"]
+        # A prepare on its own is not an exposure served: it may never be pushed.
+        assert coord.exposures == 0
+
+        assert client.post(f"/push/{job}", content=push_blob(), headers=auth()).status_code == 200
+        assert coord.exposures == 1
+        assert client.get("/health", headers=auth()).json()["flights"][0]["exposures"] == 1
+
+        # A push that loses the coordinator is not an exposure either, and the one
+        # already counted survives the restart that follows.
+        failed = prepare(client).json()["job_id"]
+        assert client.post(f"/push/{failed}", content=push_blob(), headers=auth()).status_code == 503
+        poll_until(lambda: coord.generation >= 2, what="generation 2")
+        assert coord.exposures == 1
+
+
 def test_restart_targets_one_flight_and_validates_the_index(monkeypatch):
     with make_client(monkeypatch, make_coord(), make_coord()) as client:
         for coord in server.pool.flights:

@@ -274,6 +274,70 @@ def test_admin_jobs_names_the_flight_that_ran_each_job(monkeypatch):
     assert pool._by_job == {"routed": 1}
 
 
+def test_health_counts_the_exposures_each_flight_has_served(monkeypatch):
+    """The dashboard's throughput readout. Taken off the Coord rather than counted
+    out of /admin/jobs, which is paged: a limit of 50 would have reported "how many
+    of the newest 50 jobs ran here" and silently changed meaning with an input box.
+    """
+    client = make_client(monkeypatch)
+    busy, fresh = FakeCoord(), FakeCoord()
+    for _ in range(3):
+        busy.note_exposure()
+    patch_pool(monkeypatch, busy, fresh)
+
+    flights = client.get("/health", headers=auth()).json()["flights"]
+
+    assert [f["exposures"] for f in flights] == [3, 0]
+
+
+def test_admin_exposures_lists_only_what_results_can_render(monkeypatch):
+    """The results page's exposure arrows step through this list, so a row here must
+    be a page that loads: /results 409s for a job with no table, and landing on one
+    by pressing an arrow would be indistinguishable from the feature being broken.
+
+    Newest first, like /admin/jobs, because the arrows are labelled against that
+    order -- "older" means further down this list.
+    """
+    done = _done_job("done")
+    older = _done_job("older")
+    jobs = {
+        "older": older,
+        "computing": JobRecord(job_id="computing", state=JobState.COMPUTING),
+        "failed": JobRecord(job_id="failed", state=JobState.ERROR, error="boom"),
+        "done": done,
+    }
+    client = make_client(monkeypatch, jobs)
+
+    assert client.get("/admin/exposures").status_code == 401
+
+    body = client.get("/admin/exposures", headers=auth()).json()
+
+    assert [e["job_id"] for e in body["exposures"]] == ["done", "older"]
+    # The visit is the label on the buttons, and it is the only other field: a row
+    # here must not grow into a second copy of /admin/jobs.
+    assert body["exposures"][0] == {"job_id": "done", "visit": 123}
+    assert body["returned"] == 2
+
+
+def test_admin_exposures_limit_counts_viewable_rows_not_scanned_ones(monkeypatch):
+    """`limit` has to bound the answer rather than the scan, or a long tail of
+    ERRORs would crowd the viewable exposures out of a page that still reported
+    itself full -- and the arrows would stop working for no visible reason."""
+    jobs = {f"bad{i}": JobRecord(job_id=f"bad{i}", state=JobState.ERROR) for i in range(5)}
+    jobs["good"] = _done_job("good")
+    # Newest last in insertion order, so the ERRORs are scanned *after* "good" only
+    # if the walk is newest-first -- which it is, making "good" the first row.
+    client = make_client(monkeypatch, jobs)
+
+    body = client.get("/admin/exposures?limit=1", headers=auth()).json()
+    assert [e["job_id"] for e in body["exposures"]] == ["good"]
+
+    # And the clamps, which are /admin/jobs' own so the two endpoints cannot drift.
+    assert client.get("/admin/exposures?limit=0", headers=auth()).json()["limit"] == 1
+    assert (client.get("/admin/exposures?limit=99999", headers=auth()).json()["limit"]
+            == server.JOBS_PAGE_MAX)
+
+
 def test_admin_jobs_reports_the_job_in_flight(monkeypatch):
     """active_job_ids drives which node the job diagram highlights, and it must skip
     the terminal states rather than just taking the newest rows."""
@@ -503,6 +567,10 @@ def test_results_rows_and_page_reject_the_unviewable(monkeypatch):
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
     assert "/admin/result/" in page.text
+    # The exposure arrows and the endpoint they step through: a wrong path here
+    # fails at request time in the browser, where no test would see it.
+    assert 'id="older"' in page.text and 'id="newer"' in page.text
+    assert "/admin/exposures" in page.text
 
 
 # ------------------------------------------------------- config overrides (-c/-C)
@@ -522,6 +590,10 @@ class FakeCoord:
         self.primed_args = primed_args
         self.state = state or server.CoordState.READY
         self.index = 0
+        self.exposures = 0
+
+    def note_exposure(self):
+        self.exposures += 1
 
     @property
     def config_snapshot(self):

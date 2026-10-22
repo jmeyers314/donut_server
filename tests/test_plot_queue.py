@@ -156,6 +156,9 @@ def test_a_flight_draws_queued_jobs_newest_first():
         assert len(q) == 0
         assert q.error_of("new") is None
         assert q.error_of("old") is None
+        # The dashboard's per-row "drawn" count, which is the same Coord field a
+        # Zernike flight uses for a completed push -- one exposure either way.
+        assert flight.exposures == 2
 
     asyncio.run(body())
 
@@ -171,6 +174,8 @@ def test_a_failed_draw_is_recorded_and_the_loop_survives():
             await q.start()
             await _drained(q)
             assert q.error_of("bad") is not None
+            # And a draw that failed is not counted as one served.
+            assert flight.exposures == 0
 
             # Still alive: a second job goes through.
             q.enqueue("good")

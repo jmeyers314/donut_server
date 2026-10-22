@@ -40,6 +40,10 @@
   input[type=search] { cursor: text; width: 20ch; }
   button:hover, select:hover { border-color: var(--dim); }
   button.on { border-color: var(--live); color: var(--live); }
+  /* The ends of both sequences -- the newest exposure, the last page of rows --
+     are reached often enough that a dead button needs to look dead. */
+  button:disabled { color: #5b616d; cursor: default; }
+  button:disabled:hover { border-color: var(--line); }
   .banner { padding: 8px 14px; background: #3a2320; color: #f0c9c4; display: none; }
   .banner.on { display: block; }
   .bar {
@@ -113,6 +117,15 @@
 <header>
   <h1>results</h1>
   <span class="dim" id="jid"></span>
+  <!-- Exposure navigation, deliberately up here next to the job id rather than in
+       the bar below: the bar's prev/next page the *rows* of one exposure, and two
+       pairs of identically-placed arrows would be read as the same control.
+
+       Disabled until /admin/exposures answers, so a click in that window cannot
+       find a neighbour in an empty list and do nothing visible. -->
+  <button id="older" title="older exposure (←)" disabled>← exposure</button>
+  <span class="dim" id="expo"></span>
+  <button id="newer" title="newer exposure (→)" disabled>exposure →</button>
   <span class="spacer"></span>
   <button id="cols">columns ▾</button>
   <button id="fails">only failed fits</button>
@@ -145,9 +158,17 @@
 "use strict";
 
 const el = (id) => document.getElementById(id);
-const JOB = decodeURIComponent(location.pathname.replace(/^\/results\//, ""));
-el("jid").textContent = JOB;
-document.title = "results " + JOB.slice(0, 8);
+// Mutable, because the exposure arrows switch job in place rather than reloading
+// the page: a reload would throw away the column picker, the sort and the filter,
+// which are exactly the settings an operator wants held while they step through
+// exposures comparing the same few columns.
+let JOB = decodeURIComponent(location.pathname.replace(/^\/results\//, ""));
+
+function showJob() {
+  el("jid").textContent = JOB;
+  document.title = "results " + JOB.slice(0, 8);
+}
+showJob();
 
 function banner(msg) {
   el("banner").textContent = msg || "";
@@ -223,6 +244,11 @@ function rowIndices() {
 }
 
 const shown = () => d.schema.filter((c) => !hidden.has(c.name));
+
+// A payload's column set as one comparable string, for deciding whether a step
+// onto another exposure needs the picker rebuilt. Order included on purpose: the
+// picker lists columns in schema order, so a reordering is a stale picker too.
+const schemaNames = (body) => body.schema.map((c) => c.name).join("\u0000");
 
 // ------------------------------------------------------------------ render
 
@@ -463,14 +489,20 @@ function renderPlots(p) {
 
 async function pollPlots() {
   if (plotTimer) { clearTimeout(plotTimer); plotTimer = null; }
+  // Which exposure this poll is about, captured before the await: the exposure
+  // arrows can switch JOB while it is in flight, and a reply describing the one
+  // the operator just left must not be rendered -- nor reschedule a poll, which
+  // would then race the new exposure's own loop.
+  const forJob = JOB;
   // Deliberately not through api(): a 409 here is the ordinary "not yet" state
   // and must not raise the page's error banner.
   let p = null;
   try {
-    const r = await fetch("/result/" + encodeURIComponent(JOB) + "/plots",
+    const r = await fetch("/result/" + encodeURIComponent(forJob) + "/plots",
                           {cache: "no-store"});
     if (r.ok) p = await r.json();
   } catch (e) { /* handled below: a failed fetch reschedules */ }
+  if (forJob !== JOB) return;
 
   if (p) {
     plotState = p.state;
@@ -487,23 +519,127 @@ async function pollPlots() {
   }
 }
 
+// ------------------------------------------------------- exposure navigation
+
+// Newest first, exactly as /admin/exposures serves it, so index 0 is the newest
+// and "older" means a higher index. Refreshed on every switch rather than cached
+// once: a run in progress adds exposures behind the operator's back, and the
+// newest-exposure arrow going permanently dead on a live service would be worse
+// than one extra small request per step.
+let expos = [];
+
+function expoIndex() {
+  return expos.findIndex((e) => e.job_id === JOB);
+}
+
+function renderNav() {
+  const i = expoIndex();
+  // Older is *later* in a newest-first list, so the ← button steps forward
+  // through the array. Getting this backwards is the easy mistake here.
+  el("older").disabled = i < 0 || i >= expos.length - 1;
+  el("newer").disabled = i <= 0;
+  if (i < 0) {
+    // Not in the list: this job's table is gone, or it never had one. The page
+    // itself still works -- it was loaded from somewhere -- so say why the
+    // arrows are dead rather than leaving them unexplained.
+    el("expo").textContent = expos.length ? "not in the exposure list" : "";
+    return;
+  }
+  const visit = expos[i].visit;
+  el("expo").textContent =
+    (visit === null || visit === undefined ? "exposure" : "visit " + visit) +
+    "   " + (i + 1) + " of " + expos.length + " (newest first)";
+}
+
+async function loadExposures() {
+  const body = await api("/admin/exposures");
+  if (!body) return;
+  expos = body.exposures || [];
+  renderNav();
+}
+
+// Switches the page to another exposure without a navigation: the column
+// picker, sort, filter and rows/page all carry over, which is the point of
+// stepping rather than reopening from the dashboard. `offset` does not carry
+// over -- row 400 of one exposure has nothing to do with row 400 of the next.
+async function goTo(job_id) {
+  if (!job_id || job_id === JOB) return;
+  JOB = job_id;
+  offset = 0;
+  showJob();
+  // Keeps the browser's back button and a copied URL meaningful, and matches
+  // what /results/<id> would have served.
+  history.replaceState(null, "", "/results/" + encodeURIComponent(JOB));
+  renderNav();
+  // The plot poller is keyed off JOB and may be mid-flight for the previous one;
+  // reset its state so a terminal "ready" from that exposure cannot stop this
+  // one's polling before it has an answer.
+  plotState = null;
+  el("plots").textContent = "";
+  await load();
+  pollPlots();
+  // Last, not first: the step itself is already decided from the list in hand, so
+  // this is only picking up exposures that landed since -- and doing it after the
+  // rows means a slow refresh never delays the thing the operator pressed.
+  loadExposures();
+}
+
+function step(delta) {
+  const i = expoIndex();
+  if (i < 0) return;
+  const next = expos[i + delta];
+  if (next) goTo(next.job_id);
+}
+
+el("older").onclick = () => step(1);
+el("newer").onclick = () => step(-1);
+
+// The arrow keys, which is how anyone comparing exposures actually wants to do
+// it. Ignored while a text field has focus -- in the filter box the arrows are
+// the caret's -- and when a modifier is down, where they are the browser's own
+// history and scroll gestures.
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+  if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  ev.preventDefault();
+  step(ev.key === "ArrowLeft" ? 1 : -1);
+});
+
 // ------------------------------------------------------------------ load
 
 async function load() {
   const limit = Number(el("limit").value);
-  const body = await api("/admin/result/" + encodeURIComponent(JOB) +
+  // Captured for the same reason pollPlots does it: arrow keys repeat faster than
+  // a page of rows comes back, so two loads can be in flight at once and the one
+  // that lands last must be the one the operator is looking at, not the newer
+  // request's reply being overwritten by an older exposure's.
+  const forJob = JOB;
+  const body = await api("/admin/result/" + encodeURIComponent(forJob) +
                          "/rows?offset=" + offset + "&limit=" + limit);
-  if (!body) return;
+  if (!body || forJob !== JOB) return;
+  const before = d;
   d = body;
   openRows.clear();
-  if (!el("picker").textContent) {
+  if (!before) {
+    // The first load decides the default set. Deliberately not re-derived on an
+    // exposure step: that would silently undo every column the operator had
+    // opened the moment they pressed an arrow, which is the opposite of what
+    // stepping is for.
+    //
     // Start on the columns an operator reads first; everything else is one click
     // away in the picker. 58 columns at once is unreadable.
-    const first = new Set(["det_name", "donut_id", "band", "candidate", "x_det", "y_det",
-                           "snr", "flux", "donut_radius", "group_id", "group_size",
-                           "group_fit_success", "group_fit_outcome", "group_fwhm",
-                           "zk_deviation_ccs", "zk_intrinsic_ccs"]);
+    const first = new Set(["det_name", "snr", "donut_radius", "group_fit_success",
+                           "group_fit_outcome", "group_fwhm", "zk_deviation_ccs"]);
     hidden = new Set(d.schema.map((c) => c.name).filter((n) => !first.has(n)));
+    renderPicker();
+  } else if (schemaNames(before) !== schemaNames(d)) {
+    // A step onto an exposure with different columns -- an override that adds or
+    // drops one, or a job from before a config change. The picker must be rebuilt
+    // or a new column would render in the table with no way to switch it off, but
+    // every *shared* column keeps the operator's choice: `hidden` is carried, and
+    // a name it has never seen defaults to shown.
     renderPicker();
   }
   render();
@@ -538,6 +674,7 @@ el("dl").onclick = async () => {
 
 load();
 pollPlots();
+loadExposures();
 </script>
 </body>
 </html>

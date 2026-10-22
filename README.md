@@ -245,6 +245,13 @@ Every finished job's three diagnostic figures are drawn automatically and shown 
 `/results/<job_id>`, the page the dashboard's job table links to. Thumbnails inline, full-res on
 click.
 
+That page steps between exposures with the **← exposure / exposure →** buttons or the **left and
+right arrow keys** (ignored while a text field has focus, where the arrows are the caret's). Stepping
+switches the job in place rather than reloading, so the column picker, the sort, the row filter and
+rows/page all carry over — which is the point, since comparing the same few columns across exposures
+is what the arrows are for. `GET /admin/exposures` is what they walk: it lists only jobs that still
+hold a result table, newest first, so an arrow can never land on a page that 409s.
+
 They are **not** drawn by the coordinator. Plotting measured ~16 s a job on the r_57 exposure (0.6 s
 reading the tables, 5 s building the figures, 10 s writing the six PNGs) against a ~30 s cadence, and the
 deferred hook that writes the stamps runs inside the coordinator's serial command loop — which does
@@ -352,6 +359,12 @@ header carries the front-end's own pid — the one to signal — its RSS, and th
 `POST /admin/restart?flight=N`, either because bring-up failed `MAX_RESTART_ATTEMPTS` times running
 or because the child reported a config error retrying cannot fix. The other flights keep serving,
 which is the `partial` in `/health`.
+
+Each flight also reports `exposures`: completed pushes on that lane since the **front-end** came up,
+with the pool's total in the section header. It deliberately survives a coordinator restart — the
+question it answers is whether a lane is pulling its weight, and a counter that zeroed on every
+respawn would look like that one while answering something else. A plot flight's row reports the same
+field as `drawn`, counting completed draws.
 
 The job table's rows are clickable: a click **pins** that job, and the detail panel below — phase
 bar, prepare timings, summary, and the quantum (`visit`, `group`, `n_raws`, `n_refcat_shards`,

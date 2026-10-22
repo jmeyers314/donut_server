@@ -320,13 +320,18 @@ config error that retrying cannot fix. The other flights keep serving.</title>
       <!-- `flight` rather than `blob`: the push size is the same ~308 MB on every
            job, so the column never said anything, while which lane ran a job is
            now what the two sections above are organized by. It is still in the
-           detail panel below for the one job that panel is about. -->
+           detail panel below for the one job that panel is about.
+
+           `runQuantum` and `parquet` are gone for the same reason: runQuantum is
+           most of `coord total` on every job, and is broken out exactly against
+           it in the detail panel's phase bar; the parquet size tracks `rows` and
+           is on the download itself. Neither distinguished one row from another. -->
       <th>job</th><th class="num">flight</th><th class="num">visit</th>
       <th>state</th><th>created</th>
       <th class="num">age</th>
-      <th class="num">runQuantum</th><th class="num">coord total</th>
+      <th class="num">coord total</th>
       <th class="num">rows</th><th class="num">dets</th><th class="num">groups</th>
-      <th class="num">parquet</th><th>results</th>
+      <th>results</th>
     </tr></thead>
     <tbody id="jobs-body"></tbody>
   </table>
@@ -493,8 +498,15 @@ function renderFlights(h) {
     el("flights").textContent = "";
     panels.clear();
   }
-  el("coord-note").textContent =
-    h.n_ready + "/" + h.n_flights + " ready" + (h.status === "partial" ? "  ·  partial" : "");
+  // The pool's throughput next to its readiness, so the header answers "is it up"
+  // and "has it done anything" together. Summed here rather than served as a
+  // pool-wide field: the per-flight numbers are already in the body, and a second
+  // server-side total could only ever disagree with their sum.
+  const note = [h.n_ready + "/" + h.n_flights + " ready"];
+  if (h.status === "partial") note.push("partial");
+  const served = flights.reduce((a, f) => a + (f.exposures || 0), 0);
+  note.push(served + (served === 1 ? " exposure" : " exposures"));
+  el("coord-note").textContent = note.join("  ·  ");
   // The whole service's footprint, which is the number that matters against the
   // host's RAM -- and the only place the front-end's own pid is shown.
   const fe = h.front_end;
@@ -528,6 +540,10 @@ function renderCoord(h) {
     put(facts, "span", "config stale", "chip off");
   }
   const pairs = [
+    // First, and ahead of the health counters: it is the throughput question
+    // these side-by-side panels are read to answer. Since the front-end came
+    // up, not since this child did -- a restart does not undo the work.
+    ["exposures", fmt.num(h.exposures)],
     ["gen", fmt.num(h.generation)], ["spawns", fmt.num(h.spawns)],
     ["attempts", fmt.num(h.restart_attempts)], ["pid", fmt.num(h.pid)],
     // The coordinator's own RSS, not its process group's: the task's eight fork
@@ -655,7 +671,10 @@ function renderPlotFlights(h) {
       a.target = "_blank";
     }
 
-    for (const [k, v] of [["pid", fmt.num(f.pid)], ["rss", fmt.ram(f.rss_bytes)],
+    // "drawn" rather than "exposures" off the same field: one exposure drawn is
+    // what it counts here, and the word says which of the two pools this row is.
+    for (const [k, v] of [["drawn", fmt.num(f.exposures)],
+                          ["pid", fmt.num(f.pid)], ["rss", fmt.ram(f.rss_bytes)],
                           ["up", fmt.age(f.child_uptime_s)],
                           ["spawns", fmt.num(f.spawns)]]) {
       const s = put(row, "span", k + " ");
@@ -848,12 +867,10 @@ function renderJobs(d) {
     put(tr, "td", j.state, "s-" + j.state);
     put(tr, "td", fmt.clock(j.created_wall));
     put(tr, "td", fmt.age(j.age_s), "num");
-    put(tr, "td", fmt.secs(t.run_quantum_s), "num");
     put(tr, "td", fmt.secs(t.coordinator_total_s), "num");
     put(tr, "td", fmt.num(s.n_rows), "num");
     put(tr, "td", fmt.num(s.n_detectors), "num");
     put(tr, "td", s.n_groups === undefined ? "–" : s.n_groups_succeeded + "/" + s.n_groups, "num");
-    put(tr, "td", fmt.bytes(j.parquet_bytes), "num");
     const td = put(tr, "td");
     if (j.has_table) {
       // A real href to /results/<id>, so middle-click and cmd-click open a tab the

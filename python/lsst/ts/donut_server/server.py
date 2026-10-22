@@ -310,6 +310,12 @@ class Coord:
         self._generation = 0
         self._spawns = 0
         self._restart_attempts = 0
+        # Completed work on this lane, counted for the life of the *front-end*
+        # rather than of the current child: it survives a restart on purpose,
+        # because "this flight has served 47 exposures" is the throughput
+        # question, and a counter that reset on every respawn would answer a
+        # different one. See note_exposure.
+        self._exposures = 0
         self._child_pid: Optional[int] = None
         self._child_started_at: Optional[float] = None
         self._last_loss: Optional[dict] = None
@@ -349,6 +355,23 @@ class Coord:
     @property
     def restart_attempts(self) -> int:
         return self._restart_attempts
+
+    @property
+    def exposures(self) -> int:
+        """Exposures this flight has computed since the front-end started."""
+        return self._exposures
+
+    def note_exposure(self) -> None:
+        """Count one exposure as served by this flight.
+
+        Called from the push path on success only, and deliberately not derived
+        from JOBS: that is paged and, more importantly, the dashboard's `limit`
+        bounds what it can see, so counting DONE rows there would report "how
+        many of the newest 50 jobs ran here" rather than a total. Kept on the
+        Coord because the number is per-lane, which is the comparison the
+        side-by-side flight panels exist to support.
+        """
+        self._exposures += 1
 
     @property
     def child_pid(self) -> Optional[int]:
@@ -1391,6 +1414,11 @@ class PlotQueue:
                 self._retries.pop(job_id, None)
                 if not resp.get("ok"):
                     self._record_error(job_id, resp.get("error", "plotting failed"))
+                else:
+                    # One exposure drawn. Counted on the same field a Zernike
+                    # flight uses for a completed push, so the dashboard reads
+                    # "exposures" the same way in both sections.
+                    flight.note_exposure()
             except asyncio.CancelledError:
                 # Shutdown, so this is bookkeeping for the benefit of whatever
                 # inspects the queue between the cancel and the exit -- the
@@ -1871,6 +1899,10 @@ async def _receive_and_dispatch(
     record.table_parquet = result.pop("table_parquet", None)
     record.result = result
     record.push_timings = timings
+    # Here rather than at /prepare: one exposure can be prepared and never
+    # pushed, or prepared on a lane that an ERROR then takes it off, and neither
+    # is work this flight did.
+    coord.note_exposure()
     # Enqueued, not awaited: the tables this needs are written by the
     # coordinator's deferred step, which runs *after* the reply we just received,
     # so the plot flight will find them by the time it gets there -- and if it
@@ -2301,6 +2333,11 @@ def _flight_health(coord: Coord, queue_depth: Optional[int] = None) -> dict:
         },
         "generation": coord.generation,
         "spawns": coord.spawns,
+        # How much work this lane has done since the front-end came up, which is
+        # the one number here that is about throughput rather than health. It
+        # counts completed pushes for a Zernike flight and completed draws for a
+        # plot flight -- one exposure either way.
+        "exposures": coord.exposures,
         "restart_attempts": coord.restart_attempts,
         "pid": coord.child_pid,
         # The coordinator's own RSS, which on this service oscillates 4-6 GB as
@@ -2495,6 +2532,42 @@ def _job_row(job_id: str, record: JobRecord, now: float) -> dict:
         "push_timings": record.push_timings,
         "table_url": f"/result/{job_id}/table",
     }
+
+
+@app.get("/admin/exposures", dependencies=[Depends(check_auth)])
+async def admin_exposures(response: Response, limit: int = JOBS_PAGE_MAX):
+    """The viewable exposures, newest first: just an id and a visit each.
+
+    Exists so the results page's exposure arrows can find their neighbours. It is
+    deliberately *not* /admin/jobs with a filter: a row there carries the whole
+    summary, both timing dicts and the quantum, which is two orders of magnitude
+    more bytes than this page needs to label two buttons -- and that endpoint's
+    `limit` is the dashboard's table length, so reusing it would silently make how
+    far an operator can step through exposures depend on an unrelated input box.
+
+    Only jobs that still hold a table are listed, because those are the only ones
+    /results can render -- so stepping never lands on a page that 409s. The
+    front-end's own retention is therefore what bounds this, which is the honest
+    answer: a job whose parquet is gone is not an exposure you can look at.
+    """
+    limit = max(1, min(JOBS_PAGE_MAX, limit))
+    out = []
+    # Newest first and stopping at `limit`, like /admin/jobs -- but counting only
+    # the rows that survive the filter, so a long tail of ERRORs cannot crowd out
+    # the viewable exposures the arrows are for. The cost of that is O(len(JOBS))
+    # rather than O(limit) when fewer than `limit` jobs have tables at all, which
+    # is a dict walk with no parquet read in it, on a route that runs when an
+    # operator presses an arrow rather than on any poll loop.
+    for job_id, record in reversed(JOBS.items()):
+        if record.table_parquet is None:
+            continue
+        quantum = (record.result or {}).get("quantum") or {}
+        out.append({"job_id": job_id, "visit": quantum.get("visit")})
+        if len(out) >= limit:
+            break
+
+    response.headers.update(_NO_STORE)
+    return {"exposures": out, "returned": len(out), "limit": limit}
 
 
 @app.get("/admin/jobs", dependencies=[Depends(check_auth)])
