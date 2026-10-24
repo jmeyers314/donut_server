@@ -232,6 +232,8 @@ class TestResolveSourceRouting:
         import sys
         import types
 
+        import lsst.ts.donut_server
+
         # resolve_source imports daq locally; a stub module satisfies it
         # without pulling in the stack.
         fake_daq = types.ModuleType("lsst.ts.donut_server.daq")
@@ -241,6 +243,12 @@ class TestResolveSourceRouting:
         monkeypatch.setitem(
             sys.modules, "lsst.ts.donut_server.daq", fake_daq
         )
+        # The sys.modules entry alone is not enough: `from lsst.ts.donut_server
+        # import daq` resolves the *package attribute* in preference to
+        # sys.modules, and that attribute exists as soon as anything in the run
+        # has imported the real daq (tests/test_daq.py does). Without this the
+        # stub is silently bypassed and the real module reads tmp_path.
+        monkeypatch.setattr(lsst.ts.donut_server, "daq", fake_daq, raising=False)
         monkeypatch.setattr(trigger, "read_live_headers", fake_read_live)
         monkeypatch.setattr(trigger, "replay_headers", fake_replay_headers)
         monkeypatch.setattr(trigger, "report_substitution", lambda *a: None)

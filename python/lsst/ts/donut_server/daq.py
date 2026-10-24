@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lsst.ts.donut_server import client
+from lsst.ts.donut_server import exposure_codec
 
 # The eight corner wavefront sensors, as DAQ filenames spell them. SW0 is
 # extra-focal, SW1 intra-focal.
@@ -144,6 +145,136 @@ def _camera():
     return _CAMERA
 
 
+def _assemble_image(handle: RawHandle, out=None):
+    """Read one DAQ file's amp HDUs into a single untrimmed image array.
+
+    What `readRawAmps` + `fixAmpsAndAssemble` do, minus the two thirds of the
+    work that goes into planes nobody reads. Those helpers wrap every amp in a
+    `MaskedImage` and then copy all three planes into the assembled CCD, but a
+    raw's mask and variance are identically zero -- which is exactly why
+    `exposure_codec` does not send them, and why the receiver reconstructs them
+    with `ExposureF(bbox)`. Worth roughly a third of the serial encode.
+
+    Verified bit-identical to `fixAmpsAndAssemble` on all eight corner sensors,
+    against the independently-assembled `raw/raw_*.fits`; `tests/test_daq.py`
+    is that comparison.
+
+    `out` is an optional destination array to blit into, for a caller that has
+    somewhere specific it wants the pixels and would otherwise copy them again.
+
+    Returns `(array, bbox, detector)`, where `detector` has been through
+    `makeUpdatedDetector` and so describes the *assembled* image: its amps'
+    `getRawBBox()`es are in assembled coordinates, which is what the amps on an
+    `ExposureF` read back from `raw/raw_*.fits` look like and what the receiver
+    will compare against.
+    """
+    import numpy as np
+
+    import lsst.afw.cameraGeom as cameraGeom
+    import lsst.afw.cameraGeom.utils as cameraGeomUtils
+    import lsst.afw.image as afwImage
+    from lsst.obs.lsst.assembly import fixAmpGeometry, warn_once
+
+    detector = _camera()[handle.detector_num]
+
+    # `fixAmpGeometry` is kept even though this no longer calls
+    # `fixAmpsAndAssemble`. It costs nothing measurable (what the rewrite saves
+    # is the three-plane copy inside assembleCcd, not this check) and it is not
+    # only a geometry *fix* but a guard: it raises when an on-disk bbox differs
+    # from cameraGeom in a way overscan cannot explain. On today's files it
+    # modifies 0 of 16 amps, so it is here entirely for the day the camera
+    # starts writing a different layout -- which would otherwise land as
+    # silently wrong pixels. Rebuilding the detector from its output is also
+    # what `fixAmpsAndAssemble` does, and the geometry below has to come from
+    # the corrected amps rather than the raw cameraGeom ones.
+    with warn_once(handle.path) as logCmd:
+        builder = detector.rebuild()
+        builder.clear()
+        readers = []
+        for hdu, amp in enumerate(detector, start=1):
+            reader = afwImage.ImageFitsReader(handle.path, hdu=hdu)
+            readers.append(reader)
+            fixed, _modified = fixAmpGeometry(
+                amp,
+                bbox=reader.readBBox(),
+                metadata=reader.readMetadata(),
+                logCmd=logCmd,
+            )
+            builder.append(fixed)
+        detector = builder.finish()
+
+    full = cameraGeomUtils.calcRawCcdBBox(detector)
+    shape = (full.getHeight(), full.getWidth())
+    if out is None:
+        out = np.empty(shape, dtype=exposure_codec.IMG_DTYPE)
+    elif out.shape != shape:
+        raise RuntimeError(
+            f"destination is {out.shape}, but {handle.path} assembles to {shape}"
+        )
+
+    for reader, amp in zip(readers, detector):
+        array = reader.read(dtype=np.dtype(np.int32), allowUnsafe=True).getArray()
+        if amp.getRawFlipX():
+            array = array[:, ::-1]
+        if amp.getRawFlipY():
+            array = array[::-1, :]
+
+        target = amp.getRawBBox()
+        target.shift(amp.getRawXYOffset())
+        out[
+            target.getMinY() - full.getMinY() : target.getMaxY() + 1 - full.getMinY(),
+            target.getMinX() - full.getMinX() : target.getMaxX() + 1 - full.getMinX(),
+        ] = array
+
+    # The amp images have been moved into place in one CCD-sized image, so the
+    # amps have to be told where they now live -- exactly what assembleCcd does
+    # for an untrimmed assembly, and what makes these bboxes match a detector
+    # read back off an assembled file.
+    return out, full, cameraGeom.makeUpdatedDetector(detector)
+
+
+def _build_stub(handle: RawHandle, bbox, detector):
+    """A 1x1 `ExposureF` carrying everything about this raw except its pixels.
+
+    `exposure_codec` ships the metadata as a 1x1 subimage (see its module
+    docstring for why), so the pixels this carries are never sent and a 1x1
+    exposure is all the metadata path needs. `attachRawWcsFromBoresight`
+    requires a real `Exposure` with metadata and a detector on it, which is why
+    this cannot be a bare dict.
+
+    `detector` is the assembled-coordinates one from `_assemble_image`, not raw
+    cameraGeom: it is what crosses the wire, and the WCS is built against it.
+    """
+    import lsst.afw.image as afwImage
+    import lsst.geom as geom
+    from lsst.obs.lsst import LsstCam
+    from lsst.obs.lsst.assembly import attachRawWcsFromBoresight
+
+    stub = afwImage.ExposureF(geom.Box2I(bbox.getMin(), geom.Extent2I(1, 1)))
+    stub.setDetector(detector)
+
+    # Order matters: attachRawWcsFromBoresight re-reads the metadata off the
+    # exposure to build the VisitInfo, so the header has to be on it first.
+    # This is also what makes a substituted header reach the WCS: the pointing
+    # it describes is the one the stars in these pixels were taken at, which is
+    # what the coordinator's refcat-coverage cross-check is checking.
+    stub.setMetadata(handle.header)
+    attachRawWcsFromBoresight(stub)
+
+    # The assembly helpers set VisitInfo, id and WCS but not the FilterLabel --
+    # that is the formatter's job, and the coordinator cross-checks the pushed
+    # filter against the one /prepare loaded calibs for, so an absent label
+    # fails the push rather than silently pairing the wrong flat.
+    physical = obs_info(handle.header, filename=handle.path).physical_filter
+    stub.setFilter(
+        afwImage.FilterLabel(
+            band=LsstCam.filterDefinitions.physical_to_band[physical],
+            physical=physical,
+        )
+    )
+    return stub
+
+
 def load_raw(handle: RawHandle):
     """Assemble one DAQ-native amplifier file into an `ExposureF`.
 
@@ -155,41 +286,25 @@ def load_raw(handle: RawHandle):
     overscan present and ISR not yet run -- which is what the coordinator's
     `runQuantum` expects to be handed.
 
+    The whole-exposure entry point, for `RawSource.load` and anything else
+    wanting one object; `_assemble_image` and `_build_stub` are the two halves
+    for a caller that needs the pixels and the metadata separately.
+
     Imported lazily, so that importing this module costs nothing.
     """
     import lsst.afw.image as afwImage
-    from lsst.obs.lsst.assembly import (
-        attachRawWcsFromBoresight,
-        fixAmpsAndAssemble,
-        readRawAmps,
-    )
 
-    camera = _camera()
-    exposure = fixAmpsAndAssemble(
-        readRawAmps(handle.path, camera[handle.detector_num]), handle.path
-    )
+    array, bbox, detector = _assemble_image(handle)
+    stub = _build_stub(handle, bbox, detector)
 
-    # Order matters: attachRawWcsFromBoresight re-reads the metadata off the
-    # exposure to build the VisitInfo, so the header has to be on it first.
-    # This is also what makes a substituted header reach the WCS: the pointing
-    # it describes is the one the stars in these pixels were taken at, which is
-    # what the coordinator's refcat-coverage cross-check is checking.
-    exposure.setMetadata(handle.header)
-    attachRawWcsFromBoresight(exposure)
-
-    # The assembly helpers set VisitInfo, id and WCS but not the FilterLabel --
-    # that is the formatter's job, and the coordinator cross-checks the pushed
-    # filter against the one /prepare loaded calibs for, so an absent label
-    # fails the push rather than silently pairing the wrong flat.
-    from lsst.obs.lsst import LsstCam
-
-    physical = obs_info(handle.header, filename=handle.path).physical_filter
-    exposure.setFilter(
-        afwImage.FilterLabel(
-            band=LsstCam.filterDefinitions.physical_to_band[physical],
-            physical=physical,
-        )
-    )
+    exposure = afwImage.ExposureF(bbox)
+    exposure.getImage().getArray()[:] = array
+    exposure.setDetector(stub.getDetector())
+    exposure.setMetadata(stub.getMetadata())
+    exposure.setWcs(stub.getWcs())
+    exposure.setFilter(stub.getFilter())
+    exposure.getInfo().setVisitInfo(stub.getInfo().getVisitInfo())
+    exposure.getInfo().setId(stub.getInfo().getId())
     return exposure
 
 
