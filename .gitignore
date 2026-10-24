@@ -4,6 +4,11 @@
 /raw/
 /ref_cat/
 
+# DAQ-native exposures the producers read, and the tree a BTS replay's original
+# metadata is looked up in. 1.2 GB for ten exposures, so a stray `git add -A`
+# after an afternoon of testing would try to stage all of it.
+/replay/
+
 # The output tree, if DONUT_SERVER_STAMP_DIR points into the checkout -- which the
 # README's own example does. ~75 MB a job and unpruned, so a stray `git add -A`
 # after an afternoon of testing would otherwise try to stage several GB.

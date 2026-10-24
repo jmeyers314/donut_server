@@ -239,6 +239,144 @@ upstream default to True, because the focal-plane selection plot needs the two t
 "persisting" them here means a dict insert into the in-memory butler. Turning it back off wires
 `cornerResults` alone, and the focal-plane plot is then skipped while the other two still draw.
 
+## Producers
+
+Three ways to drive the service, in order of how production-like they are:
+
+| launcher | picks the exposure | reads | for |
+|---|---|---|---|
+| `bin/donutClient.py` | `--visit`, from `raw_*.fits` or a butler repo | assembled raws | development, `--loop` cadence tests |
+| `scripts/run_sequence.py` | walks a tree, one dir per exposure, at `--delay` | DAQ-native amp files | replaying a night at a chosen cadence |
+| `bin/donutTrigger.py` | one directory, given to it by the camera | DAQ-native amp files | **production and BTS** |
+
+The last two share the DAQ read path in `daq.py`: the camera writes *unassembled amplifier* images,
+one FITS per corner sensor with eight `Segment1x` HDUs, and the wire format carries an assembled
+`ExposureF`, so assembly happens producer-side until the raws are ingested into a butler.
+
+### The camera trigger
+
+In production the camera drives the service. Whenever it writes a FITS file it invokes a per-file
+script that compresses it, writes a JSON sidecar, and ships it to OODS and USDF; one extra step in
+that script calls `bin/donutTrigger.py` with the exposure's directory. The hook is wired for **one
+sensor only** — `R00_SW0` — so a script that runs per *file* fires once per *exposure*:
+
+```zsh
+bin/donutTrigger.py /path/to/MC_O_20260713_000050            # poll, submit, wait for Zernikes
+bin/donutTrigger.py /path/to/exposure --dry-run              # resolve, submit nothing
+bin/donutTrigger.py /path/to/exposure --detach --log-dir /var/log/aos
+```
+
+Firing on the first corner sensor means the other seven may not have landed, so it polls until all 8
+`_R??_SW?.fits` have sidecars *and* have stopped growing — `--stable-checks` consecutive polls at an
+unchanged size, since a 9.5 MB FITS that exists is not necessarily one that is finished. Only then
+does the `/prepare` → `/push` → `/result` cycle run. **Nothing is prepared while the shutter is
+open**: everything happens after readout, which costs the latency the two-phase protocol was built to
+avoid, but the camera hook is the only trigger available today.
+
+`--detach` is for the hook, which sits on the camera's own critical path: it re-runs the command in a
+new session with output to `--log-dir/<exposure>.log` and returns in ~1.7 s, against a 0.73 s
+bare-interpreter baseline — i.e. what is left is Python startup. That is only true because
+`trigger.py` imports `client` *lazily*; it reaches `lsst.afw.image` through `exposure_codec`, and a
+top-level import would silently put ~5 s back on the hook. A test asserts the module stays clean of
+`lsst.afw` for that reason. The trade is that the child's exit status reaches nobody, so a failure is
+visible only in the log — which is why the detached child also arms a `SIGALRM` watchdog over its
+whole life rather than risking an orphan.
+
+Two guards worth knowing, because both are silent when they work:
+
+- **A hook that fires twice submits once.** Before pushing, the trigger claims
+  `<state-dir>/<visit>.done` with `O_CREAT | O_EXCL`; a second firing logs and exits 0. Keyed on the
+  *visit*, not the directory name, so the same pixels replayed twice are still caught. `--state-dir ''`
+  disables it.
+- **Calibration frames are skipped.** `DARK`/`BIAS`/`FLAT` exit 0 without pushing, since they have no
+  stars and would burn a flight to reach an empty donut catalog. `--any-imgtype` forces them through.
+  Anything outside `CWFS`/`ACQ`/`SCIENCE`/`OBJECT` is processed but flagged.
+
+Note the trigger reads **uncompressed** DAQ files: a directory holding only `.fz` files fails naming
+that as the cause, because `readRawAmps` cannot read one and whether our step runs before or after
+the camera script's compression step is still an open question.
+
+### Replayed exposures at BTS
+
+The Base Test Stand replays real images through the simulated camera, so files appear exactly as they
+would on the real camera — but **BTS replays the pixels, not the metadata**. The headers carry the
+simulated telescope's time and pointing, not the values present when the data was taken.
+
+**The service cannot detect this, and will not refuse it.** This was measured, and the result is the
+reason substitution exists rather than being a convenience. Pushing a replayed exposure under BTS's
+own headers — `FILTER z_20`, boresight `(120, -45)`, a date three months off, against pixels actually
+taken in `r_57` at `(215.5, -10.1)` — came back `DONE`, with 74 donut rows and 6 of 6 groups
+"succeeded". Every cross-check passed, because each one checks *consistency*, not truth:
+
+- the filter check compares the pushed raws against what `/prepare` loaded, and both said `z_20` —
+  consistently wrong, so the `z_20` flat was paired with `r_57` pixels without complaint
+- the refcat-coverage check asks whether the shards loaded cover the raws' WCS, and that WCS was
+  built *from the same bad boresight*, so the shards covered it exactly. Donuts in pixels from one
+  field were matched against Gaia sources from another, and the fit converged on that
+
+So the answer looks healthy and is meaningless. Nothing downstream flags it. With substitution the
+same pixels give `visit=2026071300050 physical_filter=r_57`, 62 rows and 8 of 8 groups, with
+`donut_id` values that are genuine Gaia ids for the field the pixels are of.
+
+| variable | meaning |
+|---|---|
+| `DONUT_SERVER_REPLAY_DIR` | a replay tree, one subdirectory per original exposure, named by OBSID. **Setting it switches substitution on**; unset, headers come from the polled directory, which is what the real camera needs |
+| `DONUT_SERVER_REPLAY_OBSID` | pin one exposure and skip the lookup — for hand testing, and for a replay whose marker is missing or names something not in the tree |
+
+```zsh
+export DONUT_SERVER_REPLAY_DIR=/path/to/replays
+bin/donutTrigger.py /path/to/live/exposure --dry-run
+```
+
+Which original is being replayed is read from **`EMUIMAGE`**, the emulator's own record of what it
+replayed. Its value is a bare OBSID, matching how the replay tree names its exposure directories, so
+the lookup is a path join:
+
+```json
+"OBSID"    : "MC_O_20261022_000001",     // what BTS wrote
+"EMUIMAGE" : "MC_O_20250530_000395",     // what it replayed
+```
+
+It is read from **all 8 sensors and cross-checked**, not trusted from one: a directory holding files
+from two different replays would otherwise substitute successfully, pass every downstream check, and
+answer wrongly. Disagreement names each value and the detectors that carried it.
+
+The keyword is absent on real camera files (verified across a tree of originals, including a check
+for blank-valued cards), which is what makes it safe to *require*. With `DONUT_SERVER_REPLAY_DIR`
+set, an absent or blank `EMUIMAGE` is a hard error naming the offending detectors — that is what
+pointing the replay path at real data looks like, and continuing would submit it under whatever
+pointing happened to be in the headers.
+
+**Setting the variable is the switch, not the marker's presence.** Running a replay *without*
+substitution is a deliberate test — forcing every WCS to describe the wrong sky — so unsetting the
+variable has to keep working, and it does.
+
+What gets substituted is the **whole primary header**, per detector, so filter, pointing, times and
+`FOCUSZ` all come from the original observation and stay consistent with the pixels. Two rules make
+that safe, and both are load-bearing: the substitute is matched to a live file by **detector name read
+from the live header** (`RAFTBAY` + `CCDSLOT`), never by filename, and the detector *number* likewise
+comes from the live file, because it indexes cameraGeom for the amp layout the pixels are actually in.
+Only metadata describing the *observation* is taken from the substitute.
+
+Every replay logs what it matched and what it changed, so a desynced replay is visible in the
+trigger's own log rather than only downstream as an inexplicably bad fit:
+
+```
+replay: EMUIMAGE names original exposure MC_O_20260713_000050
+replay: EMUIMAGE MC_O_20260713_000050 -> loaded MC_O_20260713_000050
+replay metadata substitution (live -> substituted):
+    OBSID     BT_S_20261023_000007    -> MC_O_20260713_000050   *
+    FILTER    g_6                     -> r_57   *
+    RA        120.0                   -> 215.53529628997933   *
+    DEC       -45.0                   -> -10.118127176345915   *
+```
+
+The second line checks the marker against the OBSID of the headers actually loaded, and prints
+`<- MISMATCH` when they differ — which is exactly what `DONUT_SERVER_REPLAY_OBSID` pinning the wrong
+exposure looks like. `EMUIMAGE` gets its own line rather than a row in the table because the
+*original* has no `EMUIMAGE` (only replays do), so a live-vs-substituted column would show every
+correct substitution as a change to `<absent>`.
+
 ## Diagnostic plots
 
 Every finished job's three diagnostic figures are drawn automatically and shown on
@@ -328,7 +466,7 @@ ordinary state for the ~17 s after a job reports DONE, exactly as `/result/<job_
 ## Verification
 
 ```zsh
-python -m pytest tests/ -q                      # 252 tests; the butler-backend 14
+python -m pytest tests/ -q                      # 294 tests; the butler-backend 14
                                                 # skip unless DONUT_SERVER_BUTLER_REPO is set,
                                                 # and the RUN-fallback one also needs a repo
                                                 # whose chain includes the producer runs
@@ -344,6 +482,51 @@ bin/donutClient.py --visit 2026071300478 --wait 60 --images   # also saves the s
 bin/donutClient.py --visit 2026071300478 --wait 60 -c maxFitScatter=2.0
 curl -si localhost:8000/config | head -20       # 200, X-Donut-Stale: 0
 ```
+
+### Rehearsing a replay
+
+The camera trigger has no server-side half to test, so it is checked by feeding it a directory —
+which is also how to rehearse before BTS access. `scripts/replay_drill.py` builds a fake replayed
+exposure from a real one, in two steps: it prints the expected answer and the trigger command for a
+second terminal, then waits on Enter and copies all 8 sensors in.
+
+```zsh
+export DONUT_SERVER_REPLAY_DIR=$PWD/replay
+scripts/replay_drill.py                                  # first exposure in the tree
+scripts/replay_drill.py --source replay/MC_O_20260713_000250
+scripts/replay_drill.py --emuimage MC_O_99999999_000001  # deliberate mismatch
+scripts/replay_drill.py --no-pause                       # unattended
+```
+
+The copy is one shot rather than drip-fed: whether the trigger counts sensors up to 8 and waits for
+their sizes to settle is the polling logic's own business, covered directly in
+`tests/test_trigger.py`. What the drill is for is the part no test can reach — that substituted
+headers survive assembly and come back as the *original* exposure's Zernikes.
+
+The mangling is the point: the copy keeps the pixels but gets a different filter, a far-away
+pointing, another night's timestamps and `FOCUSZ 0`, so a run that *silently failed to substitute* is
+distinguishable from one that worked. Stage 1 prints the expected answer before anything runs —
+compare against that rather than deciding afterwards whether the output looked about right.
+
+**Do not judge it by `DONE`.** Both the substituted and unsubstituted runs succeed; see
+[Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service cannot tell them apart.
+On `MC_O_20260713_000050`'s pixels the substituted run is identifiable by
+`visit=2026071300050 filter=r_57 boresight=(215.5361, -10.1181)` and 8 of 8 groups fit, whatever the
+files are labelled.
+
+Four paths worth walking at least once, all verified:
+
+| run | expected |
+|---|---|
+| `DONUT_SERVER_REPLAY_DIR` set | the original's `r_57` and pointing, `EMUIMAGE ... -> loaded ...` agreeing |
+| unset | the mangled `g_6` and `(120, -45)`, submitted as-is — the deliberate wrong-sky test |
+| `--emuimage` naming an absent exposure | hard failure naming the directory and suggesting `DONUT_SERVER_REPLAY_OBSID` |
+| a real exposure (`replay/MC_O_*`) with the variable set | hard failure listing all 8 detectors as lacking `EMUIMAGE` |
+
+**Check the substituted run, not just that the unsubstituted one differs.** Both come back `DONE` —
+see [Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service cannot tell the
+difference. The substituted one is identifiable by `physical_filter: r_57` in the quantum and 8 of 8
+groups fit; the unsubstituted one reports `z_20` and fits 6 of 6 of a different, meaningless grouping.
 
 The dashboard is at <http://127.0.0.1:8000/dashboard> and needs no credential: the server exempts
 loopback callers and serves the page to nobody else, so reaching it from another machine means an
