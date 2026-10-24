@@ -20,12 +20,21 @@ them into `{sensor: (img, meta)}`.
 """
 from __future__ import annotations
 
+import os
 import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 MAGIC = b"DWFS"
 VERSION = 2
+
+# Where a tmpfs-backed shm_open puts its blocks, when there is one. Checked for
+# existence rather than assumed: this is the Linux layout, and on macOS --
+# a supported dev platform -- POSIX shared memory is kernel-backed with no
+# mount to interrogate at all, so the capacity check is skipped there.
+# The path is not configurable: CPython prefixes the block name with "/" and
+# hands it to shm_open, which resolves it under this mount wherever it exists.
+SHM_MOUNT = "/dev/shm"
 
 IMG_SUFFIX = ":img"
 META_SUFFIX = ":meta"
@@ -37,6 +46,28 @@ HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 # name_len(B), offset(Q), byte_count(Q) -- part name bytes follow, variable length
 _DESC_FIXED_FMT = ">BQQ"
 _DESC_FIXED_SIZE = struct.calcsize(_DESC_FIXED_FMT)
+
+
+def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
+    """Bytes available on `mount`, or None if there is nothing to measure.
+
+    None covers both "no such mount" (macOS, where POSIX shared memory is
+    kernel-backed) and a statvfs that fails for any reason: in neither case do we
+    know the capacity, and a guess would either refuse a working server or
+    promise capacity that is not there.
+
+    Lives here rather than in `server.py` -- where it started and where
+    `check_shm_capacity` still calls it -- because the producer side needs the
+    same check before it writes a block, and `server.py` imports FastAPI.
+    """
+    try:
+        st = os.statvfs(mount)
+    except OSError:
+        return None
+    # f_bavail, not f_bfree: the latter counts root-only reserve a server running
+    # as an ordinary user cannot have. For tmpfs they are equal, but this is also
+    # the correct read if SHM_MOUNT is ever something else.
+    return st.f_bavail * st.f_frsize
 
 
 class ProtocolError(ValueError):
@@ -106,6 +137,73 @@ def split_parts(parts: Mapping[str, bytes]) -> dict[str, tuple[bytes, bytes]]:
             raise ProtocolError(f"sensor {sensor!r} missing part(s): {missing}")
         result[sensor] = (found[IMG_SUFFIX], found[META_SUFFIX])
     return result
+
+
+def descriptor_region_size(names) -> int:
+    """Bytes the descriptors for `names` will occupy.
+
+    Computable from the names alone, which is what lets a producer that writes
+    parts *in place* know where the part-data section starts before it has any
+    part bytes to write. See `build_framing`.
+    """
+    total = 0
+    for name in names:
+        name_bytes = name.encode("utf-8")
+        if len(name_bytes) > 255:
+            raise ProtocolError(f"part name too long: {name!r}")
+        total += _DESC_FIXED_SIZE + len(name_bytes)
+    return total
+
+
+def build_framing(sizes: Mapping[str, int], offsets: Mapping[str, int] | None = None):
+    """The header+descriptor prefix for parts of known size, and their offsets.
+
+    Returns `(framing, absolute_offsets, total_size)`: the bytes to write at the
+    start of the blob, where each part must then be written (absolute, from the
+    start of the blob), and how long the whole blob is.
+
+    This is the in-place counterpart to `pack_blob`, for a producer that writes
+    each part straight into shared memory at its final wire position instead of
+    building the parts and concatenating them. `pack_blob` copies the whole
+    payload twice; this copies it not at all.
+
+    `offsets` optionally pins each part's offset *relative to the part-data
+    section*, for a caller that wants fixed-size slots (e.g. one per sensor,
+    sized from cameraGeom before any pixel is read). Gaps between parts are
+    legal -- `parse_layout` bounds-checks each descriptor against
+    `payload_length` and never assumes the parts tile the payload -- so the
+    pinned offsets need not be contiguous. Omitted means pack them in iteration
+    order with no gaps, matching `pack_blob`'s layout.
+    """
+    names = list(sizes)
+    if offsets is None:
+        offsets = {}
+        cursor = 0
+        for name in names:
+            offsets[name] = cursor
+            cursor += sizes[name]
+        payload_length = cursor
+    else:
+        missing = [name for name in names if name not in offsets]
+        if missing:
+            raise ProtocolError(f"no offset given for part(s): {missing}")
+        # The payload must *cover* every part, including any gap before it.
+        payload_length = max(offsets[name] + sizes[name] for name in names)
+
+    descriptors = bytearray()
+    for name in names:
+        name_bytes = name.encode("utf-8")
+        if len(name_bytes) > 255:
+            raise ProtocolError(f"part name too long: {name!r}")
+        descriptors += struct.pack(
+            _DESC_FIXED_FMT, len(name_bytes), offsets[name], sizes[name]
+        )
+        descriptors += name_bytes
+
+    header = struct.pack(_HEADER_FMT, MAGIC, VERSION, len(names), payload_length)
+    data_start = HEADER_SIZE + len(descriptors)
+    absolute = {name: data_start + offsets[name] for name in names}
+    return bytes(header) + bytes(descriptors), absolute, data_start + payload_length
 
 
 def pack_blob(parts: Mapping[str, bytes]) -> bytes:

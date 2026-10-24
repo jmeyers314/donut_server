@@ -46,13 +46,12 @@ MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 # payload that MAX_PUSH_BYTES caps.
 SHM_SIZE = MAX_PUSH_BYTES + 1024 * 1024
 
-# Where a tmpfs-backed shm_open puts its blocks, when there is one. Checked for
-# existence rather than assumed: this is the Linux layout, and on macOS --
-# a supported dev platform -- POSIX shared memory is kernel-backed with no
-# mount to interrogate at all, so the capacity check below is skipped there.
-# The path is not configurable: CPython prefixes the block name with "/" and
-# hands it to shm_open, which resolves it under this mount wherever it exists.
-SHM_MOUNT = "/dev/shm"
+# Both defined in protocol.py, which the producer side also needs them from and
+# which imports no FastAPI. Re-exported under their original names because
+# `check_shm_capacity` below and tests/test_coord_lifecycle.py both reach for
+# `server.shm_free_bytes`.
+SHM_MOUNT = protocol.SHM_MOUNT
+shm_free_bytes = protocol.shm_free_bytes
 
 # Caps on a prepare's -c/-C override list. Bounded rather than trusted because an
 # accepted list is retained in _primed_args, replayed verbatim on every coordinator
@@ -984,24 +983,6 @@ class ShmTooSmall(RuntimeError):
     makes uvicorn abort startup and print it, which is the same operator-facing
     outcome with none of the signal plumbing.
     """
-
-
-def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
-    """Bytes available on `mount`, or None if there is nothing to measure.
-
-    None covers both "no such mount" (macOS, where POSIX shared memory is
-    kernel-backed) and a statvfs that fails for any reason: in neither case do we
-    know the capacity, and a guess would either refuse a working server or
-    promise capacity that is not there.
-    """
-    try:
-        st = os.statvfs(mount)
-    except OSError:
-        return None
-    # f_bavail, not f_bfree: the latter counts root-only reserve a server running
-    # as an ordinary user cannot have. For tmpfs they are equal, but this is also
-    # the correct read if SHM_MOUNT is ever something else.
-    return st.f_bavail * st.f_frsize
 
 
 def rss_bytes(pid: Optional[int]) -> Optional[int]:

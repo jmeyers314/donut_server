@@ -24,4 +24,20 @@ for var in (
     if var in os.environ:
         env["ENV"][var] = os.environ[var]
 
+# test_daq.py's parallel-encode tests need these, and need them set before
+# pytest starts: they only bind if nothing has imported numpy yet, and the
+# pytest_doctestplus plugin imports it while loading plugins -- before any
+# conftest or test module could set them. Without these the parallel tests skip
+# (naming this fix in the skip reason) while the rest of the module still runs.
+# Set unconditionally rather than forwarded, since there is no reason for a
+# developer to have them in their shell.
+for var in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    env["ENV"].setdefault(var, "1")
+
 scripts.BasicSConscript.tests(pyList=[])
