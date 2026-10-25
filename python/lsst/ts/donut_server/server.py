@@ -1846,6 +1846,85 @@ async def prepare(body: dict):
     }
 
 
+@app.post("/ingest/{job_id}", dependencies=[Depends(check_auth)])
+async def ingest(job_id: str, body: dict, num_workers: int | None = None):
+    """Run a job from an exposure directory the *server* can read.
+
+    The alternative to `/push`, for a producer on this host: instead of
+    assembling the pixels and streaming 294 MB in, it sends a path and the
+    coordinator reads the DAQ files itself. That removes the producer's encode,
+    this process's receive, and the coordinator's decode -- and because the
+    coordinator is long-lived, it also removes the camera and header-translator
+    warm-up a fresh producer pays on every exposure.
+
+    Takes no shared block and therefore no `push_lock`: nothing is streamed
+    through the one reusable buffer that lock exists to serialize. `Coord._lock`
+    inside `send_command` still serializes the command itself.
+
+    The directory must be visible to *this* host. That is the one deployment
+    constraint `/push` does not have, and the reason `/push` stays: an
+    off-machine producer, `donutClient.py` and `scripts/run_sequence.py` all
+    still need it.
+    """
+    record = JOBS.get(job_id)
+    if record is None:
+        raise HTTPException(404, "unknown job_id")
+    if record.state != JobState.PREPARED:
+        raise HTTPException(409, f"job in state {record.state}, expected PREPARED")
+    if num_workers is not None and num_workers < 1:
+        raise HTTPException(400, "num_workers must be >= 1")
+
+    directory = _required_str(body, "directory")
+    # Absolute, because a relative path would be resolved against the server's
+    # cwd rather than the caller's and would silently mean something else.
+    if not os.path.isabs(directory):
+        raise HTTPException(400, "directory must be an absolute path")
+
+    coord = pool.for_push(job_id)
+    async with pool.queued(coord):
+        pool.note_used(coord)
+        record.state = JobState.COMPUTING
+        try:
+            resp = await coord.send_command(
+                {
+                    "cmd": "ingest",
+                    "job_id": job_id,
+                    "directory": directory,
+                    "num_workers": num_workers,
+                    "prepared_key": record.prepared_key,
+                }
+            )
+        except (CoordinatorLost, CoordinatorUnavailable) as exc:
+            # Before the 503, so /status and /result agree with what the caller
+            # saw rather than stranding this job in COMPUTING.
+            record.state = JobState.ERROR
+            record.error = str(exc)
+            raise
+        if not resp.get("ok"):
+            record.state = JobState.ERROR
+            record.error = resp.get("error")
+            raise HTTPException(500, resp.get("error", "ingest failed"))
+
+        result = resp.get("result") or {}
+        timings = dict(result.get("timings", {}))
+        record.state = JobState.DONE
+        record.table_parquet = result.pop("table_parquet", None)
+        record.result = result
+        record.push_timings = timings
+        coord.note_exposure()
+        # Enqueued, not awaited, for the same reason as the push path: the
+        # tables the plot flight needs are written by the coordinator's deferred
+        # step, which runs after the reply we just received.
+        plot_pool.enqueue(job_id)
+        return {
+            "job_id": job_id,
+            "state": record.state,
+            "timings": timings,
+            "generation": coord.generation,
+            "flight": coord.index,
+        }
+
+
 @app.post("/push/{job_id}", dependencies=[Depends(check_auth)])
 async def push(job_id: str, request: Request, num_workers: int | None = None):
     record = JOBS.get(job_id)

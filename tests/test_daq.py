@@ -342,6 +342,84 @@ def test_the_parallel_path_leaves_no_shared_blocks_behind(paired):
     assert set(_glob.glob("/dev/shm/psm_*")) <= before
 
 
+@needs_fork
+def test_ingested_exposures_match_load_raw(paired):
+    """The server-side ingest path against the whole-exposure entry point.
+
+    `ingested_exposures` assembles in forked workers, wraps each shared-memory
+    slot zero-copy, and rebuilds the metadata in the parent rather than
+    unpickling a stub from the child -- three places to get it wrong. This is
+    the guard: the exposures it yields must be what `load_raw` would have
+    produced, which `test_assembled_image_matches_the_reference` has already
+    tied to an independent reference.
+    """
+    source, _ = paired
+    reference = {
+        daq.load_raw(source.handles[det]).getDetector().getName(): daq.load_raw(
+            source.handles[det]
+        )
+        for det in sorted(source.handles)
+    }
+
+    with daq.ingested_exposures(source) as exposures:
+        assert sorted(exposures) == sorted(reference)
+        for name, got in sorted(exposures.items()):
+            want = reference[name]
+            assert np.array_equal(
+                got.getImage().getArray(), want.getImage().getArray()
+            ), f"{name} pixels"
+            assert got.getBBox() == want.getBBox(), f"{name} bbox"
+            assert got.getFilter() == want.getFilter(), f"{name} filter"
+            assert got.getInfo().getId() == want.getInfo().getId(), f"{name} id"
+            assert got.getWcs() == want.getWcs(), f"{name} wcs"
+            assert [a.getRawBBox() for a in got.getDetector()] == [
+                a.getRawBBox() for a in want.getDetector()
+            ], f"{name} amps"
+            assert (
+                got.getMetadata().toDict() == want.getMetadata().toDict()
+            ), f"{name} metadata"
+
+
+@needs_fork
+def test_ingested_exposures_alias_the_shared_block(paired):
+    """Zero-copy is the point, so assert it rather than trusting it.
+
+    A copy here would be ~300 MB and ~0.2 s per exposure, and nothing else in
+    the result would look different -- which is exactly the kind of regression
+    that survives a correctness test.
+
+    Checked by *address*, not with `np.shares_memory`: afw hands each image's
+    array back behind its own PyCapsule, so numpy cannot see that two of them
+    have a common base and reports False even when they are windows onto one
+    block. What it cannot hide is that the eight images land at exactly their
+    slot offsets -- contiguous, one image apart -- which a per-exposure copy
+    could not reproduce.
+    """
+    source, _ = paired
+    with daq.ingested_exposures(source) as exposures:
+        arrays = [e.getImage().getArray() for e in exposures.values()]
+        addresses = sorted(a.__array_interface__["data"][0] for a in arrays)
+        stride = arrays[0].size * arrays[0].dtype.itemsize
+        gaps = {later - earlier for earlier, later in zip(addresses, addresses[1:])}
+        assert gaps == {stride}, (
+            f"images are {sorted(gaps)} bytes apart, expected one image "
+            f"({stride}) -- they are not slots in a single block"
+        )
+
+
+@needs_fork
+def test_ingest_releases_its_block(paired):
+    """A leak per exposure would fill /dev/shm overnight, and the exposures
+    alias the block -- so the release order inside the manager is load-bearing."""
+    import glob as _glob
+
+    source, _ = paired
+    before = set(_glob.glob("/dev/shm/psm_*"))
+    with daq.ingested_exposures(source) as exposures:
+        assert len(exposures) == 8
+    assert set(_glob.glob("/dev/shm/psm_*")) <= before
+
+
 def test_warm_up_needs_no_exposure_and_leaves_logging_alone():
     """The coordinator calls this before its hello, so it must not need data.
 

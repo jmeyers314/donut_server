@@ -1042,3 +1042,65 @@ def test_a_pool_whose_blocks_do_not_fit_refuses_to_start(monkeypatch):
     asyncio.run(body())
     assert all(c.shm is None for c in pool.flights)
     assert all(c._spawns == 0 for c in pool.flights)
+
+
+# ------------------------------------------------------- 15. the ingest path
+
+def test_ingest_routes_to_the_preparing_flight_and_completes(monkeypatch):
+    """`/ingest`'s plumbing, with no stack and no files.
+
+    The fake coordinator answers any command it does not special-case, so this
+    exercises everything the front end owns -- routing to the flight that
+    prepared the job, the PREPARED -> COMPUTING -> DONE transitions, and the
+    reply becoming a JobRecord -- without needing real DAQ files or afw.
+    """
+    coord = make_coord()
+    with make_client(monkeypatch, coord) as client:
+        job_id = prepare(client).json()["job_id"]
+        resp = client.post(
+            f"/ingest/{job_id}",
+            json={"directory": "/tmp/some/exposure"},
+            headers=auth(),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == server.JobState.DONE
+        assert body["flight"] == coord.index
+        assert server.JOBS[job_id].state == server.JobState.DONE
+
+
+def test_ingest_requires_an_absolute_directory(monkeypatch):
+    """A relative path would resolve against the *server's* cwd, which is not
+    the caller's -- so it would silently mean a different directory."""
+    with make_client(monkeypatch, make_coord()) as client:
+        job_id = prepare(client).json()["job_id"]
+        resp = client.post(
+            f"/ingest/{job_id}", json={"directory": "exposure"}, headers=auth()
+        )
+        assert resp.status_code == 400
+        assert "absolute" in resp.json()["detail"]
+        # The job is still PREPARED: a rejected request must not consume it.
+        assert server.JOBS[job_id].state == server.JobState.PREPARED
+
+
+def test_ingest_rejects_a_job_that_was_never_prepared(monkeypatch):
+    with make_client(monkeypatch, make_coord()) as client:
+        resp = client.post(
+            "/ingest/nosuchjob", json={"directory": "/tmp/x"}, headers=auth()
+        )
+        assert resp.status_code == 404
+
+
+def test_ingest_503s_and_marks_the_job_errored(monkeypatch):
+    """Same contract as the push path: the record must agree with what the
+    caller saw rather than being stranded in COMPUTING."""
+    # Command 1 is the prepare; command 2 (the ingest) crashes the child.
+    coord = make_coord([None, "crash"])
+    with make_client(monkeypatch, coord) as client:
+        job_id = prepare(client).json()["job_id"]
+        resp = client.post(
+            f"/ingest/{job_id}", json={"directory": "/tmp/x"}, headers=auth()
+        )
+        assert resp.status_code == 503
+        assert resp.json()["reason"] == "coordinator_lost"
+        assert server.JOBS[job_id].state == server.JobState.ERROR

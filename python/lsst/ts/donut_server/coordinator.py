@@ -1713,6 +1713,49 @@ def run_push(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     return result
 
 
+def run_ingest(
+    job_id: str,
+    directory: str,
+    num_workers: int | None = None,
+    headers: dict | None = None,
+) -> dict:
+    """Read one exposure's DAQ files from disk, then run the job.
+
+    The other way pixels reach this process, and the cheaper one: nothing is
+    encoded, nothing crosses a socket, and the exposures handed to `run_job` are
+    views onto the shared block the workers assembled into. Against the push
+    path's producer-side encode plus `receive_s` plus `decode_s`, the whole of
+    this is `ingest_s`.
+
+    `run_job` is called *inside* the context manager because the exposures alias
+    the block, which is unlinked on the way out -- so everything that reads a
+    pixel has to happen first. `run_job` drops its own references before
+    returning, and the table it hands to `_DEFERRED` holds no exposure.
+
+    `headers` substitutes replay metadata, exactly as `resolve_exposure_dir`
+    documents: detector identity still comes from the live file on disk, only
+    the observation metadata is replaced.
+    """
+    t0 = time.perf_counter()
+    source, imgtype = daq.resolve_exposure_dir(directory, headers=headers)
+    resolve_s = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    with daq.ingested_exposures(source, num_workers) as exposures:
+        ingest_s = time.perf_counter() - t0
+        result = run_job(job_id, exposures, num_workers)
+
+    timings = result["timings"]
+    timings["resolve_s"] = resolve_s
+    timings["ingest_s"] = ingest_s
+    # Same reasoning as run_push's: `coordinator_total_s` means everything this
+    # process spent on the job, and the dashboard charts phases against it.
+    timings["coordinator_total_s"] += resolve_s + ingest_s
+    result["imgtype"] = imgtype
+    result["visit"] = source.visit
+    return result
+
+
 def run_job(job_id: str, exposures: dict, num_workers: int | None = None) -> dict:
     """Build the butler around `exposures` and run the real task.
 
@@ -2357,6 +2400,26 @@ def coordinator_main(conn, shm_name: str) -> None:
                 # send above, so everything here is spent against the ~20 s gap
                 # before the next exposure rather than against the push. Also
                 # runs on the failure path, where _DEFERRED is simply empty.
+                _run_deferred()
+            elif cmd == "ingest":
+                try:
+                    prepared_key = command.get("prepared_key")
+                    if prepared_key is not None:
+                        # The same wrong-config guard the push path needs, and
+                        # for the same reason: a second prepare must not be able
+                        # to retarget the config this job runs against.
+                        ensure_prepared_for_push(tuple(prepared_key))
+                    result = run_ingest(
+                        command["job_id"],
+                        command["directory"],
+                        command.get("num_workers"),
+                    )
+                    conn.send({"ok": True, "result": result})
+                except Exception as exc:
+                    conn.send({"ok": False, "error": str(exc)})
+                # Not optional, and the same call the push arm makes: this is
+                # what writes the stamp and selection tables the plot flight
+                # reads, and what collects the job's ~900 MB.
                 _run_deferred()
             else:
                 conn.send({"ok": False, "error": f"unknown cmd {cmd!r}"})

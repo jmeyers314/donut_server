@@ -541,6 +541,49 @@ def _encode_one(det_id: int):
         return det_id, None, None, f"{type(exc).__name__}: {exc}"
 
 
+def _assemble_one(det_id: int):
+    """Write one detector's pixels into the shared block. Returns no pixels.
+
+    `_encode_one`'s sibling for the server-side ingest path, and deliberately
+    thinner: it returns only the detector id, because the consumer is in the
+    same process as the parent and can build the metadata itself from the header
+    it already holds. `_encode_one` has to pickle a ~827 kB stub back because its
+    consumer is across an HTTP boundary; here that would cost 0.037 s per
+    detector to *unpickle* against 0.0135 s to rebuild, so this does not send one.
+
+    Errors come back as a value for the same reason as `_encode_one`'s: one
+    unreadable sensor should name itself rather than surface as a
+    `multiprocessing` traceback with no detector in it.
+    """
+    try:
+        import numpy as np
+
+        handle = _WORKER_CONTEXT["handles"][det_id]
+        offset, byte_count, shape = _WORKER_CONTEXT["slots"][det_id]
+
+        expected = shape[0] * shape[1] * np.dtype(exposure_codec.IMG_DTYPE).itemsize
+        if expected != byte_count:
+            raise RuntimeError(
+                f"detector {det_id} slot is {byte_count} bytes but its shape "
+                f"{shape} needs {expected}"
+            )
+
+        block = _worker_open_block()
+        view = memoryview(block.buf)
+        try:
+            target = np.ndarray(
+                shape, dtype=exposure_codec.IMG_DTYPE, buffer=view, offset=offset
+            )
+            _assemble_image(handle, out=target)
+            del target
+        finally:
+            view.release()
+
+        return det_id, None, None, None
+    except Exception as exc:  # noqa: BLE001 -- reported, not raised; see docstring
+        return det_id, None, None, f"{type(exc).__name__}: {exc}"
+
+
 def _image_shape(detector) -> tuple[int, int]:
     """The `(height, width)` one assembled detector's image plane will have.
 
@@ -728,8 +771,18 @@ def build_parts_parallel(source, n_workers: int | None = None):
         _WORKER_CONTEXT.clear()
 
 
-def _fan_out(det_ids: list[int], n_workers: int | None, timeout: float | None = None):
-    """Run `_encode_one` over `det_ids` in a fork pool. Returns {det_id: meta}.
+def _fan_out(
+    det_ids: list[int],
+    n_workers: int | None,
+    timeout: float | None = None,
+    worker=None,
+):
+    """Run `worker` over `det_ids` in a fork pool. Returns {det_id: meta}.
+
+    `worker` is `_encode_one` for the push path and `_assemble_one` for ingest;
+    both write their pixels into the shared block and differ only in what they
+    return. It must be a module-level function, since the pool pickles it by
+    qualified name.
 
     `fork`, not `spawn`: the whole point is that the children inherit the camera
     and the loaded stack. That is safe here and not in the front end because
@@ -741,7 +794,7 @@ def _fan_out(det_ids: list[int], n_workers: int | None, timeout: float | None = 
     worker that dies *without returning* -- SIGKILL from the OOM killer, a
     segfault in cfitsio, a stray killpg -- leaves it blocked forever (verified:
     a SIGKILLed worker hangs `map` indefinitely). An exception in a worker is
-    fine, and `_encode_one` converts those to return values anyway; it is only
+    fine, and both workers convert those to return values anyway; it is only
     death that strands the parent. Nothing supervises a detached trigger, so
     waiting forever means an exposure that never completes and never says why.
     """
@@ -749,12 +802,14 @@ def _fan_out(det_ids: list[int], n_workers: int | None, timeout: float | None = 
     # one place to change it (and tests can shorten it).
     if timeout is None:
         timeout = FAN_OUT_TIMEOUT_S
+    if worker is None:
+        worker = _encode_one
 
     workers = min(n_workers or len(det_ids), len(det_ids))
     ctx = mp.get_context("fork")
     pool = ctx.Pool(workers, initializer=_child_init)
     try:
-        results = pool.map_async(_encode_one, det_ids).get(timeout=timeout)
+        results = pool.map_async(worker, det_ids).get(timeout=timeout)
     except mp.TimeoutError as exc:
         raise ParallelEncodeUnavailable(
             f"a worker did not return within {timeout:g}s; assuming one died "
@@ -820,6 +875,143 @@ def encoded_blob(source, n_workers: int | None = None):
             block.unlink()
         except FileNotFoundError:
             # Already gone; nothing to reclaim and nothing to report.
+            pass
+
+
+@contextlib.contextmanager
+def ingested_exposures(source, n_workers: int | None = None):
+    """`{detector_name: ExposureF}` for `source`, assembled in this process.
+
+    The server-side counterpart to `encoded_blob`. Where that one produces a
+    wire blob for a producer to POST, this produces the exposures themselves --
+    so when the consumer is in this process there is no wire format, no pickled
+    pixels and no decode step at all.
+
+    Three things make it cheap, all measured:
+
+    - Eight forked workers assemble straight into one shared block, as the push
+      path's fan-out already does.
+    - The exposures are **views onto that block**, not copies:
+      `ExposureF(MaskedImageF(ImageF(array=..., deep=False)))` shares the
+      pixels. (`ExposureF(bbox)` then `setImage` does *not* share -- that route
+      copies.)
+    - The metadata is rebuilt here rather than returned by the children. They
+      hold the header already, and `makeUpdatedDetector` + `calcRawCcdBBox` give
+      the geometry with no pixels read, so a stub costs 0.0135 s to build
+      against 0.037 s merely to unpickle one.
+
+    A context manager because the exposures alias the block: it must outlive
+    them, and every view onto it has to be released before it can be closed.
+    The caller must therefore be done with the exposures when the `with` exits.
+
+    Unlike `encoded_blob` there is no serial fallback. The caller is the
+    coordinator, which has no second way to get pixels, so a failure here is a
+    failed job -- `ParallelEncodeUnavailable` propagates and the command replies
+    with it.
+    """
+    import numpy as np
+
+    import lsst.afw.cameraGeom as cameraGeom
+    import lsst.afw.cameraGeom.utils as cameraGeomUtils
+    import lsst.afw.image as afwImage
+
+    det_ids = sorted(source.handles)
+    if not det_ids:
+        raise ParallelEncodeUnavailable("no detectors to assemble")
+
+    camera = _camera()
+    try:
+        _assert_single_threaded_blas()
+    except RuntimeError as exc:
+        raise ParallelEncodeUnavailable(str(exc)) from exc
+
+    itemsize = np.dtype(exposure_codec.IMG_DTYPE).itemsize
+    shapes = {
+        det_id: _image_shape(camera[source.handles[det_id].detector_num])
+        for det_id in det_ids
+    }
+
+    # One slot per detector, back to back. No framing and no descriptors: this
+    # block is never sent anywhere, so the offsets only have to agree between
+    # the workers that write them and the wraps below that read them.
+    offsets: dict[int, int] = {}
+    sizes: dict[int, int] = {}
+    cursor = 0
+    for det_id in det_ids:
+        sizes[det_id] = shapes[det_id][0] * shapes[det_id][1] * itemsize
+        offsets[det_id] = cursor
+        cursor += sizes[det_id]
+    block_size = cursor
+
+    # Before the block is written, for the reason the push path checks too: an
+    # undersized /dev/shm lets shm_open and ftruncate both succeed and then
+    # kills the process with SIGBUS on the first write it cannot back.
+    free = protocol.shm_free_bytes()
+    if free is not None and free < block_size:
+        raise ParallelEncodeUnavailable(
+            f"{protocol.SHM_MOUNT} has {free / 1024 / 1024:.0f} MB free but this "
+            f"exposure needs {block_size / 1024 / 1024:.0f} MB"
+        )
+
+    try:
+        block = shared_memory.SharedMemory(create=True, size=block_size)
+    except OSError as exc:
+        raise ParallelEncodeUnavailable(f"cannot create shared block: {exc}") from exc
+
+    view = None
+    exposures: dict[str, Any] = {}
+    try:
+        _WORKER_CONTEXT.clear()
+        _WORKER_CONTEXT.update(
+            shm_name=block.name,
+            handles=dict(source.handles),
+            slots={
+                det_id: (offsets[det_id], sizes[det_id], shapes[det_id])
+                for det_id in det_ids
+            },
+        )
+        _fan_out(det_ids, n_workers, worker=_assemble_one)
+
+        view = memoryview(block.buf)
+        for det_id in det_ids:
+            handle = source.handles[det_id]
+            detector = cameraGeom.makeUpdatedDetector(camera[handle.detector_num])
+            bbox = cameraGeomUtils.calcRawCcdBBox(detector)
+            stub = _build_stub(handle, bbox, detector)
+
+            array = np.ndarray(
+                (bbox.getHeight(), bbox.getWidth()),
+                dtype=exposure_codec.IMG_DTYPE,
+                buffer=view,
+                offset=offsets[det_id],
+            )
+            image = afwImage.ImageF(array=array, deep=False)
+            image.setXY0(bbox.getMin())
+            exposure = afwImage.ExposureF(afwImage.MaskedImageF(image))
+
+            # Mask and variance come back all-zero, as they are on a raw and as
+            # the push path's decode leaves them.
+            exposure.setDetector(stub.getDetector())
+            exposure.setWcs(stub.getWcs())
+            exposure.setFilter(stub.getFilter())
+            exposure.setMetadata(stub.getMetadata())
+            exposure.getInfo().setVisitInfo(stub.getInfo().getVisitInfo())
+            exposure.getInfo().setId(stub.getInfo().getId())
+            exposures[detector.getName()] = exposure
+
+        yield exposures
+    finally:
+        _WORKER_CONTEXT.clear()
+        # Order is load-bearing: the exposures alias the block, so they go
+        # first, then the view they were cut from, and only then can the block
+        # be closed. `close()` raises BufferError while anything is exported.
+        exposures.clear()
+        if view is not None:
+            view.release()
+        block.close()
+        try:
+            block.unlink()
+        except FileNotFoundError:
             pass
 
 
