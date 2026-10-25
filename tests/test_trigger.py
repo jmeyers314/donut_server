@@ -336,3 +336,41 @@ class TestNotifier:
         assert "visit=2026071300150" in out
         assert "filter=r_57" in out
         assert "DONE" in out
+
+    def test_the_notifier_logs_both_timing_blocks(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The hook's log is the only record a --detach run leaves, so a slow
+        exposure has to be attributable from it alone. `reused` matters most: a
+        cold calib load is several seconds and says nothing about the pixels."""
+        import json
+        import urllib.request
+
+        fill(tmp_path)
+
+        class FakeResponse:
+            def read(self):
+                return json.dumps({
+                    "state": "DONE",
+                    "exposure": {"visit": 1, "physical_filter": "r_57"},
+                    "prepare_timings": {"calib": {"reused": True, "elapsed_s": 0.0}},
+                    "timings": {"ingest_s": 1.4, "run_quantum_s": 13.5},
+                }).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(
+            urllib.request, "urlopen", lambda request, timeout=None: FakeResponse()
+        )
+
+        assert trigger.main([str(tmp_path)]) == 0
+
+        out = capsys.readouterr().out
+        assert "prepare calib" in out
+        assert "'reused': True" in out
+        assert "submit ingest_s: 1.4" in out
+        assert "submit run_quantum_s: 13.5" in out

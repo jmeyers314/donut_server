@@ -422,6 +422,18 @@ def run_notifier(
         # camera's hook should not see a failure for it.
         log(f"skipped: {body.get('reason')}")
         return 0
+
+    # Both timing blocks, flat, one per line. The resolving path used to print
+    # these and losing them would make a slow exposure unattributable from the
+    # hook's own log -- which is the only record a detached run leaves. `reused`
+    # on the prepare side is the one to read first: a cold calib load is several
+    # seconds and says nothing about the exposure.
+    for label, timings in (
+        ("prepare", body.get("prepare_timings")),
+        ("submit", body.get("timings")),
+    ):
+        for key, value in sorted((timings or {}).items()):
+            log(f"    {label} {key}: {value}")
     log(f"{state} in {time.monotonic() - started:.1f}s")
     return 0
 
