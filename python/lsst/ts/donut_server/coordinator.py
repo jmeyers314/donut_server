@@ -1714,6 +1714,33 @@ def run_push(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     return result
 
 
+def resolve_exposure(directory: str) -> dict:
+    """Everything `/prepare` needs about an exposure, read from its headers.
+
+    Header-only -- no pixel is opened -- and the reason a producer can be a thin
+    notifier: `/prepare` wants a filter, a boresight and an epoch, and getting
+    those out of a DAQ directory needs the stack. Measured at ~0.09 s here
+    against ~3 s for a fresh process to import enough to do it itself.
+
+    `boresight` and `calib_time` come off `resolve_exposure_dir`'s own
+    header read, so this is the case `client.read_prepare_args` calls free: the
+    fallback that opens a raw to find them cannot be reached from here.
+    """
+    source, imgtype = replay.resolve(
+        directory, report=lambda line: _log.info("%s", line)
+    )
+    boresight_ra, boresight_dec = source.boresight
+    return {
+        "visit": source.visit,
+        "physical_filter": source.physical_filter,
+        "boresight_ra": boresight_ra,
+        "boresight_dec": boresight_dec,
+        "calib_time": source.calib_time,
+        "imgtype": imgtype,
+        "detectors": sorted(source.handles),
+    }
+
+
 def run_ingest(
     job_id: str,
     directory: str,
@@ -2413,6 +2440,18 @@ def coordinator_main(conn, shm_name: str) -> None:
                 # before the next exposure rather than against the push. Also
                 # runs on the failure path, where _DEFERRED is simply empty.
                 _run_deferred()
+            elif cmd == "resolve":
+                # Header-only, reads no pixels, and the reason a producer can be
+                # a thin notifier at all: /prepare needs a filter, a boresight
+                # and an epoch, and reading those needs the stack. Measured at
+                # ~0.09 s, against ~3 s for a fresh process to import enough to
+                # do it itself.
+                try:
+                    conn.send({"ok": True, "result": resolve_exposure(
+                        command["directory"]
+                    )})
+                except Exception as exc:
+                    conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             elif cmd == "ingest":
                 try:
                     prepared_key = command.get("prepared_key")

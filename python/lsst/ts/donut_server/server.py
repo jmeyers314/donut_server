@@ -211,6 +211,17 @@ class JobRecord:
 
 JOBS: dict[str, JobRecord] = {}
 
+# {visit: job_id} for exposures `/submit` has accepted, so a camera hook that
+# fires twice submits once. Only that endpoint maintains it: `/prepare` does not
+# know the visit (it is given a pointing, not a directory) and a producer
+# driving `/prepare` + `/push` owns its own deduplication, which is what the
+# trigger's state-dir marker was for.
+#
+# Unbounded, like JOBS, and for the same reason it is acceptable: one small
+# integer and a uuid per exposure, against the ~200 KB of parquet each JOBS
+# record already holds.
+SUBMITTED: dict[int, str] = {}
+
 
 def _stamp_path(job_id: str) -> Optional[str]:
     """Where the coordinator's image table for this job would be, or None.
@@ -1843,6 +1854,121 @@ async def prepare(body: dict):
         # a flight rather than to the service as a whole.
         "flight": coord.index,
         "config_overrides": _digest_overrides(overrides),
+    }
+
+
+@app.post("/submit", dependencies=[Depends(check_auth)])
+async def submit(body: dict, num_workers: int | None = None):
+    """Resolve, prepare and ingest one exposure directory, in one request.
+
+    What the camera's hook calls. Everything a producer used to do -- read the
+    headers to find the filter and pointing, prepare against them, then deliver
+    the pixels -- happens here instead, so the hook needs no part of the LSST
+    stack and costs ~0.4 s of Python startup rather than ~5 s of imports.
+
+    Deliberately one call and not three. A notifier that resolved, then
+    prepared, then ingested would be holding state it has no way to interpret
+    and no way to retry sensibly; and the three steps have to land on the same
+    flight anyway, which only this side can arrange.
+
+    The trade against `/prepare` + `/push` is that nothing is prepared while
+    the shutter is open: the resolve happens when the files do. Keeping
+    `/prepare` separate is what leaves room for a future trigger that knows the
+    pointing at shutter-open and can prepare against it then.
+
+    Returns the same shape `/ingest` does, plus what the resolve found, so the
+    hook's log records which exposure it actually submitted. A skipped
+    calibration frame returns `state: SKIPPED` and no job -- the hook should
+    not see a failure because we correctly declined to fit a bias.
+
+    Two guards live here rather than in the producer, because both need the
+    visit and the image type, and a notifier does not have them: it sends a
+    path and the headers are read on this side.
+    """
+    directory = _required_str(body, "directory")
+    if not os.path.isabs(directory):
+        raise HTTPException(400, "directory must be an absolute path")
+    if num_workers is not None and num_workers < 1:
+        raise HTTPException(400, "num_workers must be >= 1")
+    overrides = _parse_overrides(body)
+    any_imgtype = bool(body.get("any_imgtype"))
+    resubmit = bool(body.get("resubmit"))
+
+    # Resolution first, and on a flight chosen for it, because its answer is
+    # what `pool.select` needs to route the prepare -- there is nothing to match
+    # on until the filter and pointing are known.
+    resolver = pool.select({"cmd": "resolve"})
+    async with pool.queued(resolver):
+        resp = await resolver.send_command(
+            {"cmd": "resolve", "directory": directory}
+        )
+    if not resp.get("ok"):
+        # 400, not 500: an unreadable or incomplete directory is the caller's
+        # to fix, and a retry would fail identically.
+        raise HTTPException(400, resp.get("error", "resolve failed"))
+    found = resp.get("result") or {}
+
+    if body.get("dry_run"):
+        # Resolve and report, submit nothing: the check to run first on a new
+        # deployment, since it proves the server can see and read the directory
+        # without spending a flight on it.
+        return {"state": "DRY_RUN", "exposure": found}
+
+    # Reported back rather than logged: this process has no logger by design
+    # (it prints only fatals, to the stderr whoever started it is watching), and
+    # the caller is the one who needs to know why its exposure did not run.
+    imgtype = str(found.get("imgtype", "")).upper()
+    if not any_imgtype and imgtype in protocol.SKIP_IMGTYPES:
+        return {
+            "state": "SKIPPED",
+            "reason": f"IMGTYPE {imgtype} has no stars to fit "
+            "(any_imgtype=true to force)",
+            "exposure": found,
+        }
+    note = (
+        None
+        if imgtype in protocol.EXPECTED_IMGTYPES
+        else f"IMGTYPE {imgtype} is not one of "
+        f"{sorted(protocol.EXPECTED_IMGTYPES)}, so treat its Zernikes with suspicion"
+    )
+
+    # Keyed on the visit, not the directory: under replay the directory name is
+    # BTS's, and the same pixels replayed twice should still be caught. Held
+    # here rather than in a coordinator because there is one front end and N
+    # flights, so a per-flight dict would not see its sibling's submissions.
+    #
+    # The trade against the trigger's old O_CREAT|O_EXCL marker is that this is
+    # lost on a front-end restart. That is the right way round for a guard
+    # against a *double firing of the same hook*, which is a seconds-apart
+    # event; surviving a restart would instead mean an exposure could never be
+    # resubmitted after one.
+    visit = found.get("visit")
+    if visit is not None and not resubmit:
+        previous = SUBMITTED.get(visit)
+        if previous is not None:
+            raise HTTPException(
+                409,
+                f"visit {visit} was already submitted as job {previous}; "
+                "pass resubmit=true to run it again",
+            )
+
+    prepared = await prepare({
+        "physical_filter": found["physical_filter"],
+        "boresight_ra": found["boresight_ra"],
+        "boresight_dec": found["boresight_dec"],
+        "calib_time": found["calib_time"],
+        "config_overrides": overrides,
+    })
+    job_id = prepared["job_id"]
+    if visit is not None:
+        SUBMITTED[visit] = job_id
+
+    result = await ingest(job_id, {"directory": directory}, num_workers=num_workers)
+    return {
+        **result,
+        "exposure": found,
+        "prepare_timings": prepared.get("timings"),
+        **({"note": note} if note else {}),
     }
 
 

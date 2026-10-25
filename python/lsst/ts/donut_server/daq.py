@@ -1,15 +1,23 @@
 """Turn a directory of DAQ-native LSSTCam corner-sensor files into a `RawSource`.
 
-**Temporary, in the same sense `scripts/run_sequence.py` says it is.** The
-camera writes *unassembled amplifier* images -- one FITS per corner sensor with
-eight `Segment1x` HDUs -- and the service's wire format carries an assembled
-`ExposureF`. Assembly belongs on the producer side eventually (or the raws get
-ingested into a butler repo and `donutClient.py -b` handles them); until then it
-happens here, in-process, with `lsst.obs.lsst`.
+The camera writes *unassembled amplifier* images -- one FITS per corner sensor
+with eight `Segment1x` HDUs -- so something has to assemble them into the
+whole-CCD `ExposureF` the task expects. That is this module, in-process, with
+`lsst.obs.lsst`.
 
-This module is the shared half of two producers: the fixed-cadence walker in
-`scripts/run_sequence.py` and the camera-triggered `trigger.py`. It was
-originally the former's private code.
+This is a distinct path, not a stopgap for one. The alternative shapes are a
+producer that ships assembled exposures (`client.resolve_from_files`) and a
+butler that has already ingested them (`client.resolve_from_butler`, i.e.
+`donutClient.py -b`); all three exist, and this is the one the camera actually
+drives. Which is why it is the one that gets the fast machinery: parallel
+assembly, and `ingested_exposures` for the server-side path where there is no
+wire format at all.
+
+Three callers, on both sides of the wire: the fixed-cadence walker in
+`scripts/run_sequence.py` and the camera-triggered `trigger.py` both assemble
+here and push the pixels, while the coordinator's `/ingest` reads the directory
+itself and skips the push entirely. It was originally `run_sequence.py`'s
+private code.
 
 Layout it expects, one directory per exposure, as the replay tree is laid out:
 

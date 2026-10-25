@@ -71,8 +71,16 @@ environment variable, so the data need not live in the checkout:
 | `DONUT_SERVER_REFCAT_DIR` | server | 23 G | Gaia level-5 shards, resharded to level 7 at prepare time |
 
 `DONUT_SERVER_RAW_DIR` is read by `client.py` alone (and `--raw-dir` overrides
-it). The server never opens a raw — they arrive over shared memory on `/push` —
-so a server host needs neither the variable nor the 5.1 G.
+it), and holds *assembled* raws. The server never opens one of those: they
+arrive over shared memory on `/push`, so a server host needs neither the
+variable nor the 5.1 G.
+
+It does open DAQ-native amplifier files, on `/ingest` and `/submit` — the
+server-side ingest path, where a producer sends a directory instead of 294 MiB
+of pixels. That directory has to be visible to the server, and
+`DONUT_SERVER_REPLAY_DIR` has to be set there too if the exposures are BTS
+replays, since the substitution happens server-side on that path. `/push` is
+unchanged and remains the only option for a producer on another host.
 
 `DONUT_SERVER_STAMP_DIR` is the one output directory, and it is required too. It needs no data up
 front, only somewhere writable: the coordinator puts one `<job_id>.parquet` there per job, holding
@@ -261,17 +269,39 @@ that script calls `bin/donutTrigger.py` with the exposure's directory. The hook 
 sensor only** — `R00_SW0` — so a script that runs per *file* fires once per *exposure*:
 
 ```zsh
-bin/donutTrigger.py /path/to/MC_O_20260713_000050            # poll, submit, wait for Zernikes
-bin/donutTrigger.py /path/to/exposure --dry-run              # resolve, submit nothing
+bin/donutTrigger.py /path/to/MC_O_20260713_000050            # poll, hand the directory over
+bin/donutTrigger.py /path/to/exposure --dry-run              # resolve and report, submit nothing
 bin/donutTrigger.py /path/to/exposure --detach --log-dir /var/log/aos
 ```
 
 Firing on the first corner sensor means the other seven may not have landed, so it polls until all 8
 `_R??_SW?.fits` have sidecars *and* have stopped growing — `--stable-checks` consecutive polls at an
 unchanged size, since a 9.5 MB FITS that exists is not necessarily one that is finished. Only then
-does the `/prepare` → `/push` → `/result` cycle run. **Nothing is prepared while the shutter is
-open**: everything happens after readout, which costs the latency the two-phase protocol was built to
-avoid, but the camera hook is the only trigger available today.
+does it POST the *directory* to `/submit`, which resolves the headers, prepares against them, and
+reads the pixels itself. **Nothing is prepared while the shutter is open**: everything happens after
+readout, which costs the latency the two-phase protocol was built to avoid, but the camera hook is
+the only trigger available today.
+
+**The trigger imports no part of the stack**, which is the point: it polls and POSTs, so the whole
+process costs 0.21 s against 2.77 s for a producer that resolves its own headers (measured on this
+dev box — the header stack is ~3 s and afw ~1.9 s, and they are additive). The server also keeps its
+camera and header-translator caches warm across exposures, which a fresh producer process cannot.
+
+The trade is that the server must see the directory — and must see it *before* the camera's `fpack`
+step, since `readRawAmps` cannot read a `.fz`. A producer on another host, or one holding assembled
+exposures or a butler, uses `donutClient.py` and the `/prepare` → `/push` path instead; that is also
+where `--images` and `--wait` live, both needing the stack to interpret a result.
+
+**`--detach` still matters.** The import is gone but the *wait* is not: `/submit` covers the whole
+fit, so the notifier blocks ~25 s on it (measured). With `--detach` the parent returns in 0.38 s and
+the child waits, which is the point for a hook on the camera's own critical path. The watchdog
+remains for the same reason — nothing supervises that child.
+
+Two guards that used to live in the producer are now `/submit`'s, because both need the visit or the
+image type and a notifier has neither: `DARK`/`BIAS`/`FLAT` come back `SKIPPED` without spending a
+flight (`--any-imgtype` forces them through), and a visit already submitted comes back 409
+(`--resubmit` runs it again, which is what the trigger's `--state-dir ''` was for). `--dry-run`
+resolves and reports without preparing — the check to run first on a new deployment.
 
 `--detach` is for the hook, which sits on the camera's own critical path: it re-runs the command in a
 new session with output to `--log-dir/<exposure>.log` and returns in ~1.7 s, against a 0.73 s
@@ -485,8 +515,9 @@ curl -si localhost:8000/config | head -20       # 200, X-Donut-Stale: 0
 
 ### Rehearsing a replay
 
-The camera trigger has no server-side half to test, so it is checked by feeding it a directory —
-which is also how to rehearse before BTS access. `scripts/replay_drill.py` builds a fake replayed
+Substitution now happens on the server, and `tests/test_replay.py` covers which exposure it picks —
+but nothing automated runs a substituted header all the way through assembly to a Zernike, so that
+is still checked by hand, which is also how to rehearse before BTS access. `scripts/replay_drill.py` builds a fake replayed
 exposure from a real one, in two steps: it prints the expected answer and the trigger command for a
 second terminal, then waits on Enter and copies all 8 sensors in.
 

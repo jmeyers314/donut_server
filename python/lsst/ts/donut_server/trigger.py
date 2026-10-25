@@ -70,6 +70,8 @@ import subprocess
 import sys
 import time
 
+from lsst.ts.donut_server import protocol
+
 # `client` is imported lazily, by each function that needs it, and never at
 # module scope. It reaches `lsst.afw.image` through `exposure_codec`, and the
 # whole value of `--detach` is that the parent hands control back to the
@@ -104,15 +106,6 @@ REPLAY_DIR_VAR = "DONUT_SERVER_REPLAY_DIR"
 # child's argv is the parent's argv and rewriting it is more fragile than one
 # variable the parent cannot have inherited.
 DETACHED_VAR = "DONUT_SERVER_TRIGGER_DETACHED"
-
-# Image types that are never worth a wavefront fit, skipped unless
-# --any-imgtype. Calibration frames have no stars, so they would burn a full
-# push to arrive at an empty donut catalog.
-SKIP_IMGTYPES = frozenset({"DARK", "BIAS", "FLAT"})
-
-# Types a wavefront fit is meaningful for. Anything else is processed but
-# flagged, the same way run_sequence.py flags it.
-EXPECTED_IMGTYPES = frozenset({"CWFS", "ACQ", "SCIENCE", "OBJECT"})
 
 
 class ConfigOverrideAction(argparse.Action):
@@ -233,47 +226,6 @@ def wait_for_exposure(
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
 
-def resolve_source(directory: str, paths: list[str]):
-    """`(RawSource, imgtype)` for a complete exposure directory.
-
-    Substitutes the original metadata when `DONUT_SERVER_REPLAY_DIR` is set.
-    Reads no pixels on either path: everything needed is in the primary headers,
-    which is what keeps /prepare off the pixel path.
-
-    The substitution itself lives in `replay`, because the coordinator's
-    `/ingest` path has to do the same thing on the server side. `paths` is now
-    only the polled file list this process already had; `replay` re-globs the
-    directory for its own use, since its other caller has no such list.
-    """
-    from lsst.ts.donut_server import replay
-
-    return replay.resolve(directory, report=log)
-
-
-def claim(state_dir: str, key: str) -> bool:
-    """Claim `key` exactly once, across processes. True if we got it.
-
-    The camera's hook can fire twice for one exposure -- a retry, a re-ingest,
-    an operator running this by hand over a directory that already went through
-    -- and a second submission is not harmless: it burns a flight's worth of
-    compute and puts a duplicate exposure on the dashboard for the same pixels.
-
-    `O_CREAT | O_EXCL` because the two firings can be concurrent, which rules
-    out checking-then-creating.
-    """
-    os.makedirs(state_dir, exist_ok=True)
-    path = os.path.join(state_dir, f"{key}.done")
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except OSError as exc:
-        if exc.errno == errno.EEXIST:
-            return False
-        raise
-    with os.fdopen(fd, "w") as f:
-        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} pid={os.getpid()}\n")
-    return True
-
-
 def detach(log_dir: str, name: str) -> str:
     """Re-run this same command in a new session, and return the log path.
 
@@ -327,82 +279,150 @@ def arm_watchdog(seconds: float) -> None:
     signal.alarm(int(seconds))
 
 
-def run_trigger(
+def _host_is_loopback(host: str) -> bool:
+    """`client.host_is_loopback`, reimplemented without reaching the stack.
+
+    Duplicated rather than imported for one reason: importing `client` is the
+    ~1.9 s the notifier path exists to avoid, and this is the only thing it
+    would want from there. `client`'s version stays the definition -- it is what
+    the resolving path and `run_sequence.py` use -- and both are stdlib-only, so
+    they cannot drift in behaviour without one of them being wrong.
+    """
+    import ipaddress
+    import socket
+    import urllib.parse
+
+    name = urllib.parse.urlsplit(host).hostname
+    if not name:
+        return False
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(name, None)
+    except socket.gaierror:
+        return False
+    return bool(infos) and all(
+        ipaddress.ip_address(info[4][0]).is_loopback for info in infos
+    )
+
+
+def run_notifier(
     directory: str,
     host: str,
     token: str,
-    wait: float,
     timeout: float = 120.0,
     interval: float = 1.0,
     stable_checks: int = 2,
-    state_dir: str | None = None,
-    any_imgtype: bool = False,
-    dry_run: bool = False,
-    images: bool = False,
     config_overrides: list | None = None,
     num_workers: int | None = None,
+    any_imgtype: bool = False,
+    dry_run: bool = False,
+    resubmit: bool = False,
 ) -> int:
-    """Poll, resolve, submit. Returns a process exit status.
+    """Poll, then hand the directory to the server. Returns an exit status.
 
-    0 for a submitted exposure *and* for a deliberate skip (an already-claimed
-    directory, a dark): the camera's hook should not see a failure because we
-    correctly declined to process a bias frame.
+    The thin half of this module, and what the camera's hook should call: it
+    imports no part of the LSST stack, so the whole process costs ~0.4 s of
+    Python startup against ~5 s for the resolving path -- 3 s of that being the
+    header stack and 1.9 s afw, which are additive. On the critical path
+    between "the files are complete" and "the Zernikes exist", that is the
+    single largest thing a producer controls.
+
+    Polling stays here rather than moving with everything else. It is
+    stdlib-only and therefore free, and the coordinator's command loop is
+    serial -- parking it on a filesystem wait would stall every other command
+    on that flight for as long as the camera took to finish writing.
+
+    What the server does instead: resolve the headers (including replay
+    substitution), prepare against what it found, and read the pixels. One
+    request, because the three steps have to land on the same flight and only
+    the server can arrange that.
+
+    `--any-imgtype`, `--dry-run` and the resubmit override are flags here but
+    decisions there, for the same reason: all three need the image type or the
+    visit, and those come out of the header read. `--images` and `--wait` have
+    no notifier equivalent, needing the stack to interpret a result;
+    `donutClient.py` keeps them.
     """
-    from lsst.ts.donut_server import client
+    import json
+    import urllib.error
+    import urllib.request
 
     started = time.monotonic()
-    paths = wait_for_exposure(directory, timeout, interval, stable_checks)
+    wait_for_exposure(directory, timeout, interval, stable_checks)
 
-    source, imgtype = resolve_source(directory, paths)
-    log(
-        f"resolved visit={source.visit} filter={source.physical_filter} "
-        f"imgtype={imgtype} detectors={sorted(source.handles)}"
-    )
-
-    normalized = imgtype.upper()
-    if not any_imgtype and normalized in SKIP_IMGTYPES:
-        log(f"skipping: IMGTYPE {imgtype!r} has no stars to fit (--any-imgtype to force)")
-        return 0
-    if normalized not in EXPECTED_IMGTYPES:
-        log(
-            f"note: IMGTYPE {imgtype!r} is not one of "
-            f"{sorted(EXPECTED_IMGTYPES)}, so treat its Zernikes with suspicion"
-        )
-
-    # Claimed after resolution, so a directory that fails to resolve can be
-    # retried once whatever was wrong with it is fixed -- but before the push,
-    # so a concurrent second firing cannot also submit. The visit is the key
-    # rather than the directory name: under replay the directory name is BTS's
-    # and the same pixels replayed twice should still be caught.
-    if state_dir is not None and not dry_run:
-        if not claim(state_dir, str(source.visit)):
-            log(
-                f"already submitted: {state_dir}/{source.visit}.done exists, so "
-                "this exposure has been through once already; not resubmitting"
-            )
-            return 0
-
+    payload = {"directory": directory}
+    if config_overrides:
+        payload["config_overrides"] = config_overrides
+    if any_imgtype:
+        payload["any_imgtype"] = True
     if dry_run:
-        boresight_ra, boresight_dec, calib_time = client.read_prepare_args(source)
+        payload["dry_run"] = True
+    if resubmit:
+        payload["resubmit"] = True
+    url = f"{host}/submit"
+    if num_workers is not None:
+        url += f"?num_workers={num_workers}"
+
+    # urllib, not requests: `requests` is a third-party import this path does
+    # not otherwise need, and the whole point here is to import as little as
+    # possible. The body is small JSON and the response is small JSON.
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+        method="POST",
+    )
+
+    log(f"submitting {directory} to {host} after {time.monotonic() - started:.1f}s")
+    try:
+        # Generous: this one call covers the server's resolve, prepare and the
+        # whole fit, so it is bounded by the job rather than by the network.
+        with urllib.request.urlopen(request, timeout=timeout + 300) as response:
+            body = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        # The server puts its reason in the body as `detail`; urllib's own
+        # message is only the status line, which on a 400 would hide which
+        # directory was wrong and why.
+        detail = exc.read().decode(errors="replace")[:500]
+        if exc.code == 409:
+            # Already submitted. Exit 0, like the trigger's own state-dir
+            # guard: a hook firing twice is expected, and the second firing
+            # declining is the guard working rather than a failure.
+            log(f"already submitted: {detail}")
+            return 0
+        log(f"failed: HTTP {exc.code} {detail}")
+        return 1
+    except urllib.error.URLError as exc:
+        log(f"failed: cannot reach {host}: {exc.reason}")
+        return 1
+
+    found = body.get("exposure") or {}
+    state = body.get("state")
+    log(
+        f"visit={found.get('visit')} filter={found.get('physical_filter')} "
+        f"imgtype={found.get('imgtype')} detectors={found.get('detectors')}"
+    )
+    if state == "DRY_RUN":
         log(
-            f"dry run, would submit: visit={source.visit} "
-            f"filter={source.physical_filter} "
-            f"boresight=({boresight_ra:.4f}, {boresight_dec:.4f}) "
-            f"calib_time={calib_time}"
+            f"dry run, would submit: boresight="
+            f"({found.get('boresight_ra')}, {found.get('boresight_dec')}) "
+            f"calib_time={found.get('calib_time')}"
         )
         return 0
-
-    log(f"submitting to {host} after {time.monotonic() - started:.1f}s")
-    client.run_once(
-        host,
-        token,
-        source,
-        wait,
-        images=images,
-        config_overrides=config_overrides,
-        num_workers=num_workers,
-    )
-    log(f"done in {time.monotonic() - started:.1f}s")
+    if body.get("note"):
+        log(f"note: {body['note']}")
+    if state == "SKIPPED":
+        # 0, not 1: declining to fit a bias frame is correct behaviour, and the
+        # camera's hook should not see a failure for it.
+        log(f"skipped: {body.get('reason')}")
+        return 0
+    log(f"{state} in {time.monotonic() - started:.1f}s")
     return 0
 
 
@@ -417,9 +437,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default="http://127.0.0.1:8000")
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
-    parser.add_argument(
-        "--wait", type=float, default=120.0, help="seconds to long-poll /result"
-    )
     parser.add_argument(
         "--timeout",
         type=float,
@@ -447,12 +464,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="cores the coordinator forks for this push",
     )
     parser.add_argument(
-        "--images",
-        action="store_true",
-        help="also fetch the per-donut stamp table, saving <job_id>.parquet in "
-        "the current directory",
-    )
-    parser.add_argument(
         "--detach",
         action="store_true",
         help="return immediately, doing the work in a new session with output to "
@@ -465,15 +476,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-dir (default: $TMPDIR/donut_trigger)",
     )
     parser.add_argument(
-        "--state-dir",
-        default=None,
-        help="where the once-only marker per exposure is kept, so a hook that "
-        "fires twice submits once (default: --log-dir). Pass '' to disable.",
+        "--resubmit",
+        action="store_true",
+        help="run an exposure the server has already accepted. The once-only "
+        "guard is the server's and is keyed on the visit, so the same pixels "
+        "under a different directory name are still caught",
     )
     parser.add_argument(
         "--any-imgtype",
         action="store_true",
-        help=f"process even {'/'.join(sorted(SKIP_IMGTYPES))} frames, which are "
+        help=f"process even {'/'.join(sorted(protocol.SKIP_IMGTYPES))} frames, which are "
         "skipped by default as having no stars to fit",
     )
     parser.add_argument(
@@ -522,8 +534,6 @@ def main(argv: list[str] | None = None) -> int:
     log_dir = args.log_dir or os.path.join(
         os.environ.get("TMPDIR", "/tmp"), "donut_trigger"
     )
-    # '' disables the guard; None means "follow --log-dir".
-    state_dir = log_dir if args.state_dir is None else (args.state_dir or None)
 
     # Before the token check, and before anything else that would need `client`:
     # every check above this line is pure argparse, so the parent reaches here
@@ -536,64 +546,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if os.environ.get(DETACHED_VAR):
-        # Poll, then fit, then a wide margin for everything unmodelled.
-        arm_watchdog(args.timeout + args.wait + 300)
+        # Poll, then the server's whole resolve/prepare/fit, then a wide
+        # margin for everything unmodelled. No --wait to add any more:
+        # /submit's own response is what bounds the fit.
+        arm_watchdog(args.timeout + 600)
 
-    import requests
-
-    from lsst.ts.donut_server import client
-
-    # Checked before any polling, so a misconfigured hook fails at once rather
-    # than after waiting out a 120 s timeout to discover it has no credentials.
-    # Under --detach this runs in the child, so the complaint lands in the log
-    # file rather than on the hook's stderr -- which is true of every other
-    # failure there too, and is the trade --detach is.
-    if (
-        not args.dry_run
-        and not args.token
-        and not client.host_is_loopback(args.host)
-    ):
+    if not args.token and not _host_is_loopback(args.host):
         parser.error(
             f"--token is required for a remote --host ({args.host}); "
             "or set DONUT_SERVER_TOKEN"
         )
 
     try:
-        return run_trigger(
+        return run_notifier(
             args.directory,
             args.host,
             args.token,
-            args.wait,
             timeout=args.timeout,
             interval=args.poll_interval,
             stable_checks=args.stable_checks,
-            state_dir=state_dir,
-            any_imgtype=args.any_imgtype,
-            dry_run=args.dry_run,
-            images=args.images,
             config_overrides=args.config_overrides,
             num_workers=args.num_workers,
+            any_imgtype=args.any_imgtype,
+            dry_run=args.dry_run,
+            resubmit=args.resubmit,
         )
     except TimeoutError as exc:
+        # The poll gave up: the exposure never completed on disk. Reported as a
+        # line rather than a traceback, since the hook reads a log.
         log(f"timed out: {exc}")
         return 1
-    except requests.HTTPError as exc:
-        # Separated from the RequestException below because they want different
-        # operator responses: a 4xx/5xx means the service answered and refused,
-        # which is a problem with this exposure or this config, while a bare
-        # RequestException means it was never reached.
-        log(f"push failed: {exc}")
-        return 1
-    except requests.RequestException as exc:
-        log(f"request failed: {exc}")
-        return 1
-    except Exception as exc:
-        # Everything is caught and logged rather than tracebacked, because when
-        # detached the traceback goes to a log file nobody is reading and the
-        # exit status goes nowhere at all. The message has to carry the cause.
-        log(f"failed: {type(exc).__name__}: {exc}")
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

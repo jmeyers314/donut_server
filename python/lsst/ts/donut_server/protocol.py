@@ -28,6 +28,19 @@ from dataclasses import dataclass
 MAGIC = b"DWFS"
 VERSION = 2
 
+# Image types that are never worth a wavefront fit. Calibration frames have no
+# stars, so they would burn a full flight to arrive at an empty donut catalog.
+SKIP_IMGTYPES = frozenset({"DARK", "BIAS", "FLAT"})
+
+# Types a wavefront fit is meaningful for. Anything else is processed but
+# flagged, the same way run_sequence.py flags it.
+EXPECTED_IMGTYPES = frozenset({"CWFS", "ACQ", "SCIENCE", "OBJECT"})
+
+# Both here, with the wire format, for the same reason `shm_free_bytes` is: the
+# front end decides whether to skip a frame, and it imports no part of the LSST
+# stack -- so the sets cannot live beside the header reading that produces the
+# image type they are compared against.
+
 # Where a tmpfs-backed shm_open puts its blocks, when there is one. Checked for
 # existence rather than assumed: this is the Linux layout, and on macOS --
 # a supported dev platform -- POSIX shared memory is kernel-backed with no

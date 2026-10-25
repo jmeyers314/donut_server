@@ -1104,3 +1104,209 @@ def test_ingest_503s_and_marks_the_job_errored(monkeypatch):
         assert resp.status_code == 503
         assert resp.json()["reason"] == "coordinator_lost"
         assert server.JOBS[job_id].state == server.JobState.ERROR
+
+
+def test_submit_resolves_prepares_and_ingests_in_one_call(monkeypatch):
+    """What the thin notifier calls: one request covering all three steps.
+
+    The fake coordinator answers `resolve` generically, so this cannot check
+    what the resolve *found* -- that needs real headers and lives in
+    tests/test_daq.py. What it does check is the wiring: that /submit reaches
+    the coordinator three times and comes back with a DONE job.
+    """
+    coord = make_coord()
+    with make_client(monkeypatch, coord) as client:
+        # The fake's generic reply has no exposure fields, so stub the resolve
+        # step's answer into it: this test is about the sequence, not the read.
+        import lsst.ts.donut_server.server as srv
+
+        real_send = srv.Coord.send_command
+
+        async def send(self, command):
+            if command.get("cmd") == "resolve":
+                return {
+                    "ok": True,
+                    "result": {
+                        "visit": 2026071300150,
+                        "physical_filter": "r_57",
+                        "boresight_ra": 1.0,
+                        "boresight_dec": 2.0,
+                        "calib_time": CALIB_TIME,
+                        "imgtype": "acq",
+                        "detectors": [191],
+                    },
+                }
+            return await real_send(self, command)
+
+        monkeypatch.setattr(srv.Coord, "send_command", send)
+
+        resp = client.post(
+            "/submit", json={"directory": "/tmp/some/exposure"}, headers=auth()
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == server.JobState.DONE
+        assert body["exposure"]["physical_filter"] == "r_57"
+        assert body["exposure"]["visit"] == 2026071300150
+
+
+def test_submit_reports_a_bad_directory_as_a_client_error(monkeypatch):
+    """A directory the server cannot read is the caller's to fix, so 400 --
+    a 500 would tell a producer's retry logic to come back later."""
+    coord = make_coord()
+    with make_client(monkeypatch, coord) as client:
+        import lsst.ts.donut_server.server as srv
+
+        async def send(self, command):
+            return {"ok": False, "error": "no *_R??_SW?.fits files in '/tmp/nope'"}
+
+        monkeypatch.setattr(srv.Coord, "send_command", send)
+
+        resp = client.post(
+            "/submit", json={"directory": "/tmp/nope"}, headers=auth()
+        )
+        assert resp.status_code == 400
+        assert "SW?.fits" in resp.json()["detail"]
+
+
+def test_submit_requires_an_absolute_directory(monkeypatch):
+    with make_client(monkeypatch, make_coord()) as client:
+        resp = client.post("/submit", json={"directory": "rel"}, headers=auth())
+        assert resp.status_code == 400
+        assert "absolute" in resp.json()["detail"]
+
+
+@pytest.fixture(autouse=True)
+def _forget_submitted_visits():
+    """`/submit`'s once-only guard is process-global, so one test's visit would
+    make the next one 409. Cleared per test rather than per call, so a test that
+    *wants* the guard to fire can submit twice itself."""
+    server.SUBMITTED.clear()
+    yield
+    server.SUBMITTED.clear()
+
+
+def _resolved(**overrides):
+    """A `resolve` reply, as the coordinator would return one."""
+    found = {
+        "visit": 2026071300150,
+        "physical_filter": "r_57",
+        "boresight_ra": 1.0,
+        "boresight_dec": 2.0,
+        "calib_time": CALIB_TIME,
+        "imgtype": "acq",
+        "detectors": [191],
+    }
+    found.update(overrides)
+    return found
+
+
+def _stub_resolve(monkeypatch, **overrides):
+    """Make the fake coordinator answer `resolve` with real-looking fields."""
+    import lsst.ts.donut_server.server as srv
+
+    real_send = srv.Coord.send_command
+    found = _resolved(**overrides)
+
+    async def send(self, command):
+        if command.get("cmd") == "resolve":
+            return {"ok": True, "result": found}
+        return await real_send(self, command)
+
+    monkeypatch.setattr(srv.Coord, "send_command", send)
+    return found
+
+
+def test_submit_skips_calibration_frames(monkeypatch):
+    """A DARK would burn a whole flight to reach an empty donut catalog.
+
+    Server-side because the image type comes out of the header read, which a
+    thin notifier does not do -- it sends a path.
+    """
+    with make_client(monkeypatch, make_coord()) as client:
+        _stub_resolve(monkeypatch, imgtype="dark")
+        resp = client.post(
+            "/submit", json={"directory": "/tmp/x"}, headers=auth()
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == "SKIPPED"
+        assert "DARK" in body["reason"]
+        # No job at all, which is the point: nothing was prepared.
+        assert "job_id" not in body
+
+
+def test_any_imgtype_forces_a_calibration_frame_through(monkeypatch):
+    with make_client(monkeypatch, make_coord()) as client:
+        _stub_resolve(monkeypatch, imgtype="dark")
+        resp = client.post(
+            "/submit",
+            json={"directory": "/tmp/x", "any_imgtype": True},
+            headers=auth(),
+        )
+        assert resp.json()["state"] == server.JobState.DONE
+
+
+def test_an_unexpected_imgtype_is_flagged_but_runs(monkeypatch):
+    """Processed, since it may well be fittable -- but the caller is told, so a
+    surprising Zernike set is attributable."""
+    with make_client(monkeypatch, make_coord()) as client:
+        _stub_resolve(monkeypatch, imgtype="spam")
+        resp = client.post(
+            "/submit", json={"directory": "/tmp/x"}, headers=auth()
+        )
+        body = resp.json()
+        assert body["state"] == server.JobState.DONE
+        assert "SPAM" in body["note"]
+
+
+def test_submit_refuses_a_visit_it_already_ran(monkeypatch):
+    """The camera's hook can fire twice for one exposure. Keyed on the visit,
+    not the directory: under replay the directory name is BTS's, so the same
+    pixels under two names must still be caught."""
+    with make_client(monkeypatch, make_coord()) as client:
+        _stub_resolve(monkeypatch)
+        first = client.post(
+            "/submit", json={"directory": "/tmp/x"}, headers=auth()
+        )
+        assert first.status_code == 200
+
+        again = client.post(
+            "/submit", json={"directory": "/tmp/other-name"}, headers=auth()
+        )
+        assert again.status_code == 409
+        assert "already submitted" in again.json()["detail"]
+        assert first.json()["job_id"] in again.json()["detail"]
+
+
+def test_resubmit_overrides_the_once_only_guard(monkeypatch):
+    """Needed for testing: the same pixels have to be runnable again."""
+    with make_client(monkeypatch, make_coord()) as client:
+        _stub_resolve(monkeypatch)
+        first = client.post(
+            "/submit", json={"directory": "/tmp/x"}, headers=auth()
+        )
+        again = client.post(
+            "/submit",
+            json={"directory": "/tmp/x", "resubmit": True},
+            headers=auth(),
+        )
+        assert again.status_code == 200
+        assert again.json()["job_id"] != first.json()["job_id"]
+
+
+def test_submit_dry_run_resolves_without_spending_a_flight(monkeypatch):
+    """The check to run first on a new deployment: it proves the server can see
+    and read the directory, without preparing or fitting anything."""
+    with make_client(monkeypatch, make_coord()) as client:
+        found = _stub_resolve(monkeypatch)
+        resp = client.post(
+            "/submit", json={"directory": "/tmp/x", "dry_run": True}, headers=auth()
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["state"] == "DRY_RUN"
+        assert body["exposure"]["calib_time"] == found["calib_time"]
+        assert "job_id" not in body
+        # And it is not recorded, so a real submit afterwards is not refused.
+        assert server.SUBMITTED == {}

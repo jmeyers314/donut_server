@@ -285,11 +285,13 @@ def main() -> int:
     print("\n" + "=" * 72)
     print("Run this in another terminal, then come back here and hit Enter")
     print("=" * 72)
-    print(f"\nexport {replay.REPLAY_DIR_VAR}={os.path.abspath(args.replay_dir)}")
-    print(f"bin/donutTrigger.py {target} --timeout 60 --wait 200")
-    print(f"\n  (add --dry-run to resolve without submitting; unset "
-          f"{replay.REPLAY_DIR_VAR}")
-    print("   to see the no-substitution case answer wrongly but succeed)")
+    print(f"bin/donutTrigger.py {target} --timeout 60")
+    print(f"\n  The server needs {replay.REPLAY_DIR_VAR}="
+          f"{os.path.abspath(args.replay_dir)}")
+    print("  exported where donutServer.py runs -- substitution is server-side,")
+    print("  so setting it in the trigger's shell does nothing. Unset it there")
+    print("  to see the no-substitution case answer wrongly but succeed.")
+    print("  (--dry-run resolves and reports without submitting.)")
 
     pause("Enter once the trigger is polling, to start copying", not args.no_pause)
 

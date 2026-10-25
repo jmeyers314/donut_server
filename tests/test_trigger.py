@@ -135,30 +135,6 @@ class TestWaitForExposure:
             trigger.wait_for_exposure(str(tmp_path), stable_checks=0)
 
 
-class TestClaim:
-    def test_first_claim_wins_and_the_second_does_not(self, tmp_path):
-        """A hook that fires twice for one exposure must submit once: a second
-        push burns a flight and puts a duplicate exposure on the dashboard for
-        the same pixels."""
-        state = str(tmp_path / "state")
-
-        assert trigger.claim(state, "2026071300050") is True
-        assert trigger.claim(state, "2026071300050") is False
-
-    def test_different_exposures_do_not_collide(self, tmp_path):
-        state = str(tmp_path / "state")
-
-        assert trigger.claim(state, "2026071300050") is True
-        assert trigger.claim(state, "2026071300150") is True
-
-    def test_marker_records_when_and_by_whom(self, tmp_path):
-        state = str(tmp_path / "state")
-        trigger.claim(state, "2026071300050")
-
-        text = (tmp_path / "state" / "2026071300050.done").read_text()
-        assert f"pid={os.getpid()}" in text
-
-
 def test_importing_trigger_does_not_import_afw():
     """What makes --detach worth having: the parent returns to the camera's
     hook without paying for the stack. `client` reaches `lsst.afw.image`
@@ -199,16 +175,17 @@ class TestCli:
             trigger.main([str(tmp_path), "--host", "http://example.invalid:8000"])
         assert "--token is required" in capsys.readouterr().err
 
-    def test_dry_run_needs_no_token(self, tmp_path, monkeypatch):
-        """--dry-run contacts no server, so demanding credentials would make
-        the first thing you run on a new deployment the hardest."""
+    def test_dry_run_needs_a_token_like_anything_else(self, tmp_path, monkeypatch):
+        """It used not to -- it resolved locally and contacted nobody. Now the
+        *server* resolves, so a dry run is a request like any other and the
+        exemption would be a hole rather than a convenience."""
         monkeypatch.delenv("DONUT_SERVER_TOKEN", raising=False)
 
-        # Times out on an empty directory rather than erroring on the token.
-        assert trigger.main([
-            str(tmp_path), "--host", "http://example.invalid:8000",
-            "--dry-run", "--timeout", "0.05", "--poll-interval", "0.01",
-        ]) == 1
+        with pytest.raises(SystemExit):
+            trigger.main([
+                str(tmp_path), "--host", "http://example.invalid:8000",
+                "--dry-run", "--timeout", "0.05", "--poll-interval", "0.01",
+            ])
 
     @pytest.mark.parametrize(
         "flag,value",
@@ -262,3 +239,100 @@ class TestCli:
             str(tmp_path), "--detach", "--log-dir", str(tmp_path / "logs"),
             "--timeout", "0.05", "--poll-interval", "0.01",
         ]) == 1
+
+
+class TestNotifier:
+    """Poll, then POST a directory and nothing else -- the only path there is.
+
+    Stack-free, like everything else in this module -- which is the property
+    under test as much as the behaviour, since a stray import here would undo
+    the only thing this path exists for.
+    """
+
+    def test_loopback_detection_matches_the_clients(self):
+        """Duplicated from `client.host_is_loopback` to avoid importing it, so
+        the two must agree -- a divergence would mean one of them is wrong
+        about when a token is required."""
+        from lsst.ts.donut_server import client
+
+        for host in (
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://example.invalid:8000",
+            "http://8.8.8.8:8000",
+            "not a url",
+        ):
+            assert trigger._host_is_loopback(host) == client.host_is_loopback(host), (
+                host
+            )
+
+    def test_a_remote_host_still_needs_a_token(self, tmp_path, monkeypatch):
+        fill(tmp_path)
+        monkeypatch.delenv("DONUT_SERVER_TOKEN", raising=False)
+        with pytest.raises(SystemExit):
+            trigger.main(
+                [str(tmp_path), "--host", "http://8.8.8.8:8000"]
+            )
+
+    def test_an_unreachable_server_fails_without_a_traceback(
+        self, tmp_path, capsys
+    ):
+        """The hook reads a log, not a stack trace, and a connection refused is
+        the most likely failure of all: the server simply is not up."""
+        fill(tmp_path)
+        # Port 1 is reserved and nothing listens there.
+        status = trigger.main(
+            [str(tmp_path), "--host", "http://127.0.0.1:1",
+             "--timeout", "5"]
+        )
+        assert status == 1
+        assert "cannot reach" in capsys.readouterr().out
+
+    def test_the_notifier_posts_the_directory_and_reports_the_exposure(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """What the server is told, and what the hook's log records back."""
+        import json
+
+        fill(tmp_path)
+        sent = {}
+
+        class FakeResponse:
+            def read(self):
+                return json.dumps({
+                    "state": "DONE",
+                    "exposure": {
+                        "visit": 2026071300150,
+                        "physical_filter": "r_57",
+                        "imgtype": "acq",
+                    },
+                }).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            sent["url"] = request.full_url
+            sent["body"] = json.loads(request.data)
+            sent["auth"] = request.headers.get("Authorization")
+            return FakeResponse()
+
+        import urllib.request
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        status = trigger.main(
+            [str(tmp_path), "-n", "16", "--token", "secret"]
+        )
+
+        assert status == 0
+        assert sent["url"].endswith("/submit?num_workers=16")
+        assert sent["body"] == {"directory": str(tmp_path)}
+        assert sent["auth"] == "Bearer secret"
+        out = capsys.readouterr().out
+        assert "visit=2026071300150" in out
+        assert "filter=r_57" in out
+        assert "DONE" in out
