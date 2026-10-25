@@ -186,6 +186,80 @@ def _camera():
     return _CAMERA
 
 
+# A corner sensor to hang the warm-up stub on. Any detector would do -- the
+# translator discovery it provokes is not detector-specific -- so this is R00_SW0
+# simply because it is the one the camera's hook fires on.
+_WARMUP_DETECTOR = 191
+
+# Enough of an LSSTCam primary header for `ObservationInfo` to pick a translator
+# and build a VisitInfo from. Not a realistic exposure and not meant to be: the
+# only thing wanted from it is the side effect. See `warm_up`.
+_WARMUP_CARDS = (
+    ("INSTRUME", "LSSTCam"),
+    ("RA", 0.0),
+    ("DEC", 0.0),
+    ("ROTPA", 0.0),
+    ("DATE-BEG", "2026-01-01T00:00:00.000"),
+    ("DATE-END", "2026-01-01T00:00:30.000"),
+    ("RAFTBAY", "R00"),
+    ("CCDSLOT", "SW0"),
+    ("OBSTYPE", "science"),
+    ("EXPTIME", 30.0),
+)
+
+
+def warm_up() -> None:
+    """Pay the one-time costs of the assembly path now, not on the first exposure.
+
+    Two of them, both measured, both otherwise landing on whichever exposure
+    happens to arrive first:
+
+    - `LsstCam.getCamera()`, ~0.4 s.
+    - the first `attachRawWcsFromBoresight` call, ~0.66 s against ~0.007 s for
+      every call after it. The cost is `astro_metadata_translator` discovering
+      which translator class a header belongs to, and it is per *process* -- so
+      without this, all eight fork workers pay it simultaneously on their first
+      call (0.51 s each, measured) rather than inheriting the result.
+
+    A synthetic header is enough to trigger the discovery, and a real one
+    immediately afterwards takes 0.007 s -- verified. The resulting exposure is
+    nonsense and is discarded; `attachRawWcsFromBoresight` may well decline to
+    attach a WCS at all, which is fine, since what is wanted is the lookup it
+    does on the way there.
+
+    Cheap to call more than once: `_camera` is cached and the translator
+    discovery is idempotent.
+
+    Logging is suppressed for the duration. The synthetic header is missing
+    cards a real one has (`LSST_NUM`, dark time), and the translator says so at
+    WARNING -- which on an otherwise clean startup reads like a real problem
+    with the service rather than an artifact of a deliberately minimal header.
+    """
+    import logging as _logging
+
+    import lsst.afw.image as afwImage
+    import lsst.daf.base as dafBase
+    import lsst.geom as geom
+    from lsst.obs.lsst.assembly import attachRawWcsFromBoresight
+
+    camera = _camera()
+
+    header = dafBase.PropertyList()
+    for card, value in _WARMUP_CARDS:
+        header.set(card, value)
+
+    stub = afwImage.ExposureF(geom.Box2I(geom.Point2I(0, 0), geom.Extent2I(1, 1)))
+    stub.setDetector(camera[_WARMUP_DETECTOR])
+    stub.setMetadata(header)
+
+    previous = _logging.root.manager.disable
+    _logging.disable(_logging.CRITICAL)
+    try:
+        attachRawWcsFromBoresight(stub)
+    finally:
+        _logging.disable(previous)
+
+
 def _assemble_image(handle: RawHandle, out=None):
     """Read one DAQ file's amp HDUs into a single untrimmed image array.
 

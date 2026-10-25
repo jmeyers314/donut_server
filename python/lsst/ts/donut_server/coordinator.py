@@ -85,8 +85,15 @@ import lsst.ip.isr as ipIsr
 
 # Imported at module scope, never lazily inside a worker: every one of these
 # must be fully resident before the first fork.
+#
+# `daq` brings in `client` and so `requests`, which this process has no use for
+# -- but it is also where the DAQ assembly path and its warm-up live, and the
+# alternative is a lazy import inside the command loop, which would put an
+# import on the first exposure's critical path. Note `daq` sets the same five
+# BLAS/OpenMP vars this module does, by `setdefault`, so the two agree.
 from lsst.ts.donut_server import protocol
 from lsst.ts.donut_server import exposure_codec
+from lsst.ts.donut_server import daq
 from lsst.ts.donut_server import logtail
 from lsst.ts.donut_server import refcat_store
 from lsst.daf.butler import (
@@ -2267,11 +2274,20 @@ def coordinator_main(conn, shm_name: str) -> None:
         _SHM.close()
         os._exit(1)
 
-    # Sent only once, and only after the BLAS assert, the shared block and the
-    # calib config are all good -- so "hello" means fully ready to serve, not
-    # merely spawned. Without it the parent cannot distinguish a healthy child
-    # from one that is 15 s into importing afw + ts_wep, or one that is about to
-    # fail the assert.
+    # Before the hello, so that "ready to serve" does not mean "ready except for
+    # ~1 s of first-exposure warm-up". Costs this flight's bring-up ~1 s against
+    # a HELLO_TIMEOUT_S of 120 s, and is per flight because each is its own
+    # process -- which is the point: the camera load and the translator lookup
+    # are per-process costs, and paying them here is what keeps them off every
+    # exposure. Safe here specifically: neither starts a thread (verified), so
+    # the single-thread and BLAS invariants the task's forks depend on still hold.
+    daq.warm_up()
+
+    # Sent only once, and only after the BLAS assert, the shared block, the
+    # calib config and the warm-up are all good -- so "hello" means fully ready
+    # to serve, not merely spawned. Without it the parent cannot distinguish a
+    # healthy child from one that is 15 s into importing afw + ts_wep, or one
+    # that is about to fail the assert.
     conn.send({"ok": True, "event": "hello", "pid": os.getpid()})
 
     # After the hello, deliberately. Everything above -- the single-thread

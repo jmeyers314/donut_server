@@ -342,6 +342,64 @@ def test_the_parallel_path_leaves_no_shared_blocks_behind(paired):
     assert set(_glob.glob("/dev/shm/psm_*")) <= before
 
 
+def test_warm_up_needs_no_exposure_and_leaves_logging_alone():
+    """The coordinator calls this before its hello, so it must not need data.
+
+    Driven by a synthetic header on purpose -- at server startup no exposure
+    exists yet. It also suppresses the translator's complaints about that
+    header's missing cards, so this checks the suppression is scoped: a
+    `logging.disable` left in place would silence the whole coordinator.
+    """
+    import logging
+
+    before = logging.root.manager.disable
+    daq.warm_up()
+    assert logging.root.manager.disable == before
+    assert logging.getLogger("probe").isEnabledFor(logging.WARNING)
+
+
+def test_warm_up_is_cheap_to_repeat():
+    """Idempotent, so a second caller (or a retry) costs nothing."""
+    import time
+
+    daq.warm_up()
+    t0 = time.monotonic()
+    daq.warm_up()
+    assert time.monotonic() - t0 < 0.1
+
+
+def test_warm_up_makes_the_first_real_wcs_cheap(paired):
+    """What the warm-up is actually for.
+
+    `attachRawWcsFromBoresight`'s first call in a process spends ~0.5 s letting
+    `astro_metadata_translator` work out which translator a header belongs to,
+    and ~0.007 s on every call after. Without the warm-up that lands on the
+    first exposure -- and in all eight fork workers at once.
+    """
+    import time
+
+    import lsst.afw.image as afwImage
+    import lsst.geom as geom
+    from lsst.obs.lsst.assembly import attachRawWcsFromBoresight
+
+    source, _ = paired
+    handle = source.handles[sorted(source.handles)[0]]
+
+    daq.warm_up()
+
+    stub = afwImage.ExposureF(geom.Box2I(geom.Point2I(0, 0), geom.Extent2I(1, 1)))
+    stub.setDetector(daq._camera()[handle.detector_num])
+    stub.setMetadata(handle.header)
+
+    t0 = time.monotonic()
+    attachRawWcsFromBoresight(stub)
+    elapsed = time.monotonic() - t0
+
+    # Generous against the ~0.007 s it actually takes once warm, but far below
+    # the ~0.5 s it costs cold.
+    assert elapsed < 0.15, f"first real WCS took {elapsed:.3f}s; warm-up did not take"
+
+
 def test_exposure_info_matches_the_reference(paired, reference_images):
     """WCS, VisitInfo and filter, which assembly attaches rather than reads."""
     import lsst.geom as geom
