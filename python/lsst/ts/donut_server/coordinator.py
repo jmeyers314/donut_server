@@ -28,9 +28,10 @@ repo), and `ButlerCalibBackend` resolves them from a real repo the way
 identity is what the two caches are keyed on, so a recertification that changes
 which datasets a filter resolves to invalidates the right half by itself.
 
-Per job, `run_job` rebuilds the raw exposures out of shared memory, hands them
-to a hand-built in-memory Butler, and calls the real
-`DonutBlitzCornerTask.runQuantum()`.
+Per job, `run_job` hands one `ExposureF` per sensor to a hand-built in-memory
+Butler and calls the real `DonutBlitzCornerTask.runQuantum()`. Where those
+exposures came from is its caller's business: `run_push` rebuilds them out of
+the shared block a producer streamed into.
 
 The task does its own two-stage forking internally (cutout, then WF fit), sized
 by `ExecutionResources(num_cores=...)`, and uses the same
@@ -1678,19 +1679,47 @@ def _summarize(table) -> dict:
     }
 
 
-def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
-    """Rebuild the raws, build the butler, run the real task."""
+def run_push(job_id: str, layout: list, num_workers: int | None = None) -> dict:
+    """Rebuild the raws out of the shared block, then run the job.
+
+    The `/push` half of the two ways pixels reach this process: a producer has
+    already assembled them and streamed them into the shared block, so all that
+    is left here is to rebuild one `ExposureF` per sensor around them.
+
+    Reads straight out of the block, so there is no second copy of the ~308 MB
+    payload to free afterwards -- the exposures themselves (~900 MB, since
+    `ExposureF` allocates all three planes) are the only per-job bulk.
+    """
+    t0 = time.perf_counter()
+    exposures = reconstruct_exposures(layout)
+    decode_s = time.perf_counter() - t0
+
+    result = run_job(job_id, exposures, num_workers)
+    # Both reported by the caller rather than inside run_job, because the decode
+    # is a cost of *this* path -- the ingest path has no decode step at all --
+    # and because `coordinator_total_s` has always meant "everything this
+    # process spent on the job", decode included. The dashboard charts the
+    # phases against that total, so leaving decode out of it would make the
+    # segments not sum to the whole.
+    result["timings"]["decode_s"] = decode_s
+    result["timings"]["coordinator_total_s"] += decode_s
+    return result
+
+
+def run_job(job_id: str, exposures: dict, num_workers: int | None = None) -> dict:
+    """Build the butler around `exposures` and run the real task.
+
+    `exposures` is `{detector_name: ExposureF}` -- keyed by name, because that is
+    how `_CALIB_STORE`'s `*_by_name` dicts are indexed. Where they came from is
+    deliberately not this function's business: `run_push` rebuilds them from the
+    shared block a producer streamed into, and the ingest path assembles them
+    from DAQ files on disk. Everything from the filter cross-check down is
+    identical either way.
+    """
     t_total = time.perf_counter()
     # The only delimiter between one job's log lines and the next's, since the
     # task's own logging knows nothing about jobs.
     _log.info("job %s: starting", job_id)
-
-    # Reads straight out of the shared block, so there is no second copy of the
-    # ~308 MB payload to free afterwards -- the exposures themselves (~900 MB,
-    # since ExposureF allocates all three planes) are the only per-job bulk.
-    t0 = time.perf_counter()
-    exposures = reconstruct_exposures(layout)
-    decode_s = time.perf_counter() - t0
 
     # physicalLabel, not bandLabel: band is a 6-valued coarsening of the filter,
     # so comparing it only checks a projection of the key. Two filters sharing a
@@ -1782,7 +1811,6 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
         "quantum": quantum_info,
         "table_parquet": parquet_bytes,
         "timings": {
-            "decode_s": decode_s,
             **bundle_timings,
             "run_quantum_s": run_quantum_s,
             "serialize_s": serialize_s,
@@ -2303,7 +2331,7 @@ def coordinator_main(conn, shm_name: str) -> None:
                         # it was evicted since prepare -- rather than running
                         # whatever entry a later prepare happened to leave active.
                         ensure_prepared_for_push(tuple(prepared_key))
-                    result = run_job(
+                    result = run_push(
                         command["job_id"], command["layout"], command.get("num_workers")
                     )
                     conn.send({"ok": True, "result": result})
