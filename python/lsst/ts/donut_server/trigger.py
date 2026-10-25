@@ -48,25 +48,16 @@ deliberately: running a replay *without* substitution has probative value --
 forcing every WCS to describe the wrong sky is a real test -- so that has to
 stay expressible.
 
-Which original is being replayed is read from **`EMUIMAGE`**, the emulator's own
-record of what it replayed, whose value is a bare OBSID matching how the replay
-tree names its exposure directories:
-
-    "OBSID"    : "MC_O_20261022_000001",     # what BTS wrote
-    "EMUIMAGE" : "MC_O_20250530_000395",     # what it replayed
-
-So the lookup is a path join. It is read from all 8 sensors and cross-checked
-rather than trusted from one, because a directory holding two different replays
-is otherwise silent. The keyword is absent entirely on real camera files
-(verified across a tree of originals, including blank-valued cards), so with the
-variable set, an absent `EMUIMAGE` is a hard error -- that is what it looks like
-to point the replay path at real data. `DONUT_SERVER_REPLAY_OBSID` pins one
-exposure and skips the lookup, for hand testing and for a replay whose marker is
-missing or names something not in the tree.
+How the original is located -- the `EMUIMAGE` marker, the 8-sensor
+cross-check, and `DONUT_SERVER_REPLAY_OBSID` as the override -- lives in
+`replay`, because the coordinator's `/ingest` path has to do the same
+substitution on the server side. See that module's docstring.
 
 Everything above `resolve_source` here is deliberately free of any `lsst`
-import, so the polling and marker logic is testable without the stack -- and so
-`--detach`'s parent process can exit before paying for it.
+import, so the polling logic is testable without the stack -- and so
+`--detach`'s parent process can exit before paying for it. `replay` is
+imported from inside `resolve_source` for that reason: it reads FITS headers,
+and so reaches afw.
 """
 from __future__ import annotations
 
@@ -89,10 +80,6 @@ import time
 # submission that failed. `tests/test_trigger.py` asserts the module stays
 # clean of `lsst.afw`, since a stray top-level import would silently undo this.
 
-# The sensor the camera's per-file hook fires on: the only one guaranteed to be
-# on disk when we start, and so the one the substitution report is drawn from.
-TRIGGER_SENSOR = "R00_SW0"
-
 EXPECTED_SENSORS = 8
 
 # Corner-sensor FITS, and the sidecar the camera's script writes beside it.
@@ -104,12 +91,14 @@ SIDECAR_SUFFIX = ".json"
 # detector a file *is* gets read from its header, in daq.py.
 _SENSOR_RE = re.compile(r"_(R\d\d_SW\d)\.fits$")
 
-# The emulator's record of which original exposure it replayed. Absent on real
-# camera files, which is what makes it safe to require when replay is enabled.
-EMUIMAGE_CARD = "EMUIMAGE"
-
+# The replay cards, variables and substitution logic live in `replay`, which
+# both this module and the coordinator's /ingest path use. Not re-exported here:
+# importing it reaches the stack, and the whole point of this module's lazy
+# imports is that `--detach`'s parent never does.
+#
+# `REPLAY_DIR_VAR` is the one name tests reach for by string, so it is spelled
+# out rather than imported: `replay.REPLAY_DIR_VAR` is the definition.
 REPLAY_DIR_VAR = "DONUT_SERVER_REPLAY_DIR"
-REPLAY_OBSID_VAR = "DONUT_SERVER_REPLAY_OBSID"
 
 # Set on the detached child so it does not detach again. Not a flag, because the
 # child's argv is the parent's argv and rewriting it is more fragile than one
@@ -244,187 +233,21 @@ def wait_for_exposure(
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
 
-def read_emuimage(headers: dict) -> str:
-    """The original exposure's OBSID, from the live headers' `EMUIMAGE` cards.
-
-    Read from all 8 sensors and cross-checked rather than trusted from one. A
-    directory holding files from two different replays is otherwise completely
-    silent: the substitution would succeed, every downstream cross-check would
-    pass, and the answer would be a fit of one exposure's donuts against
-    another's calibs.
-
-    Absent is a hard error, not a fall back to the live metadata. With
-    `DONUT_SERVER_REPLAY_DIR` set the caller has asserted these are replays, and
-    the keyword is absent only on *real camera* files -- so this firing means the
-    replay path is pointed at real data, and continuing would submit it with
-    whatever pointing happened to be in the headers. A blank value counts as
-    absent, being the plausible shape of a keyword the emulator declared but
-    never filled.
-    """
-    missing = []
-    values: dict[str, list[str]] = {}
-    for name in sorted(headers):
-        try:
-            raw = headers[name][EMUIMAGE_CARD]
-        except Exception:
-            raw = None
-        value = str(raw).strip() if raw is not None else ""
-        if not value:
-            missing.append(name)
-        else:
-            values.setdefault(value, []).append(name)
-
-    if missing:
-        raise RuntimeError(
-            f"{EMUIMAGE_CARD} is absent or blank on detector(s) "
-            f"{missing}, so the exposure being replayed cannot be identified. "
-            f"{EMUIMAGE_CARD} is written by the emulator and absent on real "
-            f"camera data -- if this is real data, unset {REPLAY_DIR_VAR}; if "
-            f"it is a replay, set {REPLAY_OBSID_VAR} to pin the exposure."
-        )
-    if len(values) != 1:
-        detail = "; ".join(
-            f"{value!r} on {sorted(dets)}" for value, dets in sorted(values.items())
-        )
-        raise RuntimeError(
-            f"the 8 sensors disagree about {EMUIMAGE_CARD}, so this directory "
-            f"holds more than one replayed exposure: {detail}"
-        )
-
-    (exposure,) = values
-    return exposure
-
-
-def replay_headers(replay_dir: str, exposure: str) -> dict:
-    """{detector name: primary header} for one exposure in the replay tree.
-
-    Keyed by detector name read from each replay header, which is how
-    `daq.resolve_exposure_dir` matches a substitute to a live file -- never by
-    filename, since the two trees need not name files the same way.
-    """
-    from lsst.ts.donut_server import daq
-
-    directory = os.path.join(replay_dir, exposure)
-    if not os.path.isdir(directory):
-        raise RuntimeError(
-            f"the replay names exposure {exposure!r} but {directory!r} is not a "
-            f"directory, so its original metadata cannot be read. Either "
-            f"{REPLAY_DIR_VAR} points at the wrong tree, or that exposure is "
-            f"not in it; {REPLAY_OBSID_VAR} overrides the name."
-        )
-
-    headers = {}
-    for path in daq.sw_paths(directory):
-        header = daq.read_header(path)
-        name = daq.detector_name(header)
-        if name in headers:
-            raise RuntimeError(
-                f"{directory!r} has two files for detector {name}"
-            )
-        headers[name] = header
-    if len(headers) != EXPECTED_SENSORS:
-        raise RuntimeError(
-            f"replay exposure {directory!r} has {len(headers)} corner sensor(s), "
-            f"expected {EXPECTED_SENSORS}: {sorted(headers)}"
-        )
-    return headers
-
-
-def _card(header, key, default="<absent>"):
-    """One header card, for the live-vs-substituted report. Never raises."""
-    try:
-        value = header[key]
-    except Exception:
-        return default
-    return default if value is None else value
-
-
-def report_substitution(live, substituted) -> None:
-    """Log live vs substituted values for the cards that change the answer.
-
-    These are what a wrong substitution corrupts: the filter picks the flat,
-    RA/DEC picks the refcat shards, DATE-BEG picks the calibs, and FOCUSZ is the
-    defocus the fit is solving against.
-
-    This log is not a nicety. A replay matched to the wrong exposure still
-    produces a DONE job whose summary looks reasonable -- the cross-checks
-    downstream test consistency rather than truth (see the module docstring) --
-    so these lines are the *only* place the substitution is visible for review.
-
-    `EMUIMAGE` is reported on its own line above the table, against the
-    substituted OBSID, because it does not belong in a live-vs-substituted
-    column: the *original* has no EMUIMAGE -- only replays do -- so pairing them
-    would show every correct substitution as a change to `<absent>`. What is
-    worth checking is that the marker and the exposure actually loaded agree.
-    """
-    marker = _card(live, EMUIMAGE_CARD)
-    loaded = _card(substituted, "OBSID")
-    agree = "" if str(marker) == str(loaded) else "   <- MISMATCH"
-    log(f"replay: {EMUIMAGE_CARD} {marker} -> loaded {loaded}{agree}")
-
-    log("replay metadata substitution (live -> substituted):")
-    for key in ("OBSID", "FILTER", "RA", "DEC", "DATE-BEG", "FOCUSZ"):
-        before, after = _card(live, key), _card(substituted, key)
-        flag = "" if before == after else "   *"
-        log(f"    {key:9s} {before!s:34s} -> {after!s}{flag}")
-
-
-def read_live_headers(paths: list[str]) -> dict:
-    """{detector name: primary header} for the polled directory.
-
-    Keyed by the header's own `RAFTBAY`/`CCDSLOT` rather than by filename, the
-    same way `replay_headers` keys the substitutes -- which is what lets the two
-    maps be matched detector-wise in `daq.resolve_exposure_dir` without either
-    tree's naming mattering.
-    """
-    from lsst.ts.donut_server import daq
-
-    headers = {}
-    for path in paths:
-        header = daq.read_header(path)
-        name = daq.detector_name(header)
-        if name in headers:
-            raise RuntimeError(f"two files claim to be detector {name}")
-        headers[name] = header
-    return headers
-
-
 def resolve_source(directory: str, paths: list[str]):
     """`(RawSource, imgtype)` for a complete exposure directory.
 
     Substitutes the original metadata when `DONUT_SERVER_REPLAY_DIR` is set.
     Reads no pixels on either path: everything needed is in the primary headers,
     which is what keeps /prepare off the pixel path.
+
+    The substitution itself lives in `replay`, because the coordinator's
+    `/ingest` path has to do the same thing on the server side. `paths` is now
+    only the polled file list this process already had; `replay` re-globs the
+    directory for its own use, since its other caller has no such list.
     """
-    from lsst.ts.donut_server import daq
+    from lsst.ts.donut_server import replay
 
-    replay_dir = os.environ.get(REPLAY_DIR_VAR)
-    if not replay_dir:
-        return daq.resolve_exposure_dir(directory)
-
-    if not os.path.isdir(replay_dir):
-        raise RuntimeError(
-            f"{REPLAY_DIR_VAR} is {replay_dir!r}, which is not a directory"
-        )
-
-    live = read_live_headers(paths)
-
-    pinned = os.environ.get(REPLAY_OBSID_VAR)
-    if pinned:
-        log(
-            f"replay: {REPLAY_OBSID_VAR}={pinned} pins the exposure, "
-            f"ignoring {EMUIMAGE_CARD}"
-        )
-        exposure = pinned
-    else:
-        exposure = read_emuimage(live)
-        log(f"replay: {EMUIMAGE_CARD} names original exposure {exposure}")
-
-    headers = replay_headers(replay_dir, exposure)
-    # Reported off the trigger sensor, which every exposure has and whose cards
-    # are the ones quoted in the module docstring.
-    report_substitution(live.get(TRIGGER_SENSOR, {}), headers[TRIGGER_SENSOR])
-    return daq.resolve_exposure_dir(directory, headers=headers)
+    return replay.resolve(directory, report=log)
 
 
 def claim(state_dir: str, key: str) -> bool:

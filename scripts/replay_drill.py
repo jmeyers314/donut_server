@@ -44,6 +44,7 @@ import time
 
 from lsst.ts.donut_server import client
 from lsst.ts.donut_server import daq
+from lsst.ts.donut_server import replay
 from lsst.ts.donut_server import trigger
 
 # Where the fake replay's metadata is moved to. Far from any real pointing, in a
@@ -122,7 +123,7 @@ def build_fake_exposure(source: str, staging: str, emuimage: str) -> dict:
             header["OBSID"] = FAKE_OBSID
             header["DAYOBS"] = FAKE_DAYOBS
             header["SEQNUM"] = FAKE_SEQNUM
-            header[trigger.EMUIMAGE_CARD] = emuimage
+            header[replay.EMUIMAGE_CARD] = emuimage
             header["FILTER"] = fake_filter
             header["FILTBAND"] = fake_band
             for card, value in (
@@ -178,9 +179,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--replay-dir",
-        default=os.environ.get(trigger.REPLAY_DIR_VAR, "replay"),
+        default=os.environ.get(replay.REPLAY_DIR_VAR, "replay"),
         help=f"the replay tree, holding one subdirectory per original exposure "
-        f"(default: ${trigger.REPLAY_DIR_VAR}, else 'replay')",
+        f"(default: ${replay.REPLAY_DIR_VAR}, else 'replay')",
     )
     parser.add_argument(
         "--source",
@@ -191,7 +192,7 @@ def main() -> int:
     parser.add_argument(
         "--emuimage",
         default=None,
-        help=f"the OBSID to stamp into {trigger.EMUIMAGE_CARD} (default: the "
+        help=f"the OBSID to stamp into {replay.EMUIMAGE_CARD} (default: the "
         "source exposure's own, which is what makes the lookup succeed). Set it "
         "to something absent to exercise the mismatch error.",
     )
@@ -235,7 +236,7 @@ def main() -> int:
     print("=" * 72)
     print(f"  source pixels : {source}")
     print(f"  replay tree   : {args.replay_dir}")
-    print(f"  {trigger.EMUIMAGE_CARD:14s}: {emuimage}")
+    print(f"  {replay.EMUIMAGE_CARD:14s}: {emuimage}")
     print(f"  staging       : {staging}")
     print(f"  target        : {target}")
 
@@ -269,7 +270,7 @@ def main() -> int:
     if expected_mismatch:
         print("  EXPECT: the trigger FAILS, naming the absent replay directory")
         print(f"          {os.path.join(args.replay_dir, emuimage)!r}")
-        print(f"          and suggesting {trigger.REPLAY_OBSID_VAR}.")
+        print(f"          and suggesting {replay.REPLAY_OBSID_VAR}.")
     else:
         print("  EXPECT, with the replay dir set -- these are the ORIGINAL values:")
         print(f"          filter={report['original_filter']}  "
@@ -284,10 +285,10 @@ def main() -> int:
     print("\n" + "=" * 72)
     print("Run this in another terminal, then come back here and hit Enter")
     print("=" * 72)
-    print(f"\nexport {trigger.REPLAY_DIR_VAR}={os.path.abspath(args.replay_dir)}")
+    print(f"\nexport {replay.REPLAY_DIR_VAR}={os.path.abspath(args.replay_dir)}")
     print(f"bin/donutTrigger.py {target} --timeout 60 --wait 200")
     print(f"\n  (add --dry-run to resolve without submitting; unset "
-          f"{trigger.REPLAY_DIR_VAR}")
+          f"{replay.REPLAY_DIR_VAR}")
     print("   to see the no-substitution case answer wrongly but succeed)")
 
     pause("Enter once the trigger is polling, to start copying", not args.no_pause)

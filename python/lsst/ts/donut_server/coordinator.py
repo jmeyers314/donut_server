@@ -94,6 +94,7 @@ import lsst.ip.isr as ipIsr
 from lsst.ts.donut_server import protocol
 from lsst.ts.donut_server import exposure_codec
 from lsst.ts.donut_server import daq
+from lsst.ts.donut_server import replay
 from lsst.ts.donut_server import logtail
 from lsst.ts.donut_server import refcat_store
 from lsst.daf.butler import (
@@ -1734,9 +1735,20 @@ def run_ingest(
 
     `headers` substitutes replay metadata, exactly as `resolve_exposure_dir`
     documents: detector identity still comes from the live file on disk, only
-    the observation metadata is replaced.
+    the observation metadata is replaced. `None` means consult
+    `DONUT_SERVER_REPLAY_DIR` -- which is the normal case, since the whole point
+    of resolving here is that the producer does not have to.
     """
     t0 = time.perf_counter()
+    if headers is None:
+        # Logged, not discarded: these lines are the only place a replay
+        # matched to the wrong original is visible, because every cross-check
+        # downstream tests consistency rather than truth. They used to land in
+        # the trigger's own output; on this path the resolution happens here, so
+        # this log is where they belong.
+        headers = replay.substituted_headers(
+            directory, report=lambda line: _log.info("job %s: %s", job_id, line)
+        )
     source, imgtype = daq.resolve_exposure_dir(directory, headers=headers)
     resolve_s = time.perf_counter() - t0
 
