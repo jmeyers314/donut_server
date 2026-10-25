@@ -1766,15 +1766,16 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
     _DEFERRED["table"] = full_table
     _DEFERRED["selection"] = selection
 
-    # Reclaim this job's cycles now rather than whenever the automatic collector
-    # next fires: the ~900 MB of exposures should be gone well before the next
-    # exposure arrives (~30 s cadence). full_table is deliberately not among them
-    # -- dropping the local name leaves _DEFERRED's ~21 MB reference, which is the
-    # point -- but the exposures and the butler holding them still go now.
+    # Drop the local names, so that everything this job allocated is unreachable
+    # the moment we return: the ~900 MB of exposures, and the butler holding
+    # them. full_table is deliberately not among them -- dropping the local name
+    # leaves _DEFERRED's ~21 MB reference, which is the point.
+    #
+    # The `gc.collect()` that used to follow is now in `_run_deferred`, i.e.
+    # after the reply. It is cycle collection for memory nobody is waiting on,
+    # and the client was blocked on every millisecond of it; at ~0.3 s that was
+    # ~7% of a push. Making it unreachable is what matters here and is free.
     del bundle, full_table, table, exposures, selection
-    t0 = time.perf_counter()
-    collected = gc.collect()
-    gc_s = time.perf_counter() - t0
 
     return {
         "summary": summary,
@@ -1785,8 +1786,6 @@ def run_job(job_id: str, layout: list, num_workers: int | None = None) -> dict:
             **bundle_timings,
             "run_quantum_s": run_quantum_s,
             "serialize_s": serialize_s,
-            "gc_s": gc_s,
-            "gc_collected": collected,
             "coordinator_total_s": time.perf_counter() - t_total,
         },
     }
@@ -1912,6 +1911,18 @@ def _run_deferred() -> None:
     table = _DEFERRED.pop("table", None)
     job_id = _DEFERRED.pop("job_id", None)
     selection = _DEFERRED.pop("selection", None) or {}
+
+    # First, before the writes below: the job's ~900 MB is unreachable but not
+    # yet freed, and the writes materialize tens of MB of parquet. Collecting
+    # first means they allocate against a reclaimed heap, so peak RSS stays what
+    # it was when this ran inside `run_job` -- the point of the move was to get
+    # it off the reply path, not to overlap it with the writes.
+    #
+    # Also runs on the failure path, where `table` is None: the exception that
+    # got us there holds a traceback, and so the whole job's frames, in a cycle
+    # only the collector breaks.
+    _collect_last_job()
+
     if table is None:
         return
     try:
@@ -1950,6 +1961,31 @@ def _run_deferred() -> None:
     # assignment -- which would otherwise hold two jobs' tables at once.
     del table, selection
     _DEFERRED.clear()
+
+
+def _collect_last_job() -> None:
+    """Reclaim the finished job's cycles, off the latency path.
+
+    `run_job` makes its ~900 MB of exposures unreachable before it returns, but
+    unreachable is not the same as freed when the graph has cycles -- the butler,
+    the quantum context and the exposures reference each other, so the collector
+    is what actually hands the pages back. Running it here rather than inside
+    `run_job` is worth ~0.3 s of a push, which the client was previously blocked
+    on for memory it does not care about.
+
+    Still explicit rather than left to the automatic collector: the pages should
+    be gone well before the next exposure, and this is the one moment in the
+    cycle when nothing is waiting. Measured at ~0.3 s against a ~30 s cadence.
+
+    There is deliberately no gc.freeze() alongside it -- see the note in
+    `run_job` for why that was tried and removed.
+    """
+    t0 = time.perf_counter()
+    collected = gc.collect()
+    _log.info(
+        "collected %d objects in %.3fs (after the reply)",
+        collected, time.perf_counter() - t0,
+    )
 
 
 # ------------------------------------------------------------------ plot flights

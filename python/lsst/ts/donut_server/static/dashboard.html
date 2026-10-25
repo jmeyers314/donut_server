@@ -980,7 +980,7 @@ const PHASES = [
   ["receive_s", "recv", "#4a86c7"], ["layout_s", "layout", "#5b7fa8"],
   ["decode_s", "decode", "#4ba36b"], ["butler_put_s", "put", "#5f9e78"],
   ["dataset_refs_s", "refs", "#6f9a84"], ["run_quantum_s", "runQuantum", "#c99a3d"],
-  ["serialize_s", "serialize", "#a8794a"], ["gc_s", "gc", "#8b93a1"],
+  ["serialize_s", "serialize", "#a8794a"],
 ];
 
 function renderDetail() {
@@ -1026,7 +1026,9 @@ function renderDetail() {
       foot.push("runQuantum is " +
         (100 * t.run_quantum_s / t.coordinator_total_s).toFixed(0) + "% of it");
     }
-    if (t.gc_collected !== undefined) foot.push("gc reclaimed " + t.gc_collected);
+    // No gc line: collection moved after the push reply, so it is not a phase
+    // of a push any more and its cost is not charged to this job. The
+    // coordinator logs what it reclaimed.
     put(d, "div", foot.join("  ·  "), "row");
   }
 
