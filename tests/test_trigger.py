@@ -8,6 +8,7 @@ submit path, and that is exercised by hand against a running server with
 `scripts/replay_drill.py` (see the README), not here.
 """
 import os
+import time
 
 import pytest
 
@@ -68,11 +69,12 @@ class TestPollOnce:
 class TestWaitForExposure:
     def test_returns_when_complete_and_stable(self, tmp_path):
         fill(tmp_path)
-        paths = trigger.wait_for_exposure(
-            str(tmp_path), timeout=5, interval=0.01, stable_checks=2
+        paths, complete_at = trigger.wait_for_exposure(
+            str(tmp_path), timeout=5, interval=0.01, settle_time=0.02
         )
         assert len(paths) == 8
         assert paths == sorted(paths)
+        assert complete_at <= time.monotonic()
 
     def test_incomplete_times_out_naming_what_is_missing(self, tmp_path):
         """The message is the thing you read when a replay delivers six
@@ -125,14 +127,57 @@ class TestWaitForExposure:
 
         monkeypatch.setattr(trigger, "poll_once", settling)
 
-        paths = trigger.wait_for_exposure(
-            str(tmp_path), timeout=5, interval=0.01, stable_checks=2
+        paths, _ = trigger.wait_for_exposure(
+            str(tmp_path), timeout=5, interval=0.01, settle_time=0.02
         )
         assert len(paths) == 8
 
-    def test_stable_checks_must_be_positive(self, tmp_path):
-        with pytest.raises(ValueError, match="stable_checks"):
-            trigger.wait_for_exposure(str(tmp_path), stable_checks=0)
+    def test_complete_at_predates_the_settle_window(self, tmp_path):
+        """What `run_notifier` subtracts out. The settle polls watch a directory
+        that stopped changing before they ran, so `complete_at` has to point at
+        the poll that first saw the final sizes -- otherwise every latency the
+        producer reports is ~`settle_time` pessimistic and a real regression
+        that size hides inside it."""
+        fill(tmp_path)
+        settle_time = 0.2
+
+        before = time.monotonic()
+        _, complete_at = trigger.wait_for_exposure(
+            str(tmp_path), timeout=5, interval=0.01, settle_time=settle_time
+        )
+        returned_at = time.monotonic()
+
+        # The whole settle window is excluded, and it is not dated before the
+        # wait began either.
+        assert returned_at - complete_at >= settle_time
+        assert complete_at >= before
+
+    def test_settle_window_is_held_regardless_of_interval(self, tmp_path):
+        """The decoupling, which is the reason `settle_time` is a duration and
+        not a poll count: a coarse interval and a fine one must both wait out
+        the same window. Spelled as a count, the fine interval here would have
+        cut the guard to a fraction of it."""
+        fill(tmp_path)
+        settle_time = 0.3
+
+        for interval in (0.01, 0.15):
+            started = time.monotonic()
+            _, complete_at = trigger.wait_for_exposure(
+                str(tmp_path), timeout=5, interval=interval, settle_time=settle_time
+            )
+            held = time.monotonic() - complete_at
+
+            assert held >= settle_time, f"interval={interval} cut the guard to {held}"
+            # And it does not overshoot by much more than one extra poll.
+            assert time.monotonic() - started <= settle_time + 2 * interval + 1.0
+
+    def test_settle_time_must_be_positive(self, tmp_path):
+        with pytest.raises(ValueError, match="settle_time"):
+            trigger.wait_for_exposure(str(tmp_path), settle_time=0)
+
+    def test_interval_must_be_positive(self, tmp_path):
+        with pytest.raises(ValueError, match="interval"):
+            trigger.wait_for_exposure(str(tmp_path), interval=0)
 
 
 def test_importing_trigger_does_not_import_afw():
@@ -190,7 +235,7 @@ class TestCli:
     @pytest.mark.parametrize(
         "flag,value",
         [("--timeout", "0"), ("--poll-interval", "0"),
-         ("--stable-checks", "0"), ("-n", "0")],
+         ("--settle-time", "0"), ("-n", "0")],
     )
     def test_nonsense_numbers_are_rejected(self, tmp_path, flag, value):
         with pytest.raises(SystemExit):

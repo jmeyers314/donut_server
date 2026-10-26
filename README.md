@@ -275,10 +275,27 @@ bin/donutTrigger.py /path/to/exposure --detach --log-dir /var/log/aos
 ```
 
 Firing on the first corner sensor means the other seven may not have landed, so it polls until all 8
-`_R??_SW?.fits` have sidecars *and* have stopped growing — `--stable-checks` consecutive polls at an
-unchanged size, since a 9.5 MB FITS that exists is not necessarily one that is finished. Only then
-does it POST the *directory* to `/submit`, which resolves the headers, prepares against them, and
-reads the pixels itself. **Nothing is prepared while the shutter is open**: everything happens after
+`_R??_SW?.fits` have sidecars *and* have stopped growing — every size unchanged across
+`--settle-time` seconds, since a 9.5 MB FITS that exists is not necessarily one that is finished.
+Only then does it POST the *directory* to `/submit`, which resolves the headers, prepares against
+them, and reads the pixels itself.
+
+The two polling knobs are deliberately independent:
+
+- **`--poll-interval`** (default 0.25 s) is sampling granularity, and nearly free — a poll is one
+  glob plus up to 16 stats, measured at 0.6 ms median / 2.6 ms worst case on USDF. It bounds only
+  how late a finished exposure is *noticed*, and that lateness **is** charged to the reported time.
+- **`--settle-time`** (default 1.0 s) is the safety property: how long a stalled write may pause
+  without being mistaken for a finished file. It is enforced against the clock, so it holds at
+  whatever the interval is.
+
+Spelling the window as a poll *count* (the old `--stable-checks`) coupled the two, so lowering the
+interval for latency silently shortened the guard. The settle window is reported separately (`+1.0s
+waiting for sizes to settle`) and excluded from the times the trigger prints, because it watches a
+directory that already stopped changing — charging it to the exposure would make every number
+~`settle_time` pessimistic and hide a real regression that size.
+
+**Nothing is prepared while the shutter is open**: everything happens after
 readout, which costs the latency the two-phase protocol was built to avoid, but the camera hook is
 the only trigger available today.
 

@@ -9,8 +9,9 @@ directory.
 
 Firing on the first corner sensor means the other seven may not have landed yet,
 so the first thing this does is poll. Only once all 8 `_R??_SW?.fits` are present
-and have stopped growing does the /prepare -> /push -> /result cycle run. That
-means nothing is prepared while the shutter is open -- everything happens after
+and have stopped growing -- every size unchanged for `--settle-time` seconds --
+does the /prepare -> /push -> /result cycle run. That means nothing is prepared
+while the shutter is open -- everything happens after
 readout -- which costs latency the two-phase protocol was built to avoid, but
 the service still operates, and the camera hook is the only trigger available
 today.
@@ -166,35 +167,53 @@ def poll_once(directory: str) -> dict[str, int]:
 def wait_for_exposure(
     directory: str,
     timeout: float = 120.0,
-    interval: float = 1.0,
-    stable_checks: int = 2,
-) -> list[str]:
+    interval: float = 0.25,
+    settle_time: float = 1.0,
+) -> tuple[list[str], float]:
     """Block until all 8 corner sensors are present and have stopped growing.
 
     Completeness alone is not enough to start reading: the files are ~9.5 MB
     each and a FITS that exists is not necessarily a FITS that is finished, so
-    every size must repeat unchanged across `stable_checks` consecutive polls.
-    That is the cheap, portable version of this check -- there is no way to ask
-    whether another process still holds a descriptor -- and at a 1 s interval it
-    costs one extra second against a 30 s exposure cadence.
+    every size must be observed unchanged across `settle_time` seconds. That is
+    the cheap, portable version of this check -- there is no way to ask whether
+    another process still holds a descriptor.
+
+    `settle_time` is a duration, not a count of polls, and that split is the
+    point: `interval` is sampling granularity, which only costs CPU (a poll is
+    one glob plus up to 16 stats -- 0.6 ms median, 2.6 ms worst case on USDF),
+    while `settle_time` is the safety property -- how long a write may stall
+    without being mistaken for a finished file. Spelling the window as a poll
+    *count*, as this did before, coupled them: lowering the interval for latency
+    silently shortened the guard too. Now a finer interval costs nothing but
+    sharpens detection, and the window holds whatever the interval is.
 
     The sidecar's existence is a second, weaker signal, used in `poll_once`: we
     do not control the order the camera's script writes the two, so it cannot be
     relied on as a done-marker on its own.
 
-    Returns the sorted FITS paths. On timeout raises, naming the sensors seen
-    and the count still missing -- the message to read when a replay delivers
-    only six sensors, which is otherwise a very quiet failure.
+    Returns the sorted FITS paths and the monotonic time at which the files were
+    *already* complete at their final sizes -- the poll that first saw them, not
+    the poll this returns on. The settle polls observe a directory that stopped
+    changing `settle_time` ago, so charging them to the exposure would overstate
+    every latency this producer reports; `run_notifier` subtracts it.
+
+    On timeout raises, naming the sensors seen and the count still missing --
+    the message to read when a replay delivers only six sensors, which is
+    otherwise a very quiet failure.
     """
-    if stable_checks < 1:
-        raise ValueError("stable_checks must be >= 1")
+    if settle_time <= 0:
+        raise ValueError("settle_time must be > 0")
+    if interval <= 0:
+        raise ValueError("interval must be > 0")
 
     deadline = time.monotonic() + timeout
     previous: dict[str, int] | None = None
-    stable = 0
+    previous_at = time.monotonic()
+    complete_at: float | None = None
     reported = -1
 
     while True:
+        polled_at = time.monotonic()
         found = poll_once(directory)
 
         if len(found) != reported:
@@ -205,16 +224,29 @@ def wait_for_exposure(
             reported = len(found)
 
         if len(found) == EXPECTED_SENSORS and found == previous:
-            stable += 1
-            if stable >= stable_checks:
-                log(f"complete: {EXPECTED_SENSORS} sensors, sizes stable")
-                return sorted(glob.glob(os.path.join(directory, SW_GLOB)))
+            if complete_at is None:
+                # First match: `previous` already held every final size, so the
+                # exposure was done landing at *that* poll. Everything from here
+                # on is this check's own cost.
+                complete_at = previous_at
+            # Measured against the clock, not counted in polls, so a slow or
+            # descheduled poll cannot shorten the guard below `settle_time`.
+            if polled_at - complete_at >= settle_time:
+                log(
+                    f"complete: {EXPECTED_SENSORS} sensors, sizes unchanged for "
+                    f"{polled_at - complete_at:.2f}s"
+                )
+                return (
+                    sorted(glob.glob(os.path.join(directory, SW_GLOB))),
+                    complete_at,
+                )
         else:
-            # Any change at all restarts the count, including a file *shrinking*
-            # or a ninth appearing: the invariant wanted is "nothing moved for
-            # N polls", not "N polls since we first saw 8".
-            stable = 0
+            # Any change at all restarts the window, including a file
+            # *shrinking* or a ninth appearing: the invariant wanted is "nothing
+            # moved for settle_time", not "settle_time since we first saw 8".
+            complete_at = None
         previous = found
+        previous_at = polled_at
 
         if time.monotonic() >= deadline:
             missing = EXPECTED_SENSORS - len(found)
@@ -313,8 +345,8 @@ def run_notifier(
     host: str,
     token: str,
     timeout: float = 120.0,
-    interval: float = 1.0,
-    stable_checks: int = 2,
+    interval: float = 0.25,
+    settle_time: float = 1.0,
     config_overrides: list | None = None,
     num_workers: int | None = None,
     any_imgtype: bool = False,
@@ -351,7 +383,14 @@ def run_notifier(
     import urllib.request
 
     started = time.monotonic()
-    wait_for_exposure(directory, timeout, interval, stable_checks)
+    _, complete_at = wait_for_exposure(directory, timeout, interval, settle_time)
+    # The clock the reported times run on. The settle window cannot be skipped
+    # -- see `wait_for_exposure` -- but it runs entirely after the last byte
+    # landed, so leaving it in would make every number ~`settle_time`
+    # pessimistic and hide a real regression that size. Still reported
+    # alongside, because a producer that spends 40 s waiting for files is worth
+    # seeing even though none of it is the service's fault.
+    settling = time.monotonic() - complete_at
 
     payload = {"directory": directory}
     if config_overrides:
@@ -379,7 +418,11 @@ def run_notifier(
         method="POST",
     )
 
-    log(f"submitting {directory} to {host} after {time.monotonic() - started:.1f}s")
+    log(
+        f"submitting {directory} to {host} after "
+        f"{time.monotonic() - started - settling:.1f}s "
+        f"(+{settling:.1f}s waiting for sizes to settle)"
+    )
     try:
         # Generous: this one call covers the server's resolve, prepare and the
         # whole fit, so it is bounded by the job rather than by the network.
@@ -434,7 +477,10 @@ def run_notifier(
     ):
         for key, value in sorted((timings or {}).items()):
             log(f"    {label} {key}: {value}")
-    log(f"{state} in {time.monotonic() - started:.1f}s")
+    log(
+        f"{state} in {time.monotonic() - started - settling:.1f}s "
+        f"(excludes {settling:.1f}s waiting for sizes to settle)"
+    )
     return 0
 
 
@@ -458,15 +504,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=1.0,
-        help="seconds between directory polls (default: 1.0)",
+        default=0.25,
+        help="seconds between directory polls -- sampling granularity only, and "
+        "nearly free (a poll is ~0.6 ms). Bounds how late a finished exposure "
+        "is noticed; does not affect --settle-time (default: 0.25)",
     )
     parser.add_argument(
-        "--stable-checks",
-        type=int,
-        default=2,
-        help="consecutive polls a file's size must be unchanged before it counts "
-        "as finished being written (default: 2)",
+        "--settle-time",
+        type=float,
+        default=1.0,
+        help="seconds a file's size must hold unchanged before it counts as "
+        "finished being written. This is the safety knob: it is how long a "
+        "stalled write may pause without being mistaken for a complete file, "
+        "and it is held regardless of --poll-interval (default: 1.0)",
     )
     parser.add_argument(
         "-n",
@@ -536,8 +586,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--timeout must be > 0")
     if args.poll_interval <= 0:
         parser.error("--poll-interval must be > 0")
-    if args.stable_checks < 1:
-        parser.error("--stable-checks must be >= 1")
+    if args.settle_time <= 0:
+        parser.error("--settle-time must be > 0")
     if args.num_workers is not None and args.num_workers < 1:
         parser.error("-n/--num-workers must be >= 1")
     if not os.path.isdir(args.directory):
@@ -576,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
             args.token,
             timeout=args.timeout,
             interval=args.poll_interval,
-            stable_checks=args.stable_checks,
+            settle_time=args.settle_time,
             config_overrides=args.config_overrides,
             num_workers=args.num_workers,
             any_imgtype=args.any_imgtype,
