@@ -36,3 +36,6 @@ __pycache__/
 .pytest_cache/
 .claude/settings.local.json
 .DS_Store
+
+# Local env setup script
+setup.sh
