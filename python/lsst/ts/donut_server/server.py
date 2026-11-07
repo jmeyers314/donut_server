@@ -48,12 +48,9 @@ MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 # payload that MAX_PUSH_BYTES caps.
 SHM_SIZE = MAX_PUSH_BYTES + 1024 * 1024
 
-# Both defined in tmpfs.py, which the producer side also needs them from and
-# which imports no FastAPI. Re-exported under their original names because
-# `check_shm_capacity` below and tests/test_coord_lifecycle.py both reach for
-# `server.shm_free_bytes`.
+# Spelled without the module prefix only because it appears three times inside
+# the f-strings of one error message, where `tmpfs.SHM_MOUNT` reads worse.
 SHM_MOUNT = tmpfs.SHM_MOUNT
-shm_free_bytes = tmpfs.shm_free_bytes
 
 # Caps on a prepare's -c/-C override list. Bounded rather than trusted because an
 # accepted list is retained in _primed_args, replayed verbatim on every coordinator
@@ -1027,29 +1024,19 @@ def rss_bytes(pid: Optional[int]) -> Optional[int]:
 def check_shm_capacity(n_flights: int, shm_size: int = SHM_SIZE) -> None:
     """Fail startup if the shared blocks cannot be backed by real pages.
 
-    The failure this prevents is otherwise undiagnosable. `SharedMemory(create=
-    True)` only does shm_open + ftruncate, which on tmpfs reserves nothing and
-    succeeds however small the mount is; the mmap succeeds too. The shortfall is
-    discovered only when /push *writes* a page tmpfs cannot allocate, and the
-    kernel's sole recourse at that point is SIGBUS -- which kills the front-end
-    mid-request, so the producer sees a closed socket with no status and the
-    server leaves nothing behind but "Bus error (core dumped)".
+    `tmpfs.shortfall` explains what this prevents and why it has to be asked
+    before the block exists; on this side the SIGBUS lands mid-request, so the
+    producer sees a closed socket with no status and the server leaves nothing
+    behind but "Bus error (core dumped)".
 
-    Checked across the whole pool rather than per flight for the same reason the
-    runtime failure is late: a sparse block does not reduce f_bavail, so flight 0
-    reserving 513 MB leaves flight 1 measuring the same free space and finding it
-    ample. Only the sum is a real requirement.
-
-    A floor, not a reservation: nothing stops another process on the host taking
-    the space between here and the first push. It catches the standing
-    misconfiguration -- a 64 MB container default against a 513 MB block -- which
-    is the case that can never work rather than the one that got unlucky.
+    Checked across the whole pool rather than per flight: a sparse block does
+    not reduce f_bavail, so flight 0 reserving 513 MB leaves flight 1 measuring
+    the same free space and finding it ample. Only the sum is a real
+    requirement.
     """
-    free = shm_free_bytes()
-    if free is None:
-        return
     needed = n_flights * shm_size
-    if free >= needed:
+    free = tmpfs.shortfall(needed)
+    if free is None:
         return
     mb = 1024 * 1024
     raise ShmTooSmall(

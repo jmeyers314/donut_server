@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 import fake_coordinator
 from lsst.ts.donut_server import protocol
 from lsst.ts.donut_server import server
+from lsst.ts.donut_server import tmpfs
 from lsst.ts.donut_server.server import (
     Coord,
     CoordinatorLost,
@@ -997,7 +998,7 @@ def test_shm_capacity_is_checked_against_the_whole_pool(monkeypatch):
     sparse and does not reduce f_bavail, so a per-flight check would pass N times
     over the same free space and still SIGBUS on the first push.
     """
-    monkeypatch.setattr(server, "shm_free_bytes", lambda *a, **k: 64 * 1024 * 1024)
+    monkeypatch.setattr(tmpfs, "shm_free_bytes", lambda *a, **k: 64 * 1024 * 1024)
 
     with pytest.raises(server.ShmTooSmall) as excinfo:
         server.check_shm_capacity(2, 513 * 1024 * 1024)
@@ -1007,17 +1008,21 @@ def test_shm_capacity_is_checked_against_the_whole_pool(monkeypatch):
 
     # Ample for one flight, short for three: the shortfall is a property of the
     # pool size, so the same mount must decide differently.
-    monkeypatch.setattr(server, "shm_free_bytes", lambda *a, **k: 600 * 1024 * 1024)
+    monkeypatch.setattr(tmpfs, "shm_free_bytes", lambda *a, **k: 600 * 1024 * 1024)
     server.check_shm_capacity(1, 513 * 1024 * 1024)
     with pytest.raises(server.ShmTooSmall):
         server.check_shm_capacity(3, 513 * 1024 * 1024)
 
 
-def test_shm_capacity_check_is_skipped_when_there_is_no_mount_to_measure():
+def test_shm_capacity_check_is_skipped_when_there_is_no_mount_to_measure(monkeypatch):
     """macOS has no /dev/shm and kernel-backed POSIX shm with no mount to
     statvfs. Unmeasurable must mean "proceed", not "refuse": the alternative
-    would make the server unstartable on a supported dev platform."""
-    assert server.shm_free_bytes("/nonexistent/for/this/test") is None
+    would make the server unstartable on a supported dev platform.
+
+    That `shm_free_bytes` itself answers None for such a mount is
+    tests/test_tmpfs.py's; what matters here is that startup survives it."""
+    monkeypatch.setattr(tmpfs, "shm_free_bytes", lambda *a, **k: None)
+    server.check_shm_capacity(8, 513 * 1024 * 1024)
 
 
 def test_a_pool_whose_blocks_do_not_fit_refuses_to_start(monkeypatch):
@@ -1027,7 +1032,7 @@ def test_a_pool_whose_blocks_do_not_fit_refuses_to_start(monkeypatch):
     it -- and it must raise *before* any child is spawned, since the whole point
     is to replace a SIGBUS that happens much later.
     """
-    monkeypatch.setattr(server, "shm_free_bytes", lambda *a, **k: 1024)
+    monkeypatch.setattr(tmpfs, "shm_free_bytes", lambda *a, **k: 1024)
     pool = server.FlightPool(
         2,
         target=fake_coordinator.main,

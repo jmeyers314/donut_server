@@ -41,12 +41,14 @@ def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
     return st.f_bavail * st.f_frsize
 
 
-def require_free(
-    needed: int, what: str, error: type[Exception], mount: str = SHM_MOUNT
-) -> None:
-    """Raise `error` unless `mount` can back `needed` bytes.
+def shortfall(needed: int, mount: str = SHM_MOUNT) -> int | None:
+    """Free bytes on `mount` when it cannot back `needed`, else None.
 
-    Call this *before* creating the block, never after: nobody can rely on the
+    None means "go ahead" for both of the reasons it can arise -- room enough,
+    or a capacity that cannot be measured at all -- because neither is grounds
+    to refuse. Only a measured shortfall is.
+
+    Ask this *before* creating the block, never after: nobody can rely on the
     creation failing. `SharedMemory(create=True)` is only shm_open plus
     ftruncate, which reserves nothing on tmpfs and succeeds however small the
     mount is, and the mmap succeeds too. The shortfall surfaces only when a
@@ -57,14 +59,26 @@ def require_free(
     between here and the write. It catches the standing misconfiguration -- a
     64 MB container default against a 513 MB block -- rather than the race.
 
-    Unmeasurable capacity means proceed, not refuse; see `shm_free_bytes`.
+    Returns the free bytes rather than a bool so each caller can say how short
+    it is in its own words; `require_free` is the short way to do that.
+    """
+    free = shm_free_bytes(mount)
+    if free is None or free >= needed:
+        return None
+    return free
+
+
+def require_free(
+    needed: int, what: str, error: type[Exception], mount: str = SHM_MOUNT
+) -> None:
+    """Raise `error` unless `mount` can back `needed` bytes. See `shortfall`.
 
     `error` is the caller's own exception type because the callers differ in
     what a shortfall means: the producers fall back to encoding serially, while
     the front-end has nothing to fall back to and refuses to start.
     """
-    free = shm_free_bytes(mount)
-    if free is None or free >= needed:
+    free = shortfall(needed, mount)
+    if free is None:
         return
     mb = 1024 * 1024
     raise error(
