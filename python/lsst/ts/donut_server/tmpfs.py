@@ -30,12 +30,6 @@ def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
     kernel-backed) and a statvfs that fails for any reason: in neither case do we
     know the capacity, and a guess would either refuse a working server or
     promise capacity that is not there.
-
-    Every caller is about to create a shared block, and none of them can rely on
-    the creation failing: `SharedMemory(create=True)` is only shm_open plus
-    ftruncate, which reserves nothing on tmpfs and succeeds however small the
-    mount is. The shortfall surfaces when a write touches a page tmpfs cannot
-    back, and the kernel's only recourse there is SIGBUS.
     """
     try:
         st = os.statvfs(mount)
@@ -45,3 +39,34 @@ def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
     # as an ordinary user cannot have. For tmpfs they are equal, but this is also
     # the correct read if SHM_MOUNT is ever something else.
     return st.f_bavail * st.f_frsize
+
+
+def require_free(
+    needed: int, what: str, error: type[Exception], mount: str = SHM_MOUNT
+) -> None:
+    """Raise `error` unless `mount` can back `needed` bytes.
+
+    Call this *before* creating the block, never after: nobody can rely on the
+    creation failing. `SharedMemory(create=True)` is only shm_open plus
+    ftruncate, which reserves nothing on tmpfs and succeeds however small the
+    mount is, and the mmap succeeds too. The shortfall surfaces only when a
+    write touches a page tmpfs cannot back, where the kernel's sole recourse is
+    SIGBUS -- so the process dies mid-job leaving nothing but "Bus error".
+
+    A floor, not a reservation: nothing stops another process taking the space
+    between here and the write. It catches the standing misconfiguration -- a
+    64 MB container default against a 513 MB block -- rather than the race.
+
+    Unmeasurable capacity means proceed, not refuse; see `shm_free_bytes`.
+
+    `error` is the caller's own exception type because the callers differ in
+    what a shortfall means: the producers fall back to encoding serially, while
+    the front-end has nothing to fall back to and refuses to start.
+    """
+    free = shm_free_bytes(mount)
+    if free is None or free >= needed:
+        return
+    mb = 1024 * 1024
+    raise error(
+        f"{mount} has {free / mb:.0f} MB free but {what} needs {needed / mb:.0f} MB"
+    )
