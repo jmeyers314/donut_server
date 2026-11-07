@@ -88,6 +88,7 @@ from typing import Any
 from lsst.ts.donut_server import client
 from lsst.ts.donut_server import exposure_codec
 from lsst.ts.donut_server import protocol
+from lsst.ts.donut_server import tmpfs
 
 # The eight corner wavefront sensors, as DAQ filenames spell them. SW0 is
 # extra-focal, SW1 intra-focal.
@@ -710,10 +711,10 @@ def build_parts_parallel(source, n_workers: int | None = None):
     # touches a page tmpfs cannot allocate, and the kernel's only recourse is
     # SIGBUS -- the process dies mid-push with nothing but "Bus error". Same
     # trap, same reasoning, as the server's own capacity check.
-    free = protocol.shm_free_bytes()
+    free = tmpfs.shm_free_bytes()
     if free is not None and free < block_size:
         raise ParallelEncodeUnavailable(
-            f"{protocol.SHM_MOUNT} has {free / 1024 / 1024:.0f} MB free but this "
+            f"{tmpfs.SHM_MOUNT} has {free / 1024 / 1024:.0f} MB free but this "
             f"exposure needs {block_size / 1024 / 1024:.0f} MB"
         )
 
@@ -954,10 +955,10 @@ def ingested_exposures(source, n_workers: int | None = None):
     # Before the block is written, for the reason the push path checks too: an
     # undersized /dev/shm lets shm_open and ftruncate both succeed and then
     # kills the process with SIGBUS on the first write it cannot back.
-    free = protocol.shm_free_bytes()
+    free = tmpfs.shm_free_bytes()
     if free is not None and free < block_size:
         raise ParallelEncodeUnavailable(
-            f"{protocol.SHM_MOUNT} has {free / 1024 / 1024:.0f} MB free but this "
+            f"{tmpfs.SHM_MOUNT} has {free / 1024 / 1024:.0f} MB free but this "
             f"exposure needs {block_size / 1024 / 1024:.0f} MB"
         )
 

@@ -321,10 +321,10 @@ def test_an_unwritable_block_falls_back_to_serial(paired, monkeypatch):
 def test_a_small_shm_mount_falls_back_rather_than_risking_sigbus(paired, monkeypatch):
     """An undersized /dev/shm kills the process with SIGBUS on *write*, so the
     shortfall has to be caught before the block is written."""
-    from lsst.ts.donut_server import protocol
+    from lsst.ts.donut_server import tmpfs
 
     source, _ = paired
-    monkeypatch.setattr(protocol, "shm_free_bytes", lambda *a, **k: 1024)
+    monkeypatch.setattr(tmpfs, "shm_free_bytes", lambda *a, **k: 1024)
 
     with pytest.raises(daq.ParallelEncodeUnavailable, match="free"):
         daq.build_parts_parallel(source)

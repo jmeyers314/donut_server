@@ -20,34 +20,12 @@ them into `{sensor: (img, meta)}`.
 """
 from __future__ import annotations
 
-import os
 import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 MAGIC = b"DWFS"
 VERSION = 2
-
-# Image types that are never worth a wavefront fit. Calibration frames have no
-# stars, so they would burn a full flight to arrive at an empty donut catalog.
-SKIP_IMGTYPES = frozenset({"DARK", "BIAS", "FLAT"})
-
-# Types a wavefront fit is meaningful for. Anything else is processed but
-# flagged, the same way run_sequence.py flags it.
-EXPECTED_IMGTYPES = frozenset({"CWFS", "ACQ", "SCIENCE", "OBJECT"})
-
-# Both here, with the wire format, for the same reason `shm_free_bytes` is: the
-# front end decides whether to skip a frame, and it imports no part of the LSST
-# stack -- so the sets cannot live beside the header reading that produces the
-# image type they are compared against.
-
-# Where a tmpfs-backed shm_open puts its blocks, when there is one. Checked for
-# existence rather than assumed: this is the Linux layout, and on macOS --
-# a supported dev platform -- POSIX shared memory is kernel-backed with no
-# mount to interrogate at all, so the capacity check is skipped there.
-# The path is not configurable: CPython prefixes the block name with "/" and
-# hands it to shm_open, which resolves it under this mount wherever it exists.
-SHM_MOUNT = "/dev/shm"
 
 IMG_SUFFIX = ":img"
 META_SUFFIX = ":meta"
@@ -59,28 +37,6 @@ HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 # name_len(B), offset(Q), byte_count(Q) -- part name bytes follow, variable length
 _DESC_FIXED_FMT = ">BQQ"
 _DESC_FIXED_SIZE = struct.calcsize(_DESC_FIXED_FMT)
-
-
-def shm_free_bytes(mount: str = SHM_MOUNT) -> int | None:
-    """Bytes available on `mount`, or None if there is nothing to measure.
-
-    None covers both "no such mount" (macOS, where POSIX shared memory is
-    kernel-backed) and a statvfs that fails for any reason: in neither case do we
-    know the capacity, and a guess would either refuse a working server or
-    promise capacity that is not there.
-
-    Lives here rather than in `server.py` -- where it started and where
-    `check_shm_capacity` still calls it -- because the producer side needs the
-    same check before it writes a block, and `server.py` imports FastAPI.
-    """
-    try:
-        st = os.statvfs(mount)
-    except OSError:
-        return None
-    # f_bavail, not f_bfree: the latter counts root-only reserve a server running
-    # as an ordinary user cannot have. For tmpfs they are equal, but this is also
-    # the correct read if SHM_MOUNT is ever something else.
-    return st.f_bavail * st.f_frsize
 
 
 class ProtocolError(ValueError):

@@ -36,9 +36,11 @@ from typing import Any, Callable, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
+from lsst.ts.donut_server import imgtypes
 from lsst.ts.donut_server import logtail
 from lsst.ts.donut_server import protocol
 from lsst.ts.donut_server import table_view
+from lsst.ts.donut_server import tmpfs
 
 MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 
@@ -46,12 +48,12 @@ MAX_PUSH_BYTES = 512 * 1024 * 1024  # early size-cap rejection
 # payload that MAX_PUSH_BYTES caps.
 SHM_SIZE = MAX_PUSH_BYTES + 1024 * 1024
 
-# Both defined in protocol.py, which the producer side also needs them from and
+# Both defined in tmpfs.py, which the producer side also needs them from and
 # which imports no FastAPI. Re-exported under their original names because
 # `check_shm_capacity` below and tests/test_coord_lifecycle.py both reach for
 # `server.shm_free_bytes`.
-SHM_MOUNT = protocol.SHM_MOUNT
-shm_free_bytes = protocol.shm_free_bytes
+SHM_MOUNT = tmpfs.SHM_MOUNT
+shm_free_bytes = tmpfs.shm_free_bytes
 
 # Caps on a prepare's -c/-C override list. Bounded rather than trusted because an
 # accepted list is retained in _primed_args, replayed verbatim on every coordinator
@@ -1918,7 +1920,7 @@ async def submit(body: dict, num_workers: int | None = None):
     # (it prints only fatals, to the stderr whoever started it is watching), and
     # the caller is the one who needs to know why its exposure did not run.
     imgtype = str(found.get("imgtype", "")).upper()
-    if not any_imgtype and imgtype in protocol.SKIP_IMGTYPES:
+    if not any_imgtype and imgtype in imgtypes.SKIP_IMGTYPES:
         return {
             "state": "SKIPPED",
             "reason": f"IMGTYPE {imgtype} has no stars to fit "
@@ -1927,9 +1929,9 @@ async def submit(body: dict, num_workers: int | None = None):
         }
     note = (
         None
-        if imgtype in protocol.EXPECTED_IMGTYPES
+        if imgtype in imgtypes.EXPECTED_IMGTYPES
         else f"IMGTYPE {imgtype} is not one of "
-        f"{sorted(protocol.EXPECTED_IMGTYPES)}, so treat its Zernikes with suspicion"
+        f"{sorted(imgtypes.EXPECTED_IMGTYPES)}, so treat its Zernikes with suspicion"
     )
 
     # Keyed on the visit, not the directory: under replay the directory name is

@@ -71,7 +71,7 @@ import subprocess
 import sys
 import time
 
-from lsst.ts.donut_server import protocol
+from lsst.ts.donut_server import imgtypes
 
 # `client` is imported lazily, by each function that needs it, and never at
 # module scope. It reaches `lsst.afw.image` through `exposure_codec`, and the
@@ -547,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--any-imgtype",
         action="store_true",
-        help=f"process even {'/'.join(sorted(protocol.SKIP_IMGTYPES))} frames, which are "
+        help=f"process even {'/'.join(sorted(imgtypes.SKIP_IMGTYPES))} frames, which are "
         "skipped by default as having no stars to fit",
     )
     parser.add_argument(
