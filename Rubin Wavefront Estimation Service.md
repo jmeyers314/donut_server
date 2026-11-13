@@ -145,15 +145,18 @@ that can never finish.
 (n, 27) and `zk_intrinsic_*` (n, 67), in microns — are ~212 KB as parquet. `coordinator.IMAGE_COLUMNS`
 names the dropped three and is guarded by a test, since an upstream rename would silently re-admit 28 MB.
 
-## Wire format (push blob), version 2
+## Wire format (push blob), version 1
 
-Single binary POST body (`application/octet-stream`), **not** base64, **not** JSON: fixed header (magic
-`DWFS`, version, part count, payload length), per-part descriptors (name, offset, count), then concatenated
-part bytes — a generic `{part_name: bytes}` map. **Each sensor contributes two parts**,
-`<detector_name>:img` and `<detector_name>:meta`, flat rather than nested so each 37 MB image lands as its
-own slice needing no second split copy. Parts are keyed by *detector name* (e.g. `R00_SW0`), read off the
-exposure, so the coordinator indexes `_CALIB_STORE`'s `*_by_name` dicts with no id->name table. `VERSION`
-is 2; a v1 peer would silently misread v2 part names.
+Single binary POST body (`application/octet-stream`), **not** base64, **not** JSON: fixed 28-byte header
+(magic `Bare Metal Blitz`, version, part count, payload length), per-part descriptors (name, offset relative
+to the part-data section, count), then concatenated part bytes — a generic `{part_name: bytes}` map.
+**Each sensor contributes two parts**, `<detector_name>:img` and `<detector_name>:meta`, flat rather than
+nested so each 37 MB image lands as its own slice needing no second split copy. Parts are keyed by
+*detector name* (e.g. `R00_SW0`), read off the exposure, so the coordinator indexes `_CALIB_STORE`'s
+`*_by_name` dicts with no id->name table. `VERSION` is 1: the format is still developmental and nothing
+has been deployed, so there is no older blob anywhere to stay compatible with. Sixteen bytes of magic
+rather than four because a bare socket gets a lot of things pointed at it, and a stray body should be
+rejected on the magic check rather than misparsed.
 
 Each pair is produced by `exposure_codec`, which ships the float32 image verbatim plus a small pickle of
 everything else — see its module docstring for why the metadata carrier is a 1x1 subimage. Encode
