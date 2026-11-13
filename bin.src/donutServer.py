@@ -17,11 +17,15 @@ import argparse
 import os
 import secrets
 
+# Stdlib-only, so it does not breach this process's rule about keeping the stack
+# out: see the note on uvicorn.run below.
+from lsst.ts.donut_server import endpoint
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=endpoint.DEFAULT_PORT)
     # Both default to None and are written into the environment below, because that
     # is the only transport that reaches where they are read: uvicorn.run() imports
     # the app by string in this process, and the coordinator children inherit the

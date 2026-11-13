@@ -179,7 +179,7 @@ async function api(path) {
   const r = await fetch(path, {cache: "no-store"});
   if (r.status === 401 || r.status === 403) {
     banner(r.status + " — the server serves this page to localhost only. Open it on " +
-           "the server host, or forward the port with ssh -L 8000:localhost:8000.");
+           "the server host, or forward the port with ssh -L 28861:localhost:28861.");
     return null;
   }
   if (!r.ok) {

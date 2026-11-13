@@ -527,7 +527,7 @@ bin/donutServer.py                              # then, in another shell:
 bin/donutClient.py --visit 2026071300478 --wait 60
 bin/donutClient.py --visit 2026071300478 --wait 60 --images   # also saves the stamps
 bin/donutClient.py --visit 2026071300478 --wait 60 -c maxFitScatter=2.0
-curl -si localhost:8000/config | head -20       # 200, X-Donut-Stale: 0
+curl -si localhost:28861/config | head -20      # 200, X-Donut-Stale: 0
 ```
 
 ### Rehearsing a replay
@@ -576,9 +576,9 @@ see [Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service 
 difference. The substituted one is identifiable by `physical_filter: r_57` in the quantum and 8 of 8
 groups fit; the unsubstituted one reports `z_20` and fits 6 of 6 of a different, meaningless grouping.
 
-The dashboard is at <http://127.0.0.1:8000/dashboard> and needs no credential: the server exempts
+The dashboard is at <http://127.0.0.1:28861/dashboard> and needs no credential: the server exempts
 loopback callers and serves the page to nobody else, so reaching it from another machine means an
-`ssh -L 8000:localhost:8000` tunnel. `DONUT_SERVER_TOKEN` is still what protects `/prepare` and
+`ssh -L 28861:localhost:28861` tunnel. `DONUT_SERVER_TOKEN` is still what protects `/prepare` and
 `/push` from the network, so a producer on a *different* host does need `--token`.
 
 It lays the flights out side by side, with one job state machine per flight, since with

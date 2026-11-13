@@ -22,6 +22,7 @@ from typing import Any
 
 import requests
 
+from lsst.ts.donut_server import endpoint
 from lsst.ts.donut_server import exposure_codec
 from lsst.ts.donut_server import protocol
 
@@ -597,7 +598,7 @@ def report_transient_or_raise(exc: requests.HTTPError) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mock producer for the WF estimation service")
-    parser.add_argument("--host", default="http://127.0.0.1:8000")
+    parser.add_argument("--host", default=endpoint.DEFAULT_HOST)
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
     # Defaults to None, not raw_dir(): resolving here would demand
     # DONUT_SERVER_RAW_DIR even from a --butler run that never reads files.

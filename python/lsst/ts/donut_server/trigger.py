@@ -71,7 +71,7 @@ import subprocess
 import sys
 import time
 
-from lsst.ts.donut_server import imgtypes
+from lsst.ts.donut_server import endpoint, imgtypes
 
 # `client` is imported lazily, by each function that needs it, and never at
 # module scope. It reaches `lsst.afw.image` through `exposure_codec`, and the
@@ -493,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="the exposure's directory, holding one _R??_SW?.fits plus sidecar "
         "per corner sensor. Polled until all 8 arrive.",
     )
-    parser.add_argument("--host", default="http://127.0.0.1:8000")
+    parser.add_argument("--host", default=endpoint.DEFAULT_HOST)
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
     parser.add_argument(
         "--timeout",

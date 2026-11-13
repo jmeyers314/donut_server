@@ -44,6 +44,7 @@ import requests
 
 from lsst.ts.donut_server import client
 from lsst.ts.donut_server import daq
+from lsst.ts.donut_server import endpoint
 
 
 
@@ -89,7 +90,7 @@ def main() -> None:
         "period, so processing time is subtracted: --delay 39 submits every "
         "39 s regardless of how long each push takes. Use 0 for back-to-back.",
     )
-    parser.add_argument("--host", default="http://127.0.0.1:8000")
+    parser.add_argument("--host", default=endpoint.DEFAULT_HOST)
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
     parser.add_argument(
         "--wait", type=float, default=60.0, help="seconds to long-poll /result"
