@@ -14,12 +14,22 @@ The emulator leaves a breadcrumb naming what it replayed:
 
 so the lookup is a path join under `DONUT_SERVER_REPLAY_DIR`. It is read from
 all 8 sensors and cross-checked rather than trusted from one, because a
-directory holding two different replays is otherwise completely silent. The
-keyword is absent entirely on real camera files, so with the variable set an
-absent `EMUIMAGE` is a hard error -- that is what it looks like to point the
-replay path at real data. `DONUT_SERVER_REPLAY_OBSID` pins one exposure and
-skips the lookup, for hand testing and for a replay whose marker is missing or
-names something not in the tree.
+directory holding two different replays is otherwise completely silent.
+
+**The marker is the switch, not the variable.** The keyword is absent entirely
+on real camera files, so its presence is a reliable statement that these pixels
+are a replay, and that is what substitution is gated on:
+
+- marker present, `DONUT_SERVER_REPLAY_DIR` set -- substitute;
+- marker present, variable unset -- hard error. These are replayed pixels and
+  there is nowhere to read the original's headers from, so the only
+  alternative is to submit them under BTS's pointing, which is the silent
+  wrong answer above;
+- marker absent -- no substitution, and the variable does not matter.
+
+That last case is what lets the variable be part of a standing test-stand
+setup: production is the marker-absent path whether or not some tree is
+configured, so the two deployments need not differ in anything but their data.
 
 This module exists because *both* sides need it. It began in `trigger.py`,
 where the producer resolved the exposure before pushing pixels; the
@@ -48,15 +58,14 @@ from lsst.ts.donut_server import daq
 TRIGGER_SENSOR = "R00_SW0"
 
 # The emulator's record of which original exposure it replayed. Absent on real
-# camera files, which is what makes it safe to require when replay is enabled.
+# camera files, which is what makes its presence the switch for substitution.
 EMUIMAGE_CARD = "EMUIMAGE"
 
 REPLAY_DIR_VAR = "DONUT_SERVER_REPLAY_DIR"
-REPLAY_OBSID_VAR = "DONUT_SERVER_REPLAY_OBSID"
 
 
-def read_emuimage(headers: dict) -> str:
-    """The original exposure's OBSID, from the live headers' `EMUIMAGE` cards.
+def read_emuimage(headers: dict) -> str | None:
+    """The replayed exposure's OBSID, or `None` if these are not replays.
 
     Read from all 8 sensors and cross-checked rather than trusted from one. A
     directory holding files from two different replays is otherwise completely
@@ -64,13 +73,28 @@ def read_emuimage(headers: dict) -> str:
     pass, and the answer would be a fit of one exposure's donuts against
     another's calibs.
 
-    Absent is a hard error, not a fall back to the live metadata. With
-    `DONUT_SERVER_REPLAY_DIR` set the caller has asserted these are replays, and
-    the keyword is absent only on *real camera* files -- so this firing means the
-    replay path is pointed at real data, and continuing would submit it with
-    whatever pointing happened to be in the headers. A blank value counts as
-    absent, being the plausible shape of a keyword the emulator declared but
-    never filled.
+    Absent on *every* sensor is the real-camera answer -- the keyword is
+    written only by the emulator -- and returns `None`, which is what gates
+    substitution off. Absent on only some is a hard error: one directory
+    cannot be both, so it is either a mix of replayed and real files or a
+    replay whose marker was not written everywhere, and neither can be
+    resolved by guessing. A blank value counts as absent, being the plausible
+    shape of a keyword the emulator declared but never filled.
+
+    Parameters
+    ----------
+    headers : dict
+        {detector name: primary header}, as `read_live_headers` returns it.
+
+    Returns
+    -------
+    str or None
+        The OBSID named by `EMUIMAGE`, or `None` if no sensor carries one.
+
+    Raises
+    ------
+    RuntimeError
+        If only some sensors carry a marker, or if they disagree.
     """
     missing = []
     values: dict[str, list[str]] = {}
@@ -85,13 +109,17 @@ def read_emuimage(headers: dict) -> str:
         else:
             values.setdefault(value, []).append(name)
 
+    if not values:
+        # Real camera data: no marker anywhere, so nothing to substitute.
+        return None
     if missing:
+        carried = sorted(det for dets in values.values() for det in dets)
         raise RuntimeError(
-            f"{EMUIMAGE_CARD} is absent or blank on detector(s) "
-            f"{missing}, so the exposure being replayed cannot be identified. "
-            f"{EMUIMAGE_CARD} is written by the emulator and absent on real "
-            f"camera data -- if this is real data, unset {REPLAY_DIR_VAR}; if "
-            f"it is a replay, set {REPLAY_OBSID_VAR} to pin the exposure."
+            f"{EMUIMAGE_CARD} is absent or blank on detector(s) {missing} but "
+            f"present on {carried}, so the exposure being replayed cannot be "
+            f"identified. One directory cannot be both a replay and real "
+            f"camera data: either its files come from two different sources, "
+            f"or the emulator did not write the marker on every sensor."
         )
     if len(values) != 1:
         detail = "; ".join(
@@ -119,7 +147,7 @@ def replay_headers(replay_dir: str, exposure: str) -> dict:
             f"the replay names exposure {exposure!r} but {directory!r} is not a "
             f"directory, so its original metadata cannot be read. Either "
             f"{REPLAY_DIR_VAR} points at the wrong tree, or that exposure is "
-            f"not in it; {REPLAY_OBSID_VAR} overrides the name."
+            f"not in it."
         )
 
     headers = {}
@@ -198,39 +226,64 @@ def substitution_report(live, substituted) -> list[str]:
 
 
 def substituted_headers(directory: str, report=None) -> dict[str, Any] | None:
-    """The substitute header map for `directory`, or None if replay is off.
+    """Substitute headers for `directory`, or None if it is not a replay.
 
-    `None` means "no substitution" and is the real-camera path: with
-    `DONUT_SERVER_REPLAY_DIR` unset the headers on disk are the truth, and
+    `None` means "no substitution" and is the real-camera path: these files
+    carry no `EMUIMAGE`, so the headers on disk are the truth and
     `daq.resolve_exposure_dir` wants `headers=None`.
 
     `report` is called with the lines from `substitution_report`, so the caller
     decides where they land. Omitted means they are not emitted at all, which
     only a caller that has already reported them should do.
+
+    Parameters
+    ----------
+    directory : str
+        The exposure directory, holding one DAQ file per corner sensor.
+    report : callable, optional
+        Called once per line of human-readable report.
+
+    Returns
+    -------
+    dict or None
+        {detector name: primary header} to substitute, or `None` for real
+        camera data.
+
+    Raises
+    ------
+    RuntimeError
+        If these are replays but `DONUT_SERVER_REPLAY_DIR` is unset or does
+        not name a directory.
+
+    Notes
+    -----
+    The live headers are read before the variable is consulted, because the
+    marker decides and the variable only says where to look. Production
+    therefore pays this read on every exposure to learn that it is not a
+    replay. `daq.resolve_exposure_dir` re-reads the same primary headers
+    immediately afterwards, so the fix is to share the map rather than to skip
+    the read.
     """
-    replay_dir = os.environ.get(REPLAY_DIR_VAR)
-    if not replay_dir:
+    live = read_live_headers(daq.sw_paths(directory))
+    exposure = read_emuimage(live)
+    if exposure is None:
         return None
 
+    replay_dir = os.environ.get(REPLAY_DIR_VAR)
+    if not replay_dir:
+        raise RuntimeError(
+            f"{EMUIMAGE_CARD} names original exposure {exposure}, so these are "
+            f"replayed pixels, but {REPLAY_DIR_VAR} is unset so the original's "
+            f"headers cannot be read. Running anyway would fit these donuts "
+            f"under whatever pointing, filter and epoch BTS wrote, which no "
+            f"downstream check can detect."
+        )
     if not os.path.isdir(replay_dir):
         raise RuntimeError(
             f"{REPLAY_DIR_VAR} is {replay_dir!r}, which is not a directory"
         )
-
-    live = read_live_headers(daq.sw_paths(directory))
-
-    pinned = os.environ.get(REPLAY_OBSID_VAR)
-    if pinned:
-        if report is not None:
-            report(
-                f"replay: {REPLAY_OBSID_VAR}={pinned} pins the exposure, "
-                f"ignoring {EMUIMAGE_CARD}"
-            )
-        exposure = pinned
-    else:
-        exposure = read_emuimage(live)
-        if report is not None:
-            report(f"replay: {EMUIMAGE_CARD} names original exposure {exposure}")
+    if report is not None:
+        report(f"replay: {EMUIMAGE_CARD} names original exposure {exposure}")
 
     headers = replay_headers(replay_dir, exposure)
     if report is not None:

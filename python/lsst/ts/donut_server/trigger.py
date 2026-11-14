@@ -39,20 +39,20 @@ check compares the shards against a WCS built from the same bad boresight, so
 they matched exactly. Donuts from one field were fit against another field's
 Gaia sources and the fit converged. Nothing anywhere flags it.
 
-Setting `DONUT_SERVER_REPLAY_DIR` switches on substitution: the original
-exposure is located in that tree and *its* primary headers are used in place of
-what BTS wrote. Unset, headers come from the files in the polled directory,
-which is what the real camera needs.
+The emulator's `EMUIMAGE` marker is the switch: where it is present the
+original exposure is located in `DONUT_SERVER_REPLAY_DIR` and *its* primary
+headers are used in place of what BTS wrote, and where it is absent -- which is
+every real camera file -- the headers in the polled directory are the truth.
+Replayed pixels with no tree configured are a hard error rather than a
+submission under BTS's own pointing.
 
-The variable rather than the mere presence of a replay marker is the switch,
-deliberately: running a replay *without* substitution has probative value --
-forcing every WCS to describe the wrong sky is a real test -- so that has to
-stay expressible.
+Gating on the marker rather than on the variable is what lets the variable be
+part of a standing test-stand setup and simply be absent in production: neither
+deployment has to be told which kind of data it is about to see.
 
-How the original is located -- the `EMUIMAGE` marker, the 8-sensor
-cross-check, and `DONUT_SERVER_REPLAY_OBSID` as the override -- lives in
-`replay`, because the coordinator's `/ingest` path has to do the same
-substitution on the server side. See that module's docstring.
+How the original is located -- the marker, the 8-sensor cross-check and the
+error cases -- lives in `replay`, because the coordinator's `/ingest` path has
+to do the same substitution on the server side. See that module's docstring.
 
 Everything above `resolve_source` here is deliberately free of any `lsst`
 import, so the polling logic is testable without the stack -- and so

@@ -1762,8 +1762,8 @@ def run_ingest(
 
     `headers` substitutes replay metadata, exactly as `resolve_exposure_dir`
     documents: detector identity still comes from the live file on disk, only
-    the observation metadata is replaced. `None` means consult
-    `DONUT_SERVER_REPLAY_DIR` -- which is the normal case, since the whole point
+    the observation metadata is replaced. `None` means decide here, from the
+    exposure's own `EMUIMAGE` cards -- the normal case, since the whole point
     of resolving here is that the producer does not have to.
     """
     t0 = time.perf_counter()

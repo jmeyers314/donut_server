@@ -367,8 +367,7 @@ same pixels give `visit=2026071300050 physical_filter=r_57`, 62 rows and 8 of 8 
 
 | variable | meaning |
 |---|---|
-| `DONUT_SERVER_REPLAY_DIR` | a replay tree, one subdirectory per original exposure, named by OBSID. **Setting it switches substitution on**; unset, headers come from the polled directory, which is what the real camera needs |
-| `DONUT_SERVER_REPLAY_OBSID` | pin one exposure and skip the lookup — for hand testing, and for a replay whose marker is missing or names something not in the tree |
+| `DONUT_SERVER_REPLAY_DIR` | a replay tree, one subdirectory per original exposure, named by OBSID. Says *where* originals live, not *whether* to substitute — safe to export as part of a standing test-stand setup, and simply absent in production |
 
 ```zsh
 export DONUT_SERVER_REPLAY_DIR=/path/to/replays
@@ -389,14 +388,20 @@ from two different replays would otherwise substitute successfully, pass every d
 answer wrongly. Disagreement names each value and the detectors that carried it.
 
 The keyword is absent on real camera files (verified across a tree of originals, including a check
-for blank-valued cards), which is what makes it safe to *require*. With `DONUT_SERVER_REPLAY_DIR`
-set, an absent or blank `EMUIMAGE` is a hard error naming the offending detectors — that is what
-pointing the replay path at real data looks like, and continuing would submit it under whatever
-pointing happened to be in the headers.
+for blank-valued cards), which is what makes it safe to treat as the switch:
 
-**Setting the variable is the switch, not the marker's presence.** Running a replay *without*
-substitution is a deliberate test — forcing every WCS to describe the wrong sky — so unsetting the
-variable has to keep working, and it does.
+| `EMUIMAGE` | `DONUT_SERVER_REPLAY_DIR` | behaviour |
+|---|---|---|
+| present | set | substitute from the named original |
+| present | unset | **hard error** — replayed pixels with nowhere to read the original's headers from. The only alternative is submitting them under BTS's pointing, which no downstream check can detect |
+| absent | either | no substitution. This is production, and the variable does not matter |
+
+**The marker is the switch, not the variable.** Gating this way is what lets the variable be
+exported once on the test stand and never set in production: neither deployment has to be told
+which kind of data it is about to see, and a replay can no longer run unsubstituted by accident.
+
+Absent or blank on only *some* detectors is a hard error naming them, since one directory cannot be
+both a replay and real camera data.
 
 What gets substituted is the **whole primary header**, per detector, so filter, pointing, times and
 `FOCUSZ` all come from the original observation and stay consistent with the pixels. Two rules make
@@ -419,8 +424,8 @@ replay metadata substitution (live -> substituted):
 ```
 
 The second line checks the marker against the OBSID of the headers actually loaded, and prints
-`<- MISMATCH` when they differ — which is exactly what `DONUT_SERVER_REPLAY_OBSID` pinning the wrong
-exposure looks like. `EMUIMAGE` gets its own line rather than a row in the table because the
+`<- MISMATCH` when they differ — a replay tree whose directory name disagrees with the OBSID in the
+files inside it. `EMUIMAGE` gets its own line rather than a row in the table because the
 *original* has no `EMUIMAGE` (only replays do), so a live-vs-substituted column would show every
 correct substitution as a change to `<absent>`.
 
@@ -552,13 +557,13 @@ their sizes to settle is the polling logic's own business, covered directly in
 headers survive assembly and come back as the *original* exposure's Zernikes.
 
 The mangling is the point: the copy keeps the pixels but gets a different filter, a far-away
-pointing, another night's timestamps and `FOCUSZ 0`, so a run that *silently failed to substitute* is
-distinguishable from one that worked. Stage 1 prints the expected answer before anything runs —
-compare against that rather than deciding afterwards whether the output looked about right.
+pointing, another night's timestamps and `FOCUSZ 0`, so which set of headers won the run is visible
+in the answer. Stage 1 prints the expected answer before anything runs — compare against that rather
+than deciding afterwards whether the output looked about right.
 
-**Do not judge it by `DONE`.** Both the substituted and unsubstituted runs succeed; see
-[Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service cannot tell them apart.
-On `MC_O_20260713_000050`'s pixels the substituted run is identifiable by
+**Do not judge it by `DONE`.** A job fit against the mangled headers still succeeds; see
+[Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service cannot tell on its own.
+On `MC_O_20260713_000050`'s pixels a correctly substituted run is identifiable by
 `visit=2026071300050 filter=r_57 boresight=(215.5361, -10.1181)` and 8 of 8 groups fit, whatever the
 files are labelled.
 
@@ -567,14 +572,9 @@ Four paths worth walking at least once, all verified:
 | run | expected |
 |---|---|
 | `DONUT_SERVER_REPLAY_DIR` set | the original's `r_57` and pointing, `EMUIMAGE ... -> loaded ...` agreeing |
-| unset | the mangled `g_6` and `(120, -45)`, submitted as-is — the deliberate wrong-sky test |
-| `--emuimage` naming an absent exposure | hard failure naming the directory and suggesting `DONUT_SERVER_REPLAY_OBSID` |
-| a real exposure (`replay/MC_O_*`) with the variable set | hard failure listing all 8 detectors as lacking `EMUIMAGE` |
-
-**Check the substituted run, not just that the unsubstituted one differs.** Both come back `DONE` —
-see [Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service cannot tell the
-difference. The substituted one is identifiable by `physical_filter: r_57` in the quantum and 8 of 8
-groups fit; the unsubstituted one reports `z_20` and fits 6 of 6 of a different, meaningless grouping.
+| unset | hard failure: `EMUIMAGE` says these are replayed pixels and there is nowhere to read the original from |
+| `--emuimage` naming an absent exposure | hard failure naming the directory that is not in the tree |
+| a real exposure (`replay/MC_O_*`) with the variable set | runs as production, nothing substituted — the standing-test-stand case |
 
 The dashboard is at <http://127.0.0.1:28861/dashboard> and needs no credential: the server exempts
 loopback callers and serves the page to nobody else, so reaching it from another machine means an

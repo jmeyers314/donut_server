@@ -57,16 +57,10 @@ class TestReadEmuimage:
         assert "R40_SW1" in message
         assert "EMUIMAGE" in message
 
-    def test_absent_everywhere_is_the_real_data_case(self):
-        """What pointing the replay path at real camera data looks like. The
-        message has to say so, since the fix is to unset the variable rather
-        than anything about the data."""
-        with pytest.raises(RuntimeError) as excinfo:
-            replay.read_emuimage({s: {} for s in SENSORS})
-
-        message = str(excinfo.value)
-        assert replay.REPLAY_DIR_VAR in message
-        assert replay.REPLAY_OBSID_VAR in message
+    def test_absent_everywhere_is_real_camera_data(self):
+        """Real camera files carry no marker at all, and that is the signal to
+        substitute nothing -- not an error, since this is production."""
+        assert replay.read_emuimage({s: {} for s in SENSORS}) is None
 
     @pytest.mark.parametrize("blank", ["", "   ", "\t"])
     def test_blank_counts_as_absent(self, blank):
@@ -101,7 +95,7 @@ class TestReadEmuimage:
 
 
 class TestSubstitutionRouting:
-    """Which exposure the substitutes are read from: unset / pinned / EMUIMAGE.
+    """Whether to substitute at all, and from which exposure.
 
     The header *reading* is stubbed out -- that needs real files and is covered
     in `tests/test_daq.py`. What is under test is the decision, which is where
@@ -110,26 +104,43 @@ class TestSubstitutionRouting:
 
     @pytest.fixture
     def stubbed(self, monkeypatch, tmp_path):
-        """Records which exposure `replay_headers` was asked for."""
-        asked = {}
+        """Stubs both header reads and records what was looked up.
+
+        `live` is the header map the live-side stub serves, so a test can
+        empty the marker to stand in for real camera data. `loaded` overrides
+        the OBSID the substitutes come back carrying, which is how the two can
+        be made to disagree.
+        """
+        asked = {
+            "live": {s: {"EMUIMAGE": "FROM_EMUIMAGE"} for s in SENSORS},
+            "loaded": None,
+        }
 
         def fake_replay_headers(replay_dir, exposure):
             asked["exposure"] = exposure
-            return {s: {"OBSID": exposure} for s in SENSORS}
+            return {s: {"OBSID": asked["loaded"] or exposure} for s in SENSORS}
 
-        monkeypatch.setattr(
-            replay, "read_live_headers",
-            lambda paths: {s: {"EMUIMAGE": "FROM_EMUIMAGE"} for s in SENSORS},
-        )
+        monkeypatch.setattr(replay, "read_live_headers", lambda paths: asked["live"])
         monkeypatch.setattr(replay, "replay_headers", fake_replay_headers)
         monkeypatch.setattr(replay.daq, "sw_paths", lambda directory: [])
-        monkeypatch.delenv(replay.REPLAY_OBSID_VAR, raising=False)
         monkeypatch.delenv(replay.REPLAY_DIR_VAR, raising=False)
         return asked
 
-    def test_unset_var_substitutes_nothing(self, stubbed, tmp_path):
+    def test_no_marker_substitutes_nothing(self, stubbed, tmp_path):
         """The real camera path: the headers on disk are the truth, so
         resolve_exposure_dir must be handed no substitutes at all."""
+        stubbed["live"] = {s: {} for s in SENSORS}
+
+        assert replay.substituted_headers(str(tmp_path)) is None
+        assert "exposure" not in stubbed
+
+    def test_no_marker_ignores_the_variable(self, stubbed, tmp_path, monkeypatch):
+        """What lets the variable be part of a standing test-stand setup: real
+        camera data takes the production path whether or not a tree is
+        configured, so the two deployments differ only in their data."""
+        stubbed["live"] = {s: {} for s in SENSORS}
+        monkeypatch.setenv(replay.REPLAY_DIR_VAR, str(tmp_path))
+
         assert replay.substituted_headers(str(tmp_path)) is None
         assert "exposure" not in stubbed
 
@@ -140,15 +151,16 @@ class TestSubstitutionRouting:
 
         assert stubbed["exposure"] == "FROM_EMUIMAGE"
 
-    def test_pinned_obsid_beats_emuimage(self, stubbed, tmp_path, monkeypatch):
-        """The escape hatch, and the whole reason it exists: a replay whose
-        marker is missing or names something absent is still runnable."""
-        monkeypatch.setenv(replay.REPLAY_DIR_VAR, str(tmp_path))
-        monkeypatch.setenv(replay.REPLAY_OBSID_VAR, "PINNED_BY_HAND")
+    def test_marker_with_no_replay_dir_is_refused(self, stubbed, tmp_path):
+        """A replay with nowhere to read originals from must not run. The
+        alternative is submitting it under BTS's pointing, which comes back
+        DONE and wrong -- the whole failure this module exists to prevent."""
+        with pytest.raises(RuntimeError) as excinfo:
+            replay.substituted_headers(str(tmp_path))
 
-        replay.substituted_headers(str(tmp_path))
-
-        assert stubbed["exposure"] == "PINNED_BY_HAND"
+        message = str(excinfo.value)
+        assert replay.REPLAY_DIR_VAR in message
+        assert "FROM_EMUIMAGE" in message
 
     def test_replay_dir_that_is_not_a_directory(self, stubbed, monkeypatch, tmp_path):
         monkeypatch.setenv(replay.REPLAY_DIR_VAR, str(tmp_path / "nope"))
@@ -173,10 +185,12 @@ class TestSubstitutionRouting:
         assert not any("MISMATCH" in line for line in lines)
 
     def test_a_marker_mismatch_is_called_out(self, stubbed, tmp_path, monkeypatch):
-        """A pinned OBSID that is not what the marker says is legitimate -- it
-        is the escape hatch -- but it must not pass unremarked."""
+        """The marker named one exposure and the headers loaded say another --
+        a replay tree whose directory name disagrees with the OBSID inside it.
+        Not refused, since the pixels may still be the right ones, but it must
+        not pass unremarked."""
         monkeypatch.setenv(replay.REPLAY_DIR_VAR, str(tmp_path))
-        monkeypatch.setenv(replay.REPLAY_OBSID_VAR, "SOMETHING_ELSE")
+        stubbed["loaded"] = "SOMETHING_ELSE"
         lines = []
 
         replay.substituted_headers(str(tmp_path), report=lines.append)

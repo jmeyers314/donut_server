@@ -270,17 +270,16 @@ def main() -> int:
     if expected_mismatch:
         print("  EXPECT: the trigger FAILS, naming the absent replay directory")
         print(f"          {os.path.join(args.replay_dir, emuimage)!r}")
-        print(f"          and suggesting {replay.REPLAY_OBSID_VAR}.")
     else:
         print("  EXPECT, with the replay dir set -- these are the ORIGINAL values:")
         print(f"          filter={report['original_filter']}  "
               f"imgtype={report['original_imgtype'].lower()}")
         print(f"          boresight=({report['original_ra']:.4f}, "
               f"{report['original_dec']:.4f})")
-        print("  EXPECT, with it unset: the mangled values above, and a DONE job "
-              "anyway --")
-        print("          an unsubstituted replay does not fail, it just answers "
-              "wrongly.")
+        print(f"  EXPECT, with it unset: a hard FAILURE -- {replay.EMUIMAGE_CARD}")
+        print("          says these are replayed pixels and there is nowhere to "
+              "read")
+        print("          the original's headers from.")
 
     print("\n" + "=" * 72)
     print("Run this in another terminal, then come back here and hit Enter")
@@ -290,7 +289,7 @@ def main() -> int:
           f"{os.path.abspath(args.replay_dir)}")
     print("  exported where donutServer.py runs -- substitution is server-side,")
     print("  so setting it in the trigger's shell does nothing. Unset it there")
-    print("  to see the no-substitution case answer wrongly but succeed.")
+    print("  to see a replay refused for having nowhere to read originals from.")
     print("  (--dry-run resolves and reports without submitting.)")
 
     pause("Enter once the trigger is polling, to start copying", not args.no_pause)
