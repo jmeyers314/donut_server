@@ -1,3 +1,28 @@
+# This file is part of donut_server.
+#
+# Developed for the Vera C. Rubin Observatory Telescope and Site Systems.
+# This product includes software developed by the LSST Project
+# (https://www.lsst.org).
+# See the COPYRIGHT file at the top-level directory of this distribution
+# for details of code ownership.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""Framing tests for the raw-image push blob."""
+
+from __future__ import annotations
+
 import random
 
 import pytest
@@ -5,12 +30,10 @@ import pytest
 from lsst.ts.donut_server import protocol
 
 
-def test_pack_unpack_round_trip():
+def test_pack_unpack_round_trip() -> None:
+    """Eight differently-sized parts survive pack then unpack."""
     rng = random.Random(0)
-    images = {
-        f"SENSOR_{i}": bytes(rng.randrange(256) for _ in range(1000 + i))
-        for i in range(8)
-    }
+    images = {f"SENSOR_{i}": bytes(rng.randrange(256) for _ in range(1000 + i)) for i in range(8)}
 
     blob = protocol.pack_blob(images)
     result = protocol.unpack_blob(blob)
@@ -18,7 +41,8 @@ def test_pack_unpack_round_trip():
     assert result == images
 
 
-def test_split_parts_round_trip():
+def test_split_parts_round_trip() -> None:
+    """A flat part map regroups back into (img, meta) pairs per sensor."""
     rng = random.Random(1)
     sensors = [f"R0{i}_SW0" for i in range(4)]
     expected = {
@@ -37,27 +61,33 @@ def test_split_parts_round_trip():
     assert protocol.split_parts(protocol.unpack_blob(protocol.pack_blob(parts))) == expected
 
 
-def test_split_parts_rejects_unpaired_part():
+def test_split_parts_rejects_unpaired_part() -> None:
+    """A sensor with an image but no metadata is an error, not a partial."""
     parts = {protocol.part_name("R00_SW0", protocol.IMG_SUFFIX): b"x"}
     with pytest.raises(protocol.ProtocolError, match="missing part"):
         protocol.split_parts(parts)
 
 
-def test_split_parts_rejects_unknown_suffix():
+def test_split_parts_rejects_unknown_suffix() -> None:
+    """A part name carrying neither suffix cannot be attributed to a sensor."""
     with pytest.raises(protocol.ProtocolError, match="no recognized suffix"):
         protocol.split_parts({"R00_SW0": b"x"})
 
 
-def test_unpack_accepts_bytearray():
+def test_unpack_accepts_bytearray() -> None:
+    """Any `Blob` is readable, and the parts come back as `bytes`."""
     parts = {"a:img": b"0123", "a:meta": b"45"}
     result = protocol.unpack_blob(bytearray(protocol.pack_blob(parts)))
     assert result == parts
     assert all(isinstance(v, bytes) for v in result.values())
 
 
-def test_parse_layout_offsets_are_absolute():
-    """The coordinator slices shared memory by these offsets, so they must be
-    absolute from the start of the blob, not relative to the data section."""
+def test_parse_layout_offsets_are_absolute() -> None:
+    """Offsets are absolute from the start of the blob.
+
+    The coordinator slices shared memory by them directly, so they must not
+    be relative to the part-data section the way the wire descriptors are.
+    """
     parts = {"a:img": b"0123456789", "a:meta": b"XY", "b:img": b"zz", "b:meta": b"Q"}
     blob = protocol.pack_blob(parts)
     layout = protocol.parse_layout(blob)
@@ -67,34 +97,33 @@ def test_parse_layout_offsets_are_absolute():
         assert blob[part.offset : part.offset + part.byte_count] == parts[part.name]
 
 
-def test_parse_layout_on_memoryview_of_oversized_buffer():
-    """Mirrors the real path: a big reusable block sliced to what was received."""
+def test_parse_layout_on_memoryview_of_oversized_buffer() -> None:
+    """Mirrors the real path: a reusable block sliced to what was received."""
     parts = {"a:img": b"abcd", "a:meta": b"ef"}
     blob = protocol.pack_blob(parts)
     block = bytearray(4096)
     block[: len(blob)] = blob
 
     view = memoryview(block)[: len(blob)]
-    rebuilt = {
-        p.name: bytes(view[p.offset : p.offset + p.byte_count])
-        for p in protocol.parse_layout(view)
-    }
+    rebuilt = {p.name: bytes(view[p.offset : p.offset + p.byte_count]) for p in protocol.parse_layout(view)}
     assert rebuilt == parts
 
 
-def test_parse_layout_rejects_truncated_blob():
+def test_parse_layout_rejects_truncated_blob() -> None:
+    """A body shorter than `payload_length` promises is rejected."""
     blob = protocol.pack_blob({"a:img": b"0" * 32, "a:meta": b"1" * 8})
     with pytest.raises(protocol.ProtocolError, match="blob too short"):
         protocol.parse_layout(blob[:-4])
 
 
-def test_parse_layout_rejects_truncated_descriptor():
+def test_parse_layout_rejects_truncated_descriptor() -> None:
+    """A descriptor region cut mid-entry is rejected before any slicing."""
     blob = protocol.pack_blob({"a:img": b"0" * 32, "a:meta": b"1" * 8})
     with pytest.raises(protocol.ProtocolError):
         protocol.parse_layout(blob[: protocol.HEADER_SIZE + 2])
 
 
-def test_build_framing_matches_pack_blob_when_packed_tight():
+def test_build_framing_matches_pack_blob_when_packed_tight() -> None:
     """The in-place framing and the copying packer must agree on the layout.
 
     `build_framing` exists so a producer can write each part straight into
@@ -104,9 +133,7 @@ def test_build_framing_matches_pack_blob_when_packed_tight():
     """
     parts = {"R00_SW0:img": b"P" * 1000, "R00_SW0:meta": b"M" * 37}
 
-    framing, absolute, total = protocol.build_framing(
-        {name: len(payload) for name, payload in parts.items()}
-    )
+    framing, absolute, total = protocol.build_framing({name: len(payload) for name, payload in parts.items()})
     blob = bytearray(total)
     blob[: len(framing)] = framing
     for name, payload in parts.items():
@@ -115,7 +142,7 @@ def test_build_framing_matches_pack_blob_when_packed_tight():
     assert bytes(blob) == protocol.pack_blob(parts)
 
 
-def test_build_framing_tolerates_gaps_between_parts():
+def test_build_framing_tolerates_gaps_between_parts() -> None:
     """Fixed-size slots, the layout the parallel producer actually uses.
 
     Image slots are sized from cameraGeom before any pixel is read, so a part
@@ -135,13 +162,11 @@ def test_build_framing_tolerates_gaps_between_parts():
     blob[absolute["R00_SW0:meta"] : absolute["R00_SW0:meta"] + 37] = b"M" * 37
 
     view = memoryview(blob)
-    rebuilt = {
-        p.name: bytes(view[p.offset : p.offset + p.byte_count])
-        for p in protocol.parse_layout(view)
-    }
+    rebuilt = {p.name: bytes(view[p.offset : p.offset + p.byte_count]) for p in protocol.parse_layout(view)}
     assert rebuilt == {"R00_SW0:img": b"P" * 1000, "R00_SW0:meta": b"M" * 37}
 
 
-def test_build_framing_requires_an_offset_for_every_part():
+def test_build_framing_requires_an_offset_for_every_part() -> None:
+    """Pinned offsets are all-or-nothing: omitting one part is an error."""
     with pytest.raises(protocol.ProtocolError, match="no offset given"):
         protocol.build_framing({"a:img": 8, "a:meta": 4}, {"a:img": 0})
