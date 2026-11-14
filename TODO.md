@@ -44,3 +44,11 @@ Scratch list, arbitrary order.
 
 - [ ] **Audit for other simplifications** — open-ended sweep, in the spirit of
       the item above.
+
+- [ ] **Think through replay/emuimage header handling trigger** - might be
+      better to trigger on header presence instead of env var presence.
+
+- [ ] **Investigate Server Side Events (SSE) for dashboard.**
+
+- [ ] **Rethink where the config should live.**  Also nproc.  Maybe default in the
+      dashboard followed by http overrides?
