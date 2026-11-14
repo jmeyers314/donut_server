@@ -32,10 +32,14 @@ Scratch list, arbitrary order.
       each pass doubles as a review of the file it touches. `protocol.py` is
       done (`0b4892f`).
 
-- [ ] **Pre-commit checks** — no `.pre-commit-config.yaml` today. Needed
-      eventually for lsst-ts compliance, which also brings ticket branches and
-      the rest of the convention set — so worth knowing what that standard
-      requires before picking tools piecemeal.
+- [ ] **Pre-commit checks** — configured but deliberately *not* installed as a
+      git hook; run by hand per file as each is brought into compliance:
+
+          pre-commit run --files python/lsst/ts/donut_server/protocol.py
+
+- [ ] **License headers** — `protocol.py` has its 21 lines of GPLv3; the other
+      sources don't. `insert-license` will add them in one pass when we're
+      ready.
 
 - [ ] **Simplify the docs** — `README.md` and `Rubin Wavefront Estimation
       Service.md` are both far too complicated right now. Probably a lot of the
