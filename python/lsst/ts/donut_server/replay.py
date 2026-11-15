@@ -303,5 +303,6 @@ def resolve(directory: str, report=None):
     keeps `/prepare` off the pixel path.
     """
     return daq.resolve_exposure_dir(
-        directory, headers=substituted_headers(directory, report=report)
+        directory,
+        override_headers=substituted_headers(directory, report=report),
     )

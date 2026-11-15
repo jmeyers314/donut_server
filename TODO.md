@@ -41,6 +41,9 @@ Scratch list, arbitrary order.
       sources don't. `insert-license` will add them in one pass when we're
       ready.
 
+- [ ] **`pathlib` instead of `os.path`** — repo-wide, in one pass rather than
+      file by file, since half-converted path handling is worse than either.
+
 - [ ] **Simplify the docs** — `README.md` and `Rubin Wavefront Estimation
       Service.md` are both far too complicated right now. Probably a lot of the
       code comments too: several carry measurement logs and rationale that have

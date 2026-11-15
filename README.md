@@ -339,10 +339,6 @@ Two guards worth knowing, because both are silent when they work:
   stars and would burn a flight to reach an empty donut catalog. `--any-imgtype` forces them through.
   Anything outside `CWFS`/`ACQ`/`SCIENCE`/`OBJECT` is processed but flagged.
 
-Note the trigger reads **uncompressed** DAQ files: a directory holding only `.fz` files fails naming
-that as the cause, because `readRawAmps` cannot read one and whether our step runs before or after
-the camera script's compression step is still an open question.
-
 ### Replayed exposures at BTS
 
 The Base Test Stand replays real images through the simulated camera, so files appear exactly as they

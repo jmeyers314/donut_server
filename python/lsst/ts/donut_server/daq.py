@@ -83,12 +83,17 @@ import multiprocessing as mp
 import signal
 from dataclasses import dataclass
 from multiprocessing import shared_memory
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from lsst.daf.base import PropertyList
 
 from lsst.ts.donut_server import client
 from lsst.ts.donut_server import exposure_codec
 from lsst.ts.donut_server import protocol
 from lsst.ts.donut_server import tmpfs
+
+if TYPE_CHECKING:
+    from astro_metadata_translator import ObservationInfo
 
 # The eight corner wavefront sensors, as DAQ filenames spell them. SW0 is
 # extra-focal, SW1 intra-focal.
@@ -111,28 +116,37 @@ FAN_OUT_TIMEOUT_S = 120.0
 class RawHandle:
     """One sensor's file, plus the header to assemble it under.
 
-    A `client.RawSource.handles` value. It carries the header rather than
-    letting `load_raw` re-read it for two reasons: the header may be a
-    *substitute* that is not on disk anywhere near `path`, and the non-replay
-    path has already read it during resolution anyway, so re-reading is pure
-    cost on the push critical path.
+    A `client.RawSource.handles` value.
 
-    `detector_num` is the live file's, never the header's -- see the module
-    docstring.
+    Attributes
+    ----------
+    path : str
+        The DAQ-native file the pixels are read from.
+    header : PropertyList
+        The primary header to assemble under, which may be a substitute that
+        is not on disk anywhere near `path`. Carried rather than re-read by
+        `load_raw`.
+    detector_num : int
+        Which detector this is.
     """
 
     path: str
-    header: Any
+    header: PropertyList
     detector_num: int
 
 
-def read_header(path: str):
+def read_header(path: str) -> PropertyList:
     """The primary header, with `astro_metadata_translator`'s fixes applied.
 
-    Fixed rather than raw because `ObservationInfo` is built from it and the
-    service's own formatter path applies the same fixes -- an unfixed header is
-    a different header. Headers handed back here are therefore already fixed,
-    which is why substituting one needs no second pass.
+    Parameters
+    ----------
+    path : str
+        A DAQ-native corner-sensor file.
+
+    Returns
+    -------
+    PropertyList
+        HDU 0's header, fixed in place.
     """
     from astro_metadata_translator import fix_header
     from lsst.afw.fits import readMetadata
@@ -143,9 +157,26 @@ def read_header(path: str):
     return metadata
 
 
-def obs_info(header, filename: str | None = None):
+def obs_info(
+    header: PropertyList, filename: str | None = None
+) -> ObservationInfo:
     """`ObservationInfo` for one sensor, from its primary header alone.
 
+    Parameters
+    ----------
+    header : PropertyList
+        A fixed primary header, live or substituted.
+    filename : str, optional
+        Reported in the translator's own error messages, which otherwise
+        cannot say which sensor was being read.
+
+    Returns
+    -------
+    ObservationInfo
+        The translated view of `header`.
+
+    Notes
+    -----
     Deliberately header-only: this is what makes the /prepare half of the cycle
     free of pixel reads. Eight of these cost ~0.1 s total, against ~0.1 s per
     sensor to assemble.
@@ -158,17 +189,39 @@ def obs_info(header, filename: str | None = None):
     )
 
 
-def read_obs_info(path: str):
-    """`ObservationInfo` straight off a file, for callers with no substitute."""
+def read_obs_info(path: str) -> ObservationInfo:
+    """`ObservationInfo` straight off a file, for callers with no substitute.
+
+    Parameters
+    ----------
+    path : str
+        A DAQ-native corner-sensor file.
+
+    Returns
+    -------
+    ObservationInfo
+        The translated view of that file's primary header.
+    """
     return obs_info(read_header(path), filename=path)
 
 
-def detector_name(header) -> str:
+def detector_name(header: PropertyList) -> str:
     """`R00_SW0`-style name, as the coordinator's calib dicts are keyed.
 
-    Assembled from the header rather than parsed out of the filename: the
-    filename is BTS's or the DAQ's to choose, whereas these two cards describe
-    the hardware the pixels came off.
+    Parameters
+    ----------
+    header : PropertyList
+        A primary header carrying `RAFTBAY` and `CCDSLOT`.
+
+    Returns
+    -------
+    str
+        `<RAFTBAY>_<CCDSLOT>`.
+
+    Raises
+    ------
+    RuntimeError
+        If either card is absent.
     """
     try:
         raft, slot = header["RAFTBAY"], header["CCDSLOT"]
@@ -1012,43 +1065,64 @@ def ingested_exposures(source, n_workers: int | None = None):
 def sw_paths(directory: str) -> list[str]:
     """The corner-sensor files in one exposure directory, sorted.
 
-    An empty result names the pattern, and says so differently when the only
-    thing present is compressed: whether our step in the camera's per-file
-    script runs before or after its `fpack` step is not yet settled, and
-    `readRawAmps` cannot read a `.fz` anyway, so guessing would turn a wiring
-    question into an obscure stack traceback.
+    Parameters
+    ----------
+    directory : str
+        One exposure's directory.
+
+    Returns
+    -------
+    list of str
+        Every file matching `SW_PATTERN`, joined onto `directory` as it was
+        given.
+
+    Raises
+    ------
+    RuntimeError
+        If anything other than exactly `EXPECTED_SENSORS` paths are found.
     """
     paths = sorted(glob.glob(os.path.join(directory, SW_PATTERN)))
-    if paths:
-        return paths
-    if glob.glob(os.path.join(directory, SW_PATTERN + ".fz")):
+    if len(paths) != EXPECTED_SENSORS:
         raise RuntimeError(
-            f"{directory!r} holds only fpacked {SW_PATTERN}.fz files; this "
-            "producer reads uncompressed DAQ files, so it must run before the "
-            "compression step (or be taught to funpack)"
+            f"found {len(paths)} corner-sensor files in {directory!r}, "
+            f"expected {EXPECTED_SENSORS}"
         )
-    raise RuntimeError(f"no {SW_PATTERN} files in {directory!r}")
+    return paths
 
 
 def resolve_exposure_dir(
-    directory: str, headers: dict[str, Any] | None = None
+    directory: str, override_headers: dict[str, PropertyList] | None = None
 ) -> tuple[client.RawSource, str]:
     """Build a `RawSource` for one exposure directory, reading no pixels.
 
-    Returns the source and the exposure's `IMGTYPE`, which callers report so an
-    off-nominal frame is identifiable in the log.
+    Parameters
+    ----------
+    directory : str
+        One exposure's directory. Must hold exactly `EXPECTED_SENSORS`
+        corner-sensor files.
+    override_headers : dict, optional
+        Detector name -> primary header.  If present, overrides the headers
+        from the files themselves. Useful for camera replay mode, which
+        replays the original pixels but not the original headers.
 
-    The pointing and the calib time come off the headers here rather than from
-    a raw's `VisitInfo` later, so `client.read_prepare_args` finds both already
-    set and /prepare goes out without opening a single amplifier HDU.
-    `calib_time` is the exposure *midpoint*, matching what the butler and files
-    paths in `client.py` both resolve calibs against (verified equal to the
-    assembled `VisitInfo.date` to the millisecond).
+    Returns
+    -------
+    source : client.RawSource
+        Raw handles + meta for exposure.
+    image_type : str
+        The exposure's `IMGTYPE`, lowercased by the translator.
 
-    `headers`, when given, maps detector name -> primary header and replaces
-    what is on disk for that detector. Every detector found must be in it: a
-    partial map would mean half the exposure resolved against one pointing and
-    half against another, which is worse than not substituting at all.
+    Raises
+    ------
+    RuntimeError
+        If the sensors disagree about anything that describes the exposure as
+        a whole, if any of them cannot be identified, if there are not exactly
+        `EXPECTED_SENSORS` of them, or if `override_headers` is incomplete.
+
+    Notes
+    -----
+    Populate pointing and calib time from headers here to facilitate potential
+    early returns later.
     """
     paths = sw_paths(directory)
 
@@ -1056,8 +1130,8 @@ def resolve_exposure_dir(
     filters: set[str] = set()
     exposure_ids: set[int] = set()
     image_types: set[str] = set()
-    pointings: list[tuple[float, float]] = []
-    midpoints: list[str] = []
+    pointings: set[tuple[float, float] | None] = set()
+    midpoints: set[str] = set()
 
     for path in paths:
         live = read_header(path)
@@ -1066,40 +1140,45 @@ def resolve_exposure_dir(
         # amp layout the pixels are in; only the observation metadata can be
         # substituted. See the module docstring.
         detector_num = obs_info(live, filename=path).detector_num
+        if detector_num is None:
+            raise RuntimeError(
+                f"{os.path.basename(path)} has no detector number, so its "
+                "pixels cannot be matched to an amp layout"
+            )
 
         header = live
-        if headers is not None:
-            if name not in headers:
+        if override_headers:
+            if name not in override_headers:
                 raise RuntimeError(
                     f"no substitute header for detector {name} "
                     f"({os.path.basename(path)}); have "
-                    f"{sorted(headers)}"
+                    f"{sorted(override_headers)}"
                 )
-            header = headers[name]
+            header = override_headers[name]
 
         info = obs_info(header, filename=path)
         handles[detector_num] = RawHandle(path, header, detector_num)
         filters.add(str(info.physical_filter))
         exposure_ids.add(int(info.exposure_id))
         image_types.add(str(info.observation_type))
-        if info.tracking_radec is None:
-            raise RuntimeError(
-                f"{os.path.basename(path)} has no tracking_radec; its RA/DEC "
-                "headers are unpopulated, so no WCS can be built for it"
-            )
-        pointings.append(
-            (info.tracking_radec.ra.deg, info.tracking_radec.dec.deg)
+        radec = info.tracking_radec
+        pointings.add(
+            None if radec is None else (radec.ra.deg, radec.dec.deg)
         )
         begin, end = info.datetime_begin, info.datetime_end
-        midpoints.append((begin + (end - begin) / 2).tai.isot)
+        midpoints.add((begin + (end - begin) / 2).tai.isot)
 
-    # Each of these would otherwise surface much later and much less legibly:
-    # a mixed filter as a coordinator cross-check failure mid-push, a mixed
-    # exposure_id as "raws span multiple visits".
+    # Ensure all detector metadata are consistent.
     if len(filters) != 1:
-        raise RuntimeError(f"{directory!r} spans physical_filters {sorted(filters)}")
+        raise RuntimeError(f"{directory!r} spans physical_filters {filters}")
     if len(exposure_ids) != 1:
-        raise RuntimeError(f"{directory!r} spans exposures {sorted(exposure_ids)}")
+        raise RuntimeError(f"{directory!r} spans exposures {exposure_ids}")
+    if len(image_types) != 1:
+        raise RuntimeError(f"{directory!r} spans image types {image_types}")
+    if len(pointings) != 1:
+        raise RuntimeError(f"{directory!r} spans pointings {pointings}")
+    if len(midpoints) != 1:
+        raise RuntimeError(f"{directory!r} spans midpoints {midpoints}")
     if len(handles) != EXPECTED_SENSORS:
         raise RuntimeError(
             f"{directory!r} has {len(handles)} corner sensor(s), expected "
@@ -1108,19 +1187,21 @@ def resolve_exposure_dir(
 
     (physical_filter,) = filters
     (exposure_id,) = exposure_ids
+    (image_type,) = image_types
+    (boresight,) = pointings
+    (calib_time,) = midpoints
+
     source = client.RawSource(
         visit=exposure_id,
-        # Rejects a filter there are no calibs for here, at discovery, rather
-        # than as a missing-flat error deep in the coordinator's calib load.
         physical_filter=client._check_known_filter(exposure_id, physical_filter),
         handles=handles,
         load=load_raw,
-        boresight=pointings[0],
-        calib_time=min(midpoints),
+        boresight=boresight,
+        calib_time=calib_time,
         # This path, and only this path, can encode in parallel: `load_raw` is
         # ours, so the work is known to be fork-safe and the image size is
         # known from cameraGeom before any pixel is read. The butler and
         # assembled-file sources keep the serial encoder.
         encoded_blob=encoded_blob,
     )
-    return source, "/".join(sorted(image_types))
+    return source, image_type

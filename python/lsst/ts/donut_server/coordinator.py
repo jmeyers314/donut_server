@@ -1729,7 +1729,7 @@ def resolve_exposure(directory: str) -> dict:
     source, imgtype = replay.resolve(
         directory, report=lambda line: _log.info("%s", line)
     )
-    boresight_ra, boresight_dec = source.boresight
+    boresight_ra, boresight_dec = source.boresight or (None, None)
     return {
         "visit": source.visit,
         "physical_filter": source.physical_filter,
@@ -1776,7 +1776,9 @@ def run_ingest(
         headers = replay.substituted_headers(
             directory, report=lambda line: _log.info("job %s: %s", job_id, line)
         )
-    source, imgtype = daq.resolve_exposure_dir(directory, headers=headers)
+    source, imgtype = daq.resolve_exposure_dir(
+        directory, override_headers=headers
+    )
     resolve_s = time.perf_counter() - t0
 
     t0 = time.perf_counter()
