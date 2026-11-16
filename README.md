@@ -251,16 +251,17 @@ upstream default to True, because the focal-plane selection plot needs the two t
 
 Three ways to drive the service, in order of how production-like they are:
 
-| launcher | picks the exposure | reads | for |
+| launcher | picks the exposure | sends | for |
 |---|---|---|---|
-| `scripts/camera_hook.sh` | the directory the camera just filled | DAQ-native amp files | **production and BTS** |
-| `bin/donutClient.py` | `--visit`, from `raw_*.fits` or a butler repo | assembled raws | development, `--loop` cadence tests |
-| `scripts/run_sequence.py` | walks a tree, one dir per exposure, at `--delay` | DAQ-native amp files | replaying a night at a chosen cadence |
+| `scripts/camera_hook.sh` | the directory the camera just filled | a path, to `/submit` | **production and BTS** |
+| `scripts/run_sequence.py` | walks a tree, one dir per exposure, at `--delay` | a path, to `/submit` | replaying a night at a chosen cadence |
+| `bin/donutClient.py` | `--visit`, from `raw_*.fits` or a butler repo | assembled pixels, to `/prepare` + `/push` | development, `--loop` cadence tests |
 
-They split on who reads the pixels. The hook sends a **path** and the server assembles, through
-`daq.py`; the other two assemble on their own side and POST the bytes. The camera writes
-*unassembled amplifier* images — one FITS per corner sensor with eight `Segment1x` HDUs — and the
-wire format carries an assembled `ExposureF`, so anything that pushes must assemble first.
+They split on who reads the pixels. The first two send a **path** and the server reads it itself
+through `daq.py`, so neither touches the stack; `donutClient.py` loads the exposures on its own side
+and POSTs the bytes. The camera writes *unassembled amplifier* images — one FITS per corner sensor
+with eight `Segment1x` HDUs — and the wire format carries an assembled `ExposureF`, so anything that
+pushes must assemble first, which is why the DAQ-native paths do not push.
 
 ### The camera hook
 

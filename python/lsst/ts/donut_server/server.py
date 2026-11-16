@@ -1976,8 +1976,8 @@ async def ingest(job_id: str, body: dict, num_workers: int | None = None):
 
     The directory must be visible to *this* host. That is the one deployment
     constraint `/push` does not have, and the reason `/push` stays: an
-    off-machine producer, `donutClient.py` and `scripts/run_sequence.py` all
-    still need it.
+    off-machine producer, and `donutClient.py` with assembled raws or a butler,
+    both still need it.
     """
     record = JOBS.get(job_id)
     if record is None:

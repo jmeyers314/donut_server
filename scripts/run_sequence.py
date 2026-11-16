@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 """Drive the service over a directory tree of DAQ-native LSSTCam exposures.
 
-**Temporary.** This exists because the DAQ writes *unassembled amplifier*
-images -- one FITS per corner sensor with eight `Segment1x` HDUs -- and the
-service's wire format carries an assembled `ExposureF`. Assembly belongs on the
-producer side eventually (or the raws get ingested into a butler repo and
-`donutClient.py -b` handles them); until then it happens in `daq.py`,
-in-process, with `lsst.obs.lsst`.
+The fixed-cadence, operator-driven counterpart to the camera's hook: it walks a
+tree that is already complete and submits every matching exposure on a chosen
+period. Like the hook it POSTs the *directory* to `/submit` and the server
+reads the pixels itself, in-process, through `daq.py` -- so nothing here
+assembles anything or touches `lsst.obs.lsst`.
 
-This script is the fixed-cadence, operator-driven producer: it walks a tree
-that is already complete and submits every matching exposure on a chosen
-period. Production does not go through a producer at all: the camera's
-per-file hook POSTs the directory to `/submit` and the server reads it (see
-`scripts/camera_hook.sh`), so this is the only caller left that assembles
-pixels here and pushes them.
+Two deliberate departures from the hook's request, which is otherwise the same
+`{"directory": ...}`:
+
+- `resubmit` is always sent. The hook's deduplication guard exists to stop one
+  exposure being submitted twice by a hook that fired twice; this walks a
+  sorted list of distinct directories exactly once, and re-running the whole
+  sequence is the normal workflow rather than an accident.
+- `config_overrides`, `num_workers` and `any_imgtype` are passed through when
+  given. The hook has no way to send any of them, by design.
 
 Layout it expects, one directory per exposure, as the replay tree is laid out:
 
@@ -24,11 +26,13 @@ Layout it expects, one directory per exposure, as the replay tree is laid out:
 Only `_R??_SW?.fits` is read: SG* are guider sensors, not corner wavefront
 sensors, and the service has no calibs for them.
 
-Every matched exposure is submitted regardless of `IMGTYPE`, which is
-deliberate -- such a tree mixes CWFS, ACQ, science pairs and a true dark, and
-watching the service answer an off-nominal frame is part of the point. A
-non-CWFS exposure is flagged in its banner so a nonsense result is
-attributable at a glance.
+Calibration frames come back `SKIPPED` rather than fitted, exactly as they do
+in production, and are counted as skipped rather than failed -- such a tree
+mixes CWFS, ACQ, science pairs and a true dark. `--any-imgtype` forces them
+through, though a frame taken with tracking disabled has no pointing to prepare
+against, so forcing one currently fails at `/prepare`. Anything outside
+`CWFS`/`ACQ`/`SCIENCE`/`OBJECT` is fitted and flagged in its banner, so a
+nonsense result is attributable at a glance.
 
     scripts/run_sequence.py --delay 60
     scripts/run_sequence.py --glob 'MC_O_20260713_*?50' --delay 39
@@ -45,9 +49,16 @@ import time
 import requests
 
 from lsst.ts.donut_server import client
-from lsst.ts.donut_server import daq
 from lsst.ts.donut_server import endpoint
 
+# `/submit` returns only once the fit is DONE, so the result is already written
+# by the time it is asked for and this is a guard rather than a long poll.
+RESULT_WAIT_S = 10.0
+
+# Covers the server's resolve, prepare and the whole fit, the same span the
+# camera hook's `--max-time` covers. A backstop against a wedged server, not a
+# cadence control -- `--delay` is that.
+SUBMIT_TIMEOUT_S = 900
 
 
 def discover_dirs(root: str, pattern: str) -> list[str]:
@@ -65,6 +76,81 @@ def discover_dirs(root: str, pattern: str) -> list[str]:
         if entry.is_dir() and fnmatch.fnmatch(entry.name, pattern)
     ]
     return sorted(found)
+
+
+def submit_exposure(
+    host: str,
+    token: str,
+    directory: str,
+    config_overrides: list | None = None,
+    num_workers: int | None = None,
+    any_imgtype: bool = False,
+    dry_run: bool = False,
+    images: bool = False,
+) -> str:
+    """POST one exposure directory to `/submit` and report what came back.
+
+    Returns the state the server answered with -- `DONE`, `SKIPPED` or
+    `DRY_RUN` -- so the caller can tell a declined calibration frame from a
+    failure. Anything else raises, since every other outcome is an HTTP error.
+    """
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    # Absolute, because `/submit` requires it: a relative path would resolve
+    # against the server's cwd rather than ours and mean something else.
+    payload: dict = {"directory": os.path.abspath(directory), "resubmit": True}
+    if config_overrides:
+        payload["config_overrides"] = config_overrides
+    if any_imgtype:
+        payload["any_imgtype"] = True
+    if dry_run:
+        payload["dry_run"] = True
+
+    t0 = time.monotonic()
+    resp = requests.post(
+        f"{host}/submit",
+        json=payload,
+        params={"num_workers": num_workers} if num_workers is not None else None,
+        headers=headers,
+        timeout=SUBMIT_TIMEOUT_S,
+    )
+    client.raise_for_status(resp)
+    body = resp.json()
+    state = str(body.get("state", "?"))
+
+    # What the server's own header read found, which is the only description of
+    # the exposure there is now that nothing is resolved on this side.
+    exposure = body.get("exposure") or {}
+    if exposure:
+        print(
+            f"  exposure -> visit={exposure.get('visit')} "
+            f"filter={exposure.get('physical_filter')} "
+            f"imgtype={exposure.get('imgtype')} "
+            f"detectors={exposure.get('detectors')}"
+        )
+    if note := body.get("note"):
+        print(f"  note: {note}")
+
+    if state == "DRY_RUN":
+        return state
+    if state == "SKIPPED":
+        print(f"  skipped: {body.get('reason')}")
+        return state
+
+    job_id = body["job_id"]
+    print(
+        f"  submit -> state={state} job_id={job_id} "
+        f"({time.monotonic() - t0:.3f}s)"
+    )
+    for label, timings in (
+        ("prepare", body.get("prepare_timings")),
+        ("submit", body.get("timings")),
+    ):
+        for key, value in (timings or {}).items():
+            print(f"    {label}.{key}: {value}")
+
+    client.report_result(host, headers, job_id, RESULT_WAIT_S, images)
+    return state
 
 
 def main() -> None:
@@ -90,19 +176,17 @@ def main() -> None:
         required=True,
         help="seconds between exposure *starts*. Interpreted as a cadence "
         "period, so processing time is subtracted: --delay 39 submits every "
-        "39 s regardless of how long each push takes. Use 0 for back-to-back.",
+        "39 s regardless of how long each fit takes. Use 0 for back-to-back.",
     )
     parser.add_argument("--host", default=endpoint.DEFAULT_HOST)
     parser.add_argument("--token", default=os.environ.get("DONUT_SERVER_TOKEN", ""))
     parser.add_argument(
-        "--wait", type=float, default=60.0, help="seconds to long-poll /result"
-    )
-    parser.add_argument(
         "-n",
         "--num-workers",
         type=int,
-        default=8,
-        help="cores the coordinator forks for each push",
+        default=None,
+        help="cores the coordinator forks for each exposure (default: the "
+        "server's own DONUT_SERVER_NUM_WORKERS)",
     )
     parser.add_argument(
         "--images",
@@ -111,10 +195,17 @@ def main() -> None:
         "<job_id>.parquet in the current directory",
     )
     parser.add_argument(
+        "--any-imgtype",
+        action="store_true",
+        help="fit calibration frames too, instead of letting the server "
+        "decline them. A frame with tracking disabled has no pointing, so this "
+        "currently fails at /prepare for exactly the frames it exists for.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="resolve and report every matched exposure without contacting the "
-        "server or reading any pixels",
+        help="have the server resolve and report every matched exposure "
+        "without preparing or fitting any of them",
     )
     # Same -c/-C semantics as donutClient.py: shared dest, so command-line
     # order is preserved and the last write to a field wins. Applied to every
@@ -141,11 +232,11 @@ def main() -> None:
 
     if args.delay < 0:
         parser.error("--delay must be >= 0")
-    if args.num_workers < 1:
+    if args.num_workers is not None and args.num_workers < 1:
         parser.error("-n/--num-workers must be >= 1")
-    # Checked before any resolution, so a remote run without a token fails now
-    # rather than after the first exposure's headers are read.
-    if not args.dry_run and not args.token and not client.host_is_loopback(args.host):
+    # Checked before the first request, so a remote run without a token fails
+    # now rather than after the first exposure.
+    if not args.token and not client.host_is_loopback(args.host):
         parser.error(
             f"--token is required for a remote --host ({args.host}); "
             "or set DONUT_SERVER_TOKEN"
@@ -159,57 +250,39 @@ def main() -> None:
     print(f"matched {len(directories)} exposure(s) in {args.root!r}")
 
     failures: list[str] = []
+    skipped: list[str] = []
     for index, directory in enumerate(directories, start=1):
         name = os.path.basename(directory)
         started = time.monotonic()
 
         print(f"\n=== [{index}/{len(directories)}] {name} ===")
         try:
-            source, image_type = daq.resolve_exposure_dir(directory)
-        except Exception as exc:
-            # Resolution failures are per-exposure too: one directory with a
-            # short sensor list should not end an overnight sequence.
-            print(f"  resolve failed: {exc}")
+            state = submit_exposure(
+                args.host,
+                args.token,
+                directory,
+                config_overrides=args.config_overrides,
+                num_workers=args.num_workers,
+                any_imgtype=args.any_imgtype,
+                dry_run=args.dry_run,
+                images=args.images,
+            )
+        except requests.HTTPError as exc:
+            # Deliberately broader than donutClient.py's --loop, which swallows
+            # only 409/503: here *any* single-exposure failure is worth
+            # surviving, since the sequence is the experiment and one bad
+            # directory should not end an overnight run.
+            print(f"  submit failed: {exc}")
             failures.append(name)
-            continue
-
-        if image_type.upper() not in ("CWFS", "SCIENCE", "ACQ"):
-            print(
-                f"  note: IMGTYPE {image_type!r} is not one of CWFS, SCIENCE, "
-                "ACQ, so treat its Zernikes with suspicion"
-            )
-
-        if args.dry_run:
-            print(
-                f"  would submit visit={source.visit} "
-                f"filter={source.physical_filter} "
-                f"detectors={sorted(source.handles)} "
-                f"calib_time={source.calib_time}"
-            )
+        except requests.RequestException as exc:
+            print(f"  request failed: {exc}")
+            failures.append(name)
+        except Exception as exc:
+            print(f"  failed: {type(exc).__name__}: {exc}")
+            failures.append(name)
         else:
-            try:
-                client.run_once(
-                    args.host,
-                    args.token,
-                    source,
-                    args.wait,
-                    images=args.images,
-                    config_overrides=args.config_overrides,
-                    num_workers=args.num_workers,
-                )
-            except requests.HTTPError as exc:
-                # Deliberately broader than donutClient.py's --loop, which
-                # swallows only 409/503: here *any* single-exposure failure is
-                # worth surviving, since the sequence is the experiment and a
-                # dark or an in-focus frame may well be refused on its merits.
-                print(f"  push failed: {exc}")
-                failures.append(name)
-            except requests.RequestException as exc:
-                print(f"  request failed: {exc}")
-                failures.append(name)
-            except Exception as exc:
-                print(f"  failed: {type(exc).__name__}: {exc}")
-                failures.append(name)
+            if state == "SKIPPED":
+                skipped.append(name)
 
         if index == len(directories):
             break
@@ -226,8 +299,10 @@ def main() -> None:
                 f"({elapsed:.1f}s elapsed > {args.delay:g}s) -- continuing immediately"
             )
 
-    done = len(directories) - len(failures)
+    done = len(directories) - len(failures) - len(skipped)
     print(f"\n{done}/{len(directories)} exposure(s) succeeded")
+    if skipped:
+        print(f"skipped: {', '.join(skipped)}")
     if failures:
         print(f"failed: {', '.join(failures)}")
         sys.exit(1)

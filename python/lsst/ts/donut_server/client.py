@@ -390,6 +390,19 @@ def run_once(
     for key, value in (push_data.get("timings") or {}).items():
         print(f"    {key}: {value}")
 
+    report_result(host, headers, job_id, wait, images)
+
+
+def report_result(
+    host: str, headers: dict, job_id: str, wait: float, images: bool = False
+) -> None:
+    """Fetch one job's result and print it: summary, table, optional stamps.
+
+    Shared by the two ways a job is started -- `run_once`'s `/prepare` +
+    `/push` and `scripts/run_sequence.py`'s `/submit` -- because everything
+    here is keyed on the job id, and so is the same whichever way the pixels
+    reached the server.
+    """
     t0 = time.monotonic()
     resp = requests.get(
         f"{host}/result/{job_id}", params={"wait": wait}, headers=headers, timeout=wait + 30

@@ -13,11 +13,13 @@ arrives in. Which is why it is the one that gets the fast machinery: parallel
 assembly, and `ingested_exposures` for the server-side path where there is no
 wire format at all.
 
-Two callers, on opposite sides of the wire. The coordinator's `/submit` and
-`/ingest` read the directory in-process and never build a wire format at all,
-which is what production does; `scripts/run_sequence.py` assembles here and
-pushes the pixels to `/prepare` + `/push`. It was originally
-`run_sequence.py`'s private code.
+One caller in production: the coordinator's `/submit` and `/ingest` read the
+directory in-process and never build a wire format at all. Both the camera's
+hook and `scripts/run_sequence.py` reach it that way, by sending a path rather
+than pixels, so neither of them imports this module. It was originally
+`run_sequence.py`'s private code, which is why `encoded_blob` and the parallel
+encoder below exist at all -- nothing but `scripts/bench_encode.py` and
+`tests/test_daq.py` calls them now.
 
 Layout it expects, one directory per exposure, as the replay tree is laid out:
 
@@ -62,7 +64,7 @@ import os
 # `exposure_codec` and so afw and numpy, and these only bind if they are set
 # before numpy loads. `bin.src/donutServer.py` sets the same five for the
 # service; `setdefault` makes the overlap harmless, and this copy is what
-# covers `scripts/run_sequence.py` and any other in-process importer.
+# covers `scripts/bench_encode.py` and any other in-process importer.
 #
 # Measured, and the reason `_assert_single_threaded_blas` below checks rather
 # than trusts: without this block, resolving one exposure directory takes the
