@@ -522,26 +522,24 @@ curl -si localhost:28861/config | head -20      # 200, X-Donut-Stale: 0
 
 Substitution now happens on the server, and `tests/test_replay.py` covers which exposure it picks —
 but nothing automated runs a substituted header all the way through assembly to a Zernike, so that
-is still checked by hand, which is also how to rehearse before BTS access. `scripts/replay_drill.py` builds a fake replayed
-exposure from a real one: it prints the expected answer, copies all 8 sensors into place, and prints
-the `/submit` call to make against them. It contacts no server itself, so it needs no host and no
-token.
+is still checked by hand, which is also how to rehearse before BTS access.
+`scripts/replay_drill.py` builds a fake replayed exposure from a real one — the same pixels with
+deliberately wrong metadata and `EMUIMAGE` stamped — then prints the expected answer and the
+`/submit` call to make against it. It contacts no server itself, so it needs no host and no token.
 
 ```zsh
 export DONUT_SERVER_REPLAY_DIR=$PWD/replay
-scripts/replay_drill.py                                  # first exposure in the tree
+scripts/replay_drill.py                               # first exposure in the tree
 scripts/replay_drill.py --source replay/MC_O_20260713_000250
-scripts/replay_drill.py --emuimage MC_O_99999999_000001  # deliberate mismatch
 ```
 
-The copy is one shot rather than drip-fed: counting sensors is the camera hook's own business, and
-it does it under a `flock`. What the drill is for is the part no test can reach — that substituted
-headers survive assembly and come back as the *original* exposure's Zernikes.
+What the drill is for is the part no test can reach — that substituted headers survive assembly and
+come back as the *original* exposure's Zernikes.
 
 The mangling is the point: the copy keeps the pixels but gets a different filter, a far-away
-pointing, another night's timestamps and `FOCUSZ 0`, so which set of headers won the run is visible
-in the answer. Stage 1 prints the expected answer before anything runs — compare against that rather
-than deciding afterwards whether the output looked about right.
+pointing and another night's timestamps, so which set of headers won the run is visible
+in the answer. The expected answer is printed before anything is submitted — compare against that
+rather than deciding afterwards whether the output looked about right.
 
 **Do not judge it by `DONE`.** A job fit against the mangled headers still succeeds; see
 [Replayed exposures at BTS](#replayed-exposures-at-bts) for why the service cannot tell on its own.
@@ -549,13 +547,12 @@ On `MC_O_20260713_000050`'s pixels a correctly substituted run is identifiable b
 `visit=2026071300050 filter=r_57 boresight=(215.5361, -10.1181)` and 8 of 8 groups fit, whatever the
 files are labelled.
 
-Four paths worth walking at least once, all verified:
+Three paths worth walking at least once, all verified:
 
 | run | expected |
 |---|---|
 | `DONUT_SERVER_REPLAY_DIR` set | the original's `r_57` and pointing, `EMUIMAGE ... -> loaded ...` agreeing |
 | unset | hard failure: `EMUIMAGE` says these are replayed pixels and there is nowhere to read the original from |
-| `--emuimage` naming an absent exposure | hard failure naming the directory that is not in the tree |
 | a real exposure (`replay/MC_O_*`) with the variable set | runs as production, nothing substituted — the standing-test-stand case |
 
 The dashboard is at <http://127.0.0.1:28861/dashboard> and needs no credential: the server exempts
