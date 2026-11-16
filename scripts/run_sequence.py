@@ -10,8 +10,10 @@ in-process, with `lsst.obs.lsst`.
 
 This script is the fixed-cadence, operator-driven producer: it walks a tree
 that is already complete and submits every matching exposure on a chosen
-period. The camera-triggered producer that waits for one exposure's files to
-land is `donutTrigger.py`; both read exposure directories through `daq.py`.
+period. Production does not go through a producer at all: the camera's
+per-file hook POSTs the directory to `/submit` and the server reads it (see
+`scripts/camera_hook.sh`), so this is the only caller left that assembles
+pixels here and pushes them.
 
 Layout it expects, one directory per exposure, as the replay tree is laid out:
 

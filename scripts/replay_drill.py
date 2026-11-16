@@ -1,51 +1,49 @@
 #!/usr/bin/env python
-"""Rehearse a BTS replay locally, by faking one and feeding it to the trigger.
+"""Rehearse a BTS replay locally, by faking one and submitting it.
 
-The camera trigger has no server-side half to test, so the only way to exercise
-it is to put files in a directory and watch. This builds that directory from a
-real exposure: **same pixels, deliberately wrong metadata**, with `EMUIMAGE`
-stamped so the trigger can find the original.
+Builds an exposure directory from a real exposure: **same pixels, deliberately
+wrong metadata**, with `EMUIMAGE` stamped so the server can find the original.
+Then it prints the `/submit` call to make against it.
 
 The mangling is the point. Copying an exposure unmodified would pass whether or
 not substitution works, because the live headers and the substituted ones would
-be identical -- so the test would prove nothing. Here the filter, pointing, time
-and focus are all moved somewhere obviously wrong, and the trigger is correct
-only if it reports the *original* values back.
+be identical -- so the drill would prove nothing. Here the filter, pointing,
+time and focus are all moved somewhere obviously wrong, and the service is
+correct only if it reports the *original* values back.
 
 That matters more than it sounds: an unsubstituted replay does not fail. It
 comes back DONE with a plausible-looking fit, because every cross-check
-downstream tests consistency rather than truth (see `trigger.py`). So this
-script prints the expected answer before anything runs, and you compare against
-that rather than deciding afterwards whether the output looked about right.
+downstream tests consistency rather than truth (see `replay`). So this script
+prints the expected answer before anything runs, and you compare against that
+rather than deciding afterwards whether the output looked about right.
 
     scripts/replay_drill.py                                  # first exposure in the tree
     scripts/replay_drill.py --source replay/MC_O_20260713_000250
     scripts/replay_drill.py --emuimage MC_O_99999999_000001  # deliberate mismatch
-    scripts/replay_drill.py --no-pause                       # unattended
 
-Two steps. The first builds the fake exposure and prints both the expected
-answer and the trigger command to run in another terminal; then it waits on
-Enter, and copies all 8 sensors in.
-
-The copy is one shot rather than drip-fed: whether the trigger counts sensors up
-to 8 and waits for their sizes to settle is the polling logic's own business, and
-`tests/test_trigger.py` covers it directly. What this drill is for is the part no
-test can reach -- that substituted headers survive assembly and come back as the
-original exposure's Zernikes.
+Contacts no server itself, so it needs no host and no token: it leaves a
+directory and prints the request. What it is for is the part no test can reach
+-- that substituted headers survive assembly and come back as the original
+exposure's Zernikes.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 import time
 
 from lsst.ts.donut_server import client
 from lsst.ts.donut_server import daq
+from lsst.ts.donut_server import endpoint
 from lsst.ts.donut_server import replay
-from lsst.ts.donut_server import trigger
+
+# Pulled off a DAQ filename to name the sensor in this drill's own progress
+# lines. What detector a file *is* gets read from its header, in `daq`.
+_SENSOR_RE = re.compile(r"_(R\d\d_SW\d)\.fits$")
 
 # Where the fake replay's metadata is moved to. Far from any real pointing, in a
 # filter the service *does* have calibs for, and at a different epoch. The filter
@@ -61,6 +59,12 @@ FAKE_DATE_END = "2026-10-23T01:00:30.000"
 FAKE_MJD_BEG = 61336.041666666664
 FAKE_MJD_END = 61336.04201388889
 FAKE_FOCUSZ = 0.0
+
+
+def sensor_of(path: str) -> str:
+    """The `R00_SW0`-style sensor in a DAQ filename, for progress reporting."""
+    m = _SENSOR_RE.search(os.path.basename(path))
+    return m.group(1) if m else os.path.basename(path)
 
 
 def pick_fake_filter(original: str) -> str:
@@ -95,7 +99,7 @@ def build_fake_exposure(source: str, staging: str, emuimage: str) -> dict:
     """Write a mangled copy of `source` into `staging`. Returns a report dict.
 
     One `.fits` plus one `.json` sidecar per corner sensor, the sidecar being
-    required by the trigger's own completeness check. The sidecar is written from
+    required beside every corner-sensor file. The sidecar is written from
     the rewritten header, so the two agree -- the real camera's script derives
     one from the other, and a drill whose sidecar disagreed with its FITS would
     be testing a situation that cannot occur.
@@ -114,7 +118,7 @@ def build_fake_exposure(source: str, staging: str, emuimage: str) -> dict:
         name = os.path.basename(path)
         # Keep the sensor suffix, swap the exposure identity, so the filenames
         # look like what BTS would have written.
-        sensor = trigger.sensor_of(path)
+        sensor = sensor_of(path)
         out_name = f"{FAKE_OBSID}_{sensor}.fits"
         out = os.path.join(staging, out_name)
 
@@ -163,16 +167,6 @@ def build_fake_exposure(source: str, staging: str, emuimage: str) -> dict:
     }
 
 
-def pause(message: str, enabled: bool) -> None:
-    if not enabled:
-        print(f"  ({message} -- --no-pause, continuing)")
-        return
-    try:
-        input(f"\n>>> {message} ")
-    except EOFError:
-        print("\n(stdin closed, continuing)")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -199,13 +193,8 @@ def main() -> int:
     parser.add_argument(
         "--target",
         default=None,
-        help="the directory the trigger polls, copied into once you hit Enter "
+        help="the directory to submit, copied into once the fake is built "
         f"(default: $TMPDIR/replay_drill/{FAKE_OBSID})",
-    )
-    parser.add_argument(
-        "--no-pause",
-        action="store_true",
-        help="do not wait for Enter between stages, for an unattended run",
     )
     parser.add_argument(
         "--keep",
@@ -268,7 +257,7 @@ def main() -> int:
     )
     print()
     if expected_mismatch:
-        print("  EXPECT: the trigger FAILS, naming the absent replay directory")
+        print("  EXPECT: the submit FAILS, naming the absent replay directory")
         print(f"          {os.path.join(args.replay_dir, emuimage)!r}")
     else:
         print("  EXPECT, with the replay dir set -- these are the ORIGINAL values:")
@@ -282,37 +271,31 @@ def main() -> int:
         print("          the original's headers from.")
 
     print("\n" + "=" * 72)
-    print("Run this in another terminal, then come back here and hit Enter")
-    print("=" * 72)
-    print(f"bin/donutTrigger.py {target} --timeout 60")
-    print(f"\n  The server needs {replay.REPLAY_DIR_VAR}="
-          f"{os.path.abspath(args.replay_dir)}")
-    print("  exported where donutServer.py runs -- substitution is server-side,")
-    print("  so setting it in the trigger's shell does nothing. Unset it there")
-    print("  to see a replay refused for having nowhere to read originals from.")
-    print("  (--dry-run resolves and reports without submitting.)")
-
-    pause("Enter once the trigger is polling, to start copying", not args.no_pause)
-
-    print("\n" + "=" * 72)
     print(f"STEP 2: copying {len(report['written'])} sensors")
     print("=" * 72)
     for index, path in enumerate(sorted(report["written"]), start=1):
         for suffix in (".fits", ".json"):
             src = path[: -len(".fits")] + suffix
             shutil.copy2(src, os.path.join(target, os.path.basename(src)))
-        print(
-            f"  [{index}/{len(report['written'])}] "
-            f"{trigger.sensor_of(path)} landed"
-        )
+        print(f"  [{index}/{len(report['written'])}] {sensor_of(path)} landed")
 
-    print("\nall sensors delivered; the trigger should now resolve and submit.")
-    print("Check its output against the EXPECT block above.")
+    print("\n" + "=" * 72)
+    print("Submit it, and check the reply against the EXPECT block above")
+    print("=" * 72)
+    print(f"curl -sS -X POST http://127.0.0.1:{endpoint.DEFAULT_PORT}/submit \\")
+    print("  -H 'Content-Type: application/json' \\")
+    print(f"  --data '{json.dumps({'directory': target})}'")
+    print(f"\n  The server needs {replay.REPLAY_DIR_VAR}="
+          f"{os.path.abspath(args.replay_dir)}")
+    print("  exported where donutServer.py runs -- substitution is server-side,")
+    print("  so setting it in this shell does nothing. Unset it there to see a")
+    print("  replay refused for having nowhere to read originals from.")
+    print('  (Add "dry_run": true to resolve and report without submitting.)')
 
     if not args.keep:
         shutil.rmtree(staging, ignore_errors=True)
         print(f"\n(removed staging {staging}; --keep to retain. The target "
-              f"{target} is left for the trigger.)")
+              f"{target} is left in place to submit.)")
     return 0
 
 

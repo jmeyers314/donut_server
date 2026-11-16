@@ -213,8 +213,7 @@ JOBS: dict[str, JobRecord] = {}
 # {visit: job_id} for exposures `/submit` has accepted, so a camera hook that
 # fires twice submits once. Only that endpoint maintains it: `/prepare` does not
 # know the visit (it is given a pointing, not a directory) and a producer
-# driving `/prepare` + `/push` owns its own deduplication, which is what the
-# trigger's state-dir marker was for.
+# driving `/prepare` + `/push` owns its own deduplication.
 #
 # Unbounded, like JOBS, and for the same reason it is acceptable: one small
 # integer and a uuid per exposure, against the ~200 KB of parquet each JOBS
@@ -1926,10 +1925,9 @@ async def submit(body: dict, num_workers: int | None = None):
     # here rather than in a coordinator because there is one front end and N
     # flights, so a per-flight dict would not see its sibling's submissions.
     #
-    # The trade against the trigger's old O_CREAT|O_EXCL marker is that this is
-    # lost on a front-end restart. That is the right way round for a guard
-    # against a *double firing of the same hook*, which is a seconds-apart
-    # event; surviving a restart would instead mean an exposure could never be
+    # Lost on a front-end restart, which is the right way round for a guard
+    # against a *double firing of the same hook*, a seconds-apart event;
+    # surviving a restart would instead mean an exposure could never be
     # resubmitted after one.
     visit = found.get("visit")
     if visit is not None and not resubmit:

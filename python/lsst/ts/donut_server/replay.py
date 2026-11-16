@@ -31,20 +31,15 @@ That last case is what lets the variable be part of a standing test-stand
 setup: production is the marker-absent path whether or not some tree is
 configured, so the two deployments need not differ in anything but their data.
 
-This module exists because *both* sides need it. It began in `trigger.py`,
-where the producer resolved the exposure before pushing pixels; the
-coordinator's `/ingest` path reads the files itself and so has to do the same
-substitution, on the server, from the same two rules (see `daq`'s module
-docstring):
+Its own module because the substitution has to be describable on its own
+terms: it rewrites what an exposure claims to be, and the two rules that keep
+that safe belong next to each other rather than inside the assembly path that
+obeys them (see `daq`'s module docstring):
 
 - the map is keyed by **detector name**, and the name is read from the *live*
   file, so a substituted header never decides which detector we are looking at;
 - `detector_num` likewise comes from the live header, because it indexes
   cameraGeom for the amp layout the pixels are in.
-
-Needs the stack (it reads FITS headers), which is why it is not in `trigger.py`
--- that module stays importable without `lsst.afw` so the camera's hook pays
-only for Python startup.
 """
 from __future__ import annotations
 
@@ -53,9 +48,10 @@ from typing import Any
 
 from lsst.ts.donut_server import daq
 
-# The sensor the camera's per-file hook fires on: the only one guaranteed to be
-# on disk when we start, and so the one the substitution report is drawn from.
-TRIGGER_SENSOR = "R00_SW0"
+# The sensor the substitution report is drawn from. One sensor's cards stand
+# for the exposure's -- `resolve_exposure_dir` refuses a directory whose
+# sensors disagree -- and a report over all 8 would be eight copies of one.
+REPORT_SENSOR = "R00_SW0"
 
 # The emulator's record of which original exposure it replayed. Absent on real
 # camera files, which is what makes its presence the switch for substitution.
@@ -166,7 +162,7 @@ def replay_headers(replay_dir: str, exposure: str) -> dict:
 
 
 def read_live_headers(paths: list[str]) -> dict:
-    """{detector name: primary header} for the polled directory.
+    """{detector name: primary header} for the exposure's own files.
 
     Keyed by the header's own `RAFTBAY`/`CCDSLOT` rather than by filename, the
     same way `replay_headers` keys the substitutes -- which is what lets the two
@@ -203,8 +199,9 @@ def substitution_report(live, substituted) -> list[str]:
     produces a DONE job whose summary looks reasonable -- the cross-checks
     downstream test consistency rather than truth -- so these lines are the
     *only* place the substitution is visible for review. Returned rather than
-    logged so each caller can put them where its own output goes: the trigger
-    prints them on stdout, the coordinator logs them.
+    logged so each caller can put them where its own output goes: the
+    coordinator logs them against the job, `scripts/replay_drill.py` prints
+    them beside the answer it expects.
 
     `EMUIMAGE` is reported on its own line above the table, against the
     substituted OBSID, because it does not belong in a live-vs-substituted
@@ -287,10 +284,10 @@ def substituted_headers(directory: str, report=None) -> dict[str, Any] | None:
 
     headers = replay_headers(replay_dir, exposure)
     if report is not None:
-        # Reported off the trigger sensor, which every exposure has and whose
-        # cards are the ones quoted in the module docstring.
+        # Reported off one sensor, whose cards are the ones quoted in the
+        # module docstring.
         for line in substitution_report(
-            live.get(TRIGGER_SENSOR, {}), headers[TRIGGER_SENSOR]
+            live.get(REPORT_SENSOR, {}), headers[REPORT_SENSOR]
         ):
             report(line)
     return headers

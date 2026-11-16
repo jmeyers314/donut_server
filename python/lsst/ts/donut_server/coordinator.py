@@ -1770,9 +1770,7 @@ def run_ingest(
     if headers is None:
         # Logged, not discarded: these lines are the only place a replay
         # matched to the wrong original is visible, because every cross-check
-        # downstream tests consistency rather than truth. They used to land in
-        # the trigger's own output; on this path the resolution happens here, so
-        # this log is where they belong.
+        # downstream tests consistency rather than truth.
         headers = replay.substituted_headers(
             directory, report=lambda line: _log.info("job %s: %s", job_id, line)
         )

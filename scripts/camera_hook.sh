@@ -8,8 +8,8 @@
 #
 # Everything above the "donut server" block is the pre-existing script, which
 # counts the 8 corner-sensor files of one exposure and detects completion. The
-# block at the bottom is the trigger: it replaces bin/donutTrigger.py entirely,
-# since the lock here already guarantees what that script's polling was for.
+# block at the bottom submits it: one curl, no Python, and no polling, because
+# the lock here already establishes that all 8 files have arrived.
 #
 # Nothing in here reads the environment. The camera's environment is not ours
 # to assume, so the two things that could come from it -- where the server is,

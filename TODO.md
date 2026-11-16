@@ -2,15 +2,25 @@
 
 Scratch list, arbitrary order.
 
-- [ ] **Eliminate `donutTrigger.py`** — run production through the camera's
-      per-file script instead. `scripts/camera_hook.sh` is the deployed shape,
-      and it does the whole job with a single `curl` to `/submit`, no Python
-      startup and no polling (the hook's own `flock` already guarantees what the
-      polling was for).
+- [ ] **Rename `/ingest`** — it suggests `butler ingest-raws`, registering files
+      into a repo, which is not what it does: it touches no registry and writes
+      nothing. The in-memory butler it appears to name is built in `run_job`,
+      which `/push` reaches too, so the name does not even distinguish the two
+      paths. What it actually means is pixels by reference rather than by value,
+      so `/pull` would be both accurate and symmetric with `/push`.
 
-      What `donutTrigger.py` still uniquely offers, and so has to be accounted
-      for before it goes: `--dry-run` against a new deployment, `--wait`, and the
-      poll itself for any caller that is *not* the camera hook.
+      Not just the route: `cmd: "ingest"` on the coordinator wire, `run_ingest`,
+      and the `ingest_s` timing key, which the dashboard charts and job records
+      may hold.
+
+- [ ] **A producer CLI for `/submit`** — deleting `donutTrigger.py` left no
+      ergonomic way to submit one directory by hand; it is a `curl` with up to
+      six optional JSON fields. Belongs in `donutClient.py` as a mode, which
+      already has the token handling and the `-c`/`-C` override parsing.
+
+      Also gone with it: the poll. Nothing needs it today, since the camera's
+      hook counts sensors under its own `flock`, but pointing a producer at a
+      directory that is still filling is the BTS scenario to remember.
 
 - [ ] **Make the calib backend exclusively butler** — drop `raw/` and `calib/`
       and the `files` backend with them: `DONUT_SERVER_CALIB_DIR`,

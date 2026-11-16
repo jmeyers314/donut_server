@@ -1,11 +1,5 @@
 """Replay metadata substitution: which exposure, and from where.
 
-Separate from `tests/test_trigger.py` because importing `replay` reaches the
-stack (it reads FITS headers), which that module's tests deliberately do not --
-`trigger` stays importable without `lsst.afw` so the camera's hook pays only
-for Python startup, and a test that imported it there would not notice if that
-broke.
-
 The header-reading half is not covered here; it needs real files and lives in
 `tests/test_daq.py`. What is covered is the decision logic, which plain dicts
 exercise completely.
@@ -171,9 +165,9 @@ class TestSubstitutionRouting:
     def test_the_report_goes_wherever_the_caller_sends_it(
         self, stubbed, tmp_path, monkeypatch
     ):
-        """Returned as lines rather than logged, because the trigger prints them
-        on stdout and the coordinator logs them -- and they are the only place
-        a wrong substitution is visible for review."""
+        """Returned as lines rather than logged, because the coordinator logs
+        them against the job and `replay_drill` prints them -- and they are the
+        only place a wrong substitution is visible for review."""
         monkeypatch.setenv(replay.REPLAY_DIR_VAR, str(tmp_path))
         lines = []
 

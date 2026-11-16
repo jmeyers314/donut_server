@@ -4,11 +4,15 @@ One definition, because the port otherwise appears in four argparse defaults
 across three processes plus the docs, and a drift between any two of them is a
 connection refused with no hint as to which side is wrong.
 
-Stdlib-only, and imports nothing from this package. That is what lets
-`trigger.py` use it: that module's contract is that the camera's hook pays only
-for Python startup, so it cannot reach `client` -- the module where a default
-host would otherwise naturally live -- without pulling `requests` and
-`lsst.afw` in behind it.
+Stdlib-only, and imports nothing from this package, so importing it costs
+nothing and cannot pull `requests` or `lsst.afw` in behind it -- which is why a
+default host lives here rather than in `client`, where it would otherwise
+naturally go.
+
+`scripts/camera_hook.sh` is the one place the port is duplicated rather than
+imported: it is bash on the camera node and reads no environment by design, so
+it carries the number as a constant and a comment saying to keep the two in
+step.
 
 28861 rather than 8000: the 8000s collide with everything (8000 is Django's
 default and `http-alt` in practice), and a port *above* 32768 is worse than it

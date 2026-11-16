@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""A/B the trigger's `encode` step: serial vs. parallel, and split the serial path.
+"""A/B the push path's `encode` step: serial vs. parallel, and split the serial.
 
 `client.run_once` reports encode as one number ("encode -> ... 1.347s"). This
 takes it apart: the serial path's load/encode/pack split per detector, then the
@@ -22,7 +22,7 @@ import os
 import time
 
 # Before anything reaches numpy, so the parallel path can actually fork -- the
-# same block `bin.src/donutTrigger.py` has, for the same reason. Without it
+# same block `bin.src/donutServer.py` has, for the same reason. Without it
 # `daq.encoded_blob` declines and silently measures the serial fallback twice.
 for _var in (
     "OMP_NUM_THREADS",

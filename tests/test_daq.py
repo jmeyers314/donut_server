@@ -31,7 +31,7 @@ from lsst.ts.donut_server import daq
 # live OpenMP threads.
 #
 # Hence a skip rather than a workaround, with the fix in the reason. The
-# production entry points (`bin.src/donutTrigger.py`, and `daq.py` itself for
+# production entry points (`bin.src/donutServer.py`, and `daq.py` itself for
 # in-process callers) set these before anything reaches numpy, so this is a
 # pytest-only wrinkle, not something a deployment has to think about.
 _UNCLAMPED = None
@@ -289,9 +289,8 @@ def test_a_worker_that_dies_without_reporting_times_out(paired, monkeypatch):
     killer, segfault in cfitsio, stray killpg -- never posts a result and the
     parent blocks indefinitely (verified: a SIGKILLed worker hangs `map` with
     no timeout). An *exception* in a worker is harmless by comparison, since
-    `_encode_one` turns those into return values. Nothing supervises a detached
-    trigger, so a hang here is an exposure that never finishes and never says
-    why.
+    `_encode_one` turns those into return values. The coordinator's command
+    loop is serial, so a hang here stalls every later command on that flight.
     """
     source, _ = paired
     monkeypatch.setattr(daq, "_encode_one", _suicidal_worker)

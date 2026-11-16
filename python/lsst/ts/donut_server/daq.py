@@ -8,21 +8,21 @@ whole-CCD `ExposureF` the task expects. That is this module, in-process, with
 This is a distinct path, not a stopgap for one. The alternative shapes are a
 producer that ships assembled exposures (`client.resolve_from_files`) and a
 butler that has already ingested them (`client.resolve_from_butler`, i.e.
-`donutClient.py -b`); all three exist, and this is the one the camera actually
-drives. Which is why it is the one that gets the fast machinery: parallel
+`donutClient.py -b`); all three exist, and this is the one the camera's data
+arrives in. Which is why it is the one that gets the fast machinery: parallel
 assembly, and `ingested_exposures` for the server-side path where there is no
 wire format at all.
 
-Three callers, on both sides of the wire: the fixed-cadence walker in
-`scripts/run_sequence.py` and the camera-triggered `trigger.py` both assemble
-here and push the pixels, while the coordinator's `/ingest` reads the directory
-itself and skips the push entirely. It was originally `run_sequence.py`'s
-private code.
+Two callers, on opposite sides of the wire. The coordinator's `/submit` and
+`/ingest` read the directory in-process and never build a wire format at all,
+which is what production does; `scripts/run_sequence.py` assembles here and
+pushes the pixels to `/prepare` + `/push`. It was originally
+`run_sequence.py`'s private code.
 
 Layout it expects, one directory per exposure, as the replay tree is laid out:
 
     <dir>/MC_O_20260713_000050_R00_SW0.fits
-         /MC_O_20260713_000050_R00_SW0.json          # not read; see trigger.py
+         /MC_O_20260713_000050_R00_SW0.json          # not read
          /MC_O_20260713_000050_R00_SG0_guider.fits   # ignored
 
 Only `_R??_SW?.fits` is read: SG* are guider sensors, not corner wavefront
@@ -36,7 +36,7 @@ Every header read goes through `read_header`, and `resolve_exposure_dir` accepts
 a `headers` map that replaces the on-disk primary header per detector. That one
 seam is what lets a BTS replay -- which reproduces the pixels but not the
 metadata -- be processed against the metadata the pixels were actually taken
-with. See `trigger.py` for why that matters and where the map comes from.
+with. See `replay` for why that matters and where the map comes from.
 
 Two rules make the substitution safe, and both are load-bearing:
 
@@ -60,8 +60,8 @@ import os
 #
 # It has to be *here*, above the `client` import: that reaches
 # `exposure_codec` and so afw and numpy, and these only bind if they are set
-# before numpy loads. `bin.src/donutTrigger.py` sets the same five for the
-# camera's hook; `setdefault` makes the overlap harmless, and this copy is what
+# before numpy loads. `bin.src/donutServer.py` sets the same five for the
+# service; `setdefault` makes the overlap harmless, and this copy is what
 # covers `scripts/run_sequence.py` and any other in-process importer.
 #
 # Measured, and the reason `_assert_single_threaded_blas` below checks rather
@@ -80,7 +80,6 @@ for _var in (
 import contextlib
 import glob
 import multiprocessing as mp
-import signal
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any
@@ -249,8 +248,8 @@ def _camera():
 
 
 # A corner sensor to hang the warm-up stub on. Any detector would do -- the
-# translator discovery it provokes is not detector-specific -- so this is R00_SW0
-# simply because it is the one the camera's hook fires on.
+# translator discovery it provokes is not detector-specific -- so this is just
+# the first of the eight.
 _WARMUP_DETECTOR = 191
 
 # Enough of an LSSTCam primary header for `ObservationInfo` to pick a translator
@@ -512,21 +511,8 @@ def _assert_single_threaded_blas() -> None:
             "lsst.ts.donut_server.daq, so the thread-limit env vars never "
             "bound, and forking with live OpenMP threads is undefined "
             "behaviour. Export them before starting the process (see "
-            "bin.src/donutTrigger.py)."
+            "bin.src/donutServer.py)."
         )
-
-
-def _child_init() -> None:
-    """Make a fork worker safe to be one. Runs once per child, before any task.
-
-    `trigger.arm_watchdog` installs a SIGALRM handler that raises `TimeoutError`
-    from whatever frame happens to be executing. A fork clears the pending alarm
-    but *inherits the handler*, so without this a child could raise out of the
-    middle of `multiprocessing`'s own queue machinery. The parent keeps its
-    watchdog; the children must not have one, since they are bounded by the
-    parent's pool teardown instead.
-    """
-    signal.signal(signal.SIGALRM, signal.SIG_DFL)
 
 
 # Set by `_fan_out` in the parent before forking, read by the children through
@@ -849,8 +835,9 @@ def _fan_out(
     segfault in cfitsio, a stray killpg -- leaves it blocked forever (verified:
     a SIGKILLed worker hangs `map` indefinitely). An exception in a worker is
     fine, and both workers convert those to return values anyway; it is only
-    death that strands the parent. Nothing supervises a detached trigger, so
-    waiting forever means an exposure that never completes and never says why.
+    death that strands the parent. The coordinator's command loop is serial, so
+    a parent blocked here does not merely lose this exposure: it stalls every
+    later command on that flight, with nothing to say why.
     """
     # Read at call time, not bound as a default, so the module global stays the
     # one place to change it (and tests can shorten it).
@@ -861,7 +848,7 @@ def _fan_out(
 
     workers = min(n_workers or len(det_ids), len(det_ids))
     ctx = mp.get_context("fork")
-    pool = ctx.Pool(workers, initializer=_child_init)
+    pool = ctx.Pool(workers)
     try:
         results = pool.map_async(worker, det_ids).get(timeout=timeout)
     except mp.TimeoutError as exc:
@@ -872,12 +859,11 @@ def _fan_out(
     except Exception as exc:
         raise ParallelEncodeUnavailable(f"fork pool failed: {exc}") from exc
     finally:
-        # terminate() before join(), always: if the parent's own SIGALRM
-        # watchdog fired while we were in map(), a bare join() on a pool with
-        # live children would block until that alarm's TimeoutError had nowhere
-        # left to go. Nothing supervises a detached trigger, so a child left
-        # running here would be a permanent orphan holding a core. This is also
-        # what reaps the survivors when the timeout above fires.
+        # terminate() before join(), always: a bare join() waits for children
+        # to finish on their own, which is exactly what the timeout above has
+        # just established will not happen. This is what reaps the survivors,
+        # and a child left running would hold a core in the coordinator for the
+        # life of the process.
         pool.terminate()
         pool.join()
 
