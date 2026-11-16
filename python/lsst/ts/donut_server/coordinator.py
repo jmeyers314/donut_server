@@ -1779,10 +1779,19 @@ def run_ingest(
     )
     resolve_s = time.perf_counter() - t0
 
+    # Both halves run on the same number, resolved once here rather than each
+    # applying its own default -- otherwise an unset `num_workers` means
+    # NUM_WORKERS for the fit but one worker per sensor for the assembly, and
+    # lowering DONUT_SERVER_NUM_WORKERS on a small host would not reach the
+    # fork pool at all. Capped for the assembly because there are only ever
+    # EXPECTED_SENSORS files to read, so more processes than that cannot help.
+    workers = num_workers or NUM_WORKERS
     t0 = time.perf_counter()
-    with daq.ingested_exposures(source, num_workers) as exposures:
+    with daq.ingested_exposures(
+        source, min(workers, daq.EXPECTED_SENSORS)
+    ) as exposures:
         ingest_s = time.perf_counter() - t0
-        result = run_job(job_id, exposures, num_workers)
+        result = run_job(job_id, exposures, workers)
 
     timings = result["timings"]
     timings["resolve_s"] = resolve_s

@@ -13,13 +13,11 @@ arrives in. Which is why it is the one that gets the fast machinery: parallel
 assembly, and `ingested_exposures` for the server-side path where there is no
 wire format at all.
 
-One caller in production: the coordinator's `/submit` and `/ingest` read the
-directory in-process and never build a wire format at all. Both the camera's
-hook and `scripts/run_sequence.py` reach it that way, by sending a path rather
-than pixels, so neither of them imports this module. It was originally
-`run_sequence.py`'s private code, which is why `encoded_blob` and the parallel
-encoder below exist at all -- nothing but `scripts/bench_encode.py` and
-`tests/test_daq.py` calls them now.
+One caller: the coordinator's `/submit` and `/ingest` read the directory
+in-process, assemble the pixels into shared memory and hand the task the
+exposures directly, so no wire format is involved at any point. Both the
+camera's hook and `scripts/run_sequence.py` reach it that way, by sending a
+path rather than pixels, so neither of them imports this module.
 
 Layout it expects, one directory per exposure, as the replay tree is laid out:
 
@@ -55,7 +53,7 @@ from __future__ import annotations
 import os
 
 # Before importing anything that reaches numpy: keep BLAS/OpenMP
-# single-threaded, because `build_parts_parallel` forks. This is for fork
+# single-threaded, because `ingested_exposures` forks. This is for fork
 # safety, not speed -- A/B'd on the serial assembly loop at 1.92 s either way --
 # but this numpy links OpenBLAS built with USE_OPENMP, and forking with live
 # OpenMP threads is undefined behaviour.
@@ -63,8 +61,8 @@ import os
 # It has to be *here*, above the `client` import: that reaches
 # `exposure_codec` and so afw and numpy, and these only bind if they are set
 # before numpy loads. `bin.src/donutServer.py` sets the same five for the
-# service; `setdefault` makes the overlap harmless, and this copy is what
-# covers `scripts/bench_encode.py` and any other in-process importer.
+# service, which is the only deployment that forks here; `setdefault` makes the
+# overlap harmless, and this copy covers any other in-process importer.
 #
 # Measured, and the reason `_assert_single_threaded_blas` below checks rather
 # than trusts: without this block, resolving one exposure directory takes the
@@ -90,7 +88,6 @@ from lsst.daf.base import PropertyList
 
 from lsst.ts.donut_server import client
 from lsst.ts.donut_server import exposure_codec
-from lsst.ts.donut_server import protocol
 from lsst.ts.donut_server import tmpfs
 
 if TYPE_CHECKING:
@@ -102,14 +99,10 @@ SW_PATTERN = "*_R??_SW?.fits"
 
 EXPECTED_SENSORS = 8
 
-# Forced-serial escape hatch, for A/B measurement on a production box and to
-# have something to reach for if the fork pool ever misbehaves in the field.
-SERIAL_ENCODE_VAR = "DONUT_SERVER_SERIAL_ENCODE"
-
 # How long to wait for the eight workers before concluding one died without
 # reporting. Deliberately generous against how long they actually take --
-# this is the backstop for a worker that is *gone*, not a cadence control,
-# and the serial fallback it triggers is not free either. See `_fan_out`.
+# this is the backstop for a worker that is *gone*, not a cadence control.
+# See `_fan_out`.
 FAN_OUT_TIMEOUT_S = 120.0
 
 
@@ -541,69 +534,20 @@ def _worker_open_block() -> Any:
     return block
 
 
-def _encode_one(det_id: int):
-    """Write one detector's pixels into the shared block; return its meta pickle.
 
-    Runs in a fork worker. The pixels -- 37.75 MB -- go straight into the block
-    at their final wire offset, so they are never pickled and the parent never
-    concatenates them. The meta pickle is ~827 kB and comes back the ordinary
-    way, which measures as a rounding error and is not worth a second region
-    in the layout.
-
-    Errors come back as a value rather than an exception, so one unreadable
-    sensor names itself instead of surfacing as a `multiprocessing` traceback
-    with no detector in it.
-    """
-    try:
-        import numpy as np
-
-        handle = _WORKER_CONTEXT["handles"][det_id]
-        offset, byte_count, shape = _WORKER_CONTEXT["slots"][det_id]
-
-        expected = shape[0] * shape[1] * np.dtype(exposure_codec.IMG_DTYPE).itemsize
-        if expected != byte_count:
-            raise RuntimeError(
-                f"detector {det_id} slot is {byte_count} bytes but its shape "
-                f"{shape} needs {expected}"
-            )
-
-        block = _worker_open_block()
-        view = memoryview(block.buf)
-        try:
-            # The assembled image is written *through* this view into the
-            # parent's block, so it is never materialized in this child's heap
-            # and never pickled back.
-            target = np.ndarray(
-                shape, dtype=exposure_codec.IMG_DTYPE, buffer=view, offset=offset
-            )
-            _array, bbox, detector = _assemble_image(handle, out=target)
-            del target, _array
-        finally:
-            view.release()
-
-        # `bbox` explicitly: the stub is 1x1, and it is this bbox the receiver
-        # allocates the full image from.
-        meta = exposure_codec.encode_meta(
-            _build_stub(handle, bbox, detector), bbox=bbox
-        )
-        return det_id, detector.getName(), meta, None
-    except Exception as exc:  # noqa: BLE001 -- reported, not raised; see docstring
-        return det_id, None, None, f"{type(exc).__name__}: {exc}"
-
-
-def _assemble_one(det_id: int):
+def _assemble_one(det_id: int) -> tuple[int, str | None]:
     """Write one detector's pixels into the shared block. Returns no pixels.
 
-    `_encode_one`'s sibling for the server-side ingest path, and deliberately
-    thinner: it returns only the detector id, because the consumer is in the
-    same process as the parent and can build the metadata itself from the header
-    it already holds. `_encode_one` has to pickle a ~827 kB stub back because its
-    consumer is across an HTTP boundary; here that would cost 0.037 s per
-    detector to *unpickle* against 0.0135 s to rebuild, so this does not send one.
+    Runs in a fork worker. The assembled image -- 37.75 MB -- is written
+    *through* a view onto the parent's block, so it is never materialized in
+    this child's heap and never pickled back. No metadata comes back either:
+    the parent holds the same header and rebuilding a stub costs 0.0135 s
+    against 0.037 s merely to unpickle one.
 
-    Errors come back as a value for the same reason as `_encode_one`'s: one
-    unreadable sensor should name itself rather than surface as a
-    `multiprocessing` traceback with no detector in it.
+    Returns `(det_id, error)`, with `error` None on success. Errors come back
+    as a value rather than an exception so that one unreadable sensor names
+    itself, instead of surfacing as a `multiprocessing` traceback with no
+    detector in it.
     """
     try:
         import numpy as np
@@ -629,9 +573,9 @@ def _assemble_one(det_id: int):
         finally:
             view.release()
 
-        return det_id, None, None, None
+        return det_id, None
     except Exception as exc:  # noqa: BLE001 -- reported, not raised; see docstring
-        return det_id, None, None, f"{type(exc).__name__}: {exc}"
+        return det_id, f"{type(exc).__name__}: {exc}"
 
 
 def _image_shape(detector) -> tuple[int, int]:
@@ -661,170 +605,17 @@ class ParallelEncodeUnavailable(RuntimeError):
     """
 
 
-def build_parts_parallel(source, n_workers: int | None = None):
-    """Encode one exposure into a shared block, eight detectors at a time.
-
-    Returns `(block, view, total_bytes)` -- the caller POSTs `view[:total_bytes]`
-    and is responsible for releasing the view and closing *and unlinking* the
-    block when the push is done. `encoded_blob` is the context manager that does
-    that; prefer it.
-
-    The serial path this replaces reads, assembles and encodes each sensor in
-    turn and then concatenates the lot, which is almost entirely cfitsio
-    parsing and per-amp array handling rather than I/O -- cold and warm
-    re-reads differ little, and a bare read of one amp file is a rounding error
-    against parsing it. Threads do not help, because the amp reads hold the GIL
-    and a thread pool stops scaling after about two, so this forks instead.
-    `scripts/bench_encode.py` measures all of this on whatever machine it is
-    asked about; the ratios travel between machines and the seconds do not.
-
-    Two things make the fork cheap. The children inherit the `LsstCam` camera
-    through the address space (so `_camera()` is warmed below, before the pool
-    exists, rather than in all eight children), and they return only the small
-    meta pickle, because the pixels are already in the block the parent will
-    send.
-    """
-    if os.environ.get(SERIAL_ENCODE_VAR):
-        raise ParallelEncodeUnavailable(f"{SERIAL_ENCODE_VAR} is set")
-
-    det_ids = sorted(source.handles)
-    if not det_ids:
-        raise ParallelEncodeUnavailable("no detectors to encode")
-
-    # Both before the fork, and in this order: the camera is what the children
-    # need inherited, and the assert is only meaningful once everything that
-    # might start a thread pool has been imported.
-    camera = _camera()
-    try:
-        _assert_single_threaded_blas()
-    except RuntimeError as exc:
-        # Reported as "cannot parallelize" rather than allowed to propagate: an
-        # unclamped process is a deployment problem, but the serial encoder does
-        # not fork and so is perfectly safe in one. Falling back keeps the
-        # exposure and still says why on stdout.
-        raise ParallelEncodeUnavailable(str(exc)) from exc
-
-    import numpy as np
-
-    itemsize = np.dtype(exposure_codec.IMG_DTYPE).itemsize
-    names = {det_id: detector_name(source.handles[det_id].header) for det_id in det_ids}
-    shapes = {
-        det_id: _image_shape(camera[source.handles[det_id].detector_num])
-        for det_id in det_ids
-    }
-    img_sizes = {
-        det_id: shapes[det_id][0] * shapes[det_id][1] * itemsize for det_id in det_ids
-    }
-
-    # The image parts are laid out first, at offsets known now; the meta parts
-    # go after them, at offsets known only once the children have returned. A
-    # fixed slot per meta would also work (they come out the same size on every
-    # exposure tested) but pinning a size the codec owns would be a trap the
-    # first time it changes, so instead the framing is built once, at the end,
-    # from the real sizes.
-    sizes: dict[str, int] = {}
-    offsets: dict[str, int] = {}
-    cursor = 0
-    for det_id in det_ids:
-        part = protocol.part_name(names[det_id], protocol.IMG_SUFFIX)
-        sizes[part] = img_sizes[det_id]
-        offsets[part] = cursor
-        cursor += img_sizes[det_id]
-    img_payload_end = cursor
-
-    # Sized for the images plus a generous allowance for the eight meta parts,
-    # whose exact sizes are not known yet. The block is written sparsely and
-    # tmpfs faults pages in lazily, so an allowance that is never touched costs
-    # nothing; what it buys is one allocation rather than a resize.
-    meta_allowance = EXPECTED_SENSORS * 4 * 1024 * 1024
-    descriptors = protocol.descriptor_region_size(
-        [
-            protocol.part_name(names[det_id], suffix)
-            for det_id in det_ids
-            for suffix in (protocol.IMG_SUFFIX, protocol.META_SUFFIX)
-        ]
-    )
-    block_size = protocol.HEADER_SIZE + descriptors + img_payload_end + meta_allowance
-
-    # Before the block is created, which is where the SIGBUS this avoids would
-    # otherwise be waiting. A shortfall is not fatal here: the caller falls back
-    # to encoding serially.
-    tmpfs.require_free(block_size, "this exposure", ParallelEncodeUnavailable)
-
-    try:
-        block = shared_memory.SharedMemory(create=True, size=block_size)
-    except OSError as exc:
-        raise ParallelEncodeUnavailable(f"cannot create shared block: {exc}") from exc
-
-    view = None
-    try:
-        data_start = protocol.HEADER_SIZE + descriptors
-        _WORKER_CONTEXT.clear()
-        _WORKER_CONTEXT.update(
-            shm_name=block.name,
-            handles=dict(source.handles),
-            slots={
-                det_id: (
-                    data_start
-                    + offsets[protocol.part_name(names[det_id], protocol.IMG_SUFFIX)],
-                    img_sizes[det_id],
-                    shapes[det_id],
-                )
-                for det_id in det_ids
-            },
-        )
-
-        metas = _fan_out(det_ids, n_workers)
-
-        view = memoryview(block.buf)
-
-        # Now that the meta sizes are real, finish the layout and write the
-        # framing. Gaps are legal in this format, but there are none here: the
-        # metas are packed directly after the last image.
-        cursor = img_payload_end
-        for det_id in det_ids:
-            part = protocol.part_name(names[det_id], protocol.META_SUFFIX)
-            sizes[part] = len(metas[det_id])
-            offsets[part] = cursor
-            cursor += len(metas[det_id])
-
-        framing, absolute, total = protocol.build_framing(sizes, offsets)
-        if total > block_size:
-            raise ParallelEncodeUnavailable(
-                f"metadata came to {total - block_size} bytes more than the "
-                f"{meta_allowance} byte allowance"
-            )
-
-        view[: len(framing)] = framing
-        for det_id in det_ids:
-            part = protocol.part_name(names[det_id], protocol.META_SUFFIX)
-            start = absolute[part]
-            view[start : start + len(metas[det_id])] = metas[det_id]
-
-        return block, view, total
-    except Exception:
-        # The block is this function's to clean up until it has handed it back.
-        if view is not None:
-            view.release()
-        block.close()
-        block.unlink()
-        raise
-    finally:
-        _WORKER_CONTEXT.clear()
-
 
 def _fan_out(
     det_ids: list[int],
     n_workers: int | None,
     timeout: float | None = None,
-    worker=None,
-):
-    """Run `worker` over `det_ids` in a fork pool. Returns {det_id: meta}.
+) -> None:
+    """Assemble `det_ids` into the shared block, one fork worker per detector.
 
-    `worker` is `_encode_one` for the push path and `_assemble_one` for ingest;
-    both write their pixels into the shared block and differ only in what they
-    return. It must be a module-level function, since the pool pickles it by
-    qualified name.
+    Returns nothing: the pixels are already in the block the parent set up, and
+    the only thing to report back is failure. Raises
+    `ParallelEncodeUnavailable` naming every detector that failed.
 
     `fork`, not `spawn`: the whole point is that the children inherit the camera
     and the loaded stack. That is safe here and not in the front end because
@@ -836,8 +627,8 @@ def _fan_out(
     worker that dies *without returning* -- SIGKILL from the OOM killer, a
     segfault in cfitsio, a stray killpg -- leaves it blocked forever (verified:
     a SIGKILLed worker hangs `map` indefinitely). An exception in a worker is
-    fine, and both workers convert those to return values anyway; it is only
-    death that strands the parent. The coordinator's command loop is serial, so
+    fine, and `_assemble_one` converts those to return values anyway; it is
+    only death that strands the parent. The coordinator's command loop is serial, so
     a parent blocked here does not merely lose this exposure: it stalls every
     later command on that flight, with nothing to say why.
     """
@@ -845,14 +636,12 @@ def _fan_out(
     # one place to change it (and tests can shorten it).
     if timeout is None:
         timeout = FAN_OUT_TIMEOUT_S
-    if worker is None:
-        worker = _encode_one
 
     workers = min(n_workers or len(det_ids), len(det_ids))
     ctx = mp.get_context("fork")
     pool = ctx.Pool(workers)
     try:
-        results = pool.map_async(worker, det_ids).get(timeout=timeout)
+        results = pool.map_async(_assemble_one, det_ids).get(timeout=timeout)
     except mp.TimeoutError as exc:
         raise ParallelEncodeUnavailable(
             f"a worker did not return within {timeout:g}s; assuming one died "
@@ -869,70 +658,24 @@ def _fan_out(
         pool.terminate()
         pool.join()
 
-    metas = {}
-    failures = []
-    for det_id, _name, meta, error in results:
-        if error is not None:
-            failures.append(f"detector {det_id}: {error}")
-        else:
-            metas[det_id] = meta
+    failures = [
+        f"detector {det_id}: {error}" for det_id, error in results if error is not None
+    ]
     if failures:
         raise ParallelEncodeUnavailable("; ".join(failures))
-    return metas
-
-
-@contextlib.contextmanager
-def encoded_blob(source, n_workers: int | None = None):
-    """The push body for `source`, as a buffer the caller can POST directly.
-
-    Yields a `memoryview` of exactly the blob. Releasing the view and unlinking
-    the block are this manager's business, in that order: a block cannot be
-    closed while any view onto it is still exported, and the creator is the only
-    process that may unlink.
-
-    Falls back to the serial encoder on anything that means "not here, not now"
-    -- a small /dev/shm, a child that died, `DONUT_SERVER_SERIAL_ENCODE` -- so a
-    transient shared-memory problem costs ~1.3 s rather than the exposure. A
-    bug in the fan-out itself is not caught here and will propagate.
-    """
-    try:
-        block, view, total = build_parts_parallel(source, n_workers)
-    except ParallelEncodeUnavailable as exc:
-        print(f"encode: parallel path unavailable ({exc}); using serial")
-        yield memoryview(protocol.pack_blob(client.build_raw_parts(source)))
-        return
-
-    # Sliced once, here, so there is a name to release. A `yield view[:total]`
-    # would hand out a second exported view that nothing holds a reference to,
-    # and `close()` below would then raise BufferError -- the block cannot be
-    # closed while *any* view onto it is live, not just the one we named.
-    body = view[:total]
-    try:
-        yield body
-    finally:
-        body.release()
-        view.release()
-        block.close()
-        try:
-            block.unlink()
-        except FileNotFoundError:
-            # Already gone; nothing to reclaim and nothing to report.
-            pass
 
 
 @contextlib.contextmanager
 def ingested_exposures(source, n_workers: int | None = None):
     """`{detector_name: ExposureF}` for `source`, assembled in this process.
 
-    The server-side counterpart to `encoded_blob`. Where that one produces a
-    wire blob for a producer to POST, this produces the exposures themselves --
-    so when the consumer is in this process there is no wire format, no pickled
-    pixels and no decode step at all.
+    How the coordinator gets pixels. The consumer is in this process, so there
+    is no wire format, no pickled pixels and no decode step at all.
 
     Three things make it cheap, all measured:
 
-    - Eight forked workers assemble straight into one shared block, as the push
-      path's fan-out already does.
+    - Eight forked workers assemble straight into one shared block, one per
+      corner sensor.
     - The exposures are **views onto that block**, not copies:
       `ExposureF(MaskedImageF(ImageF(array=..., deep=False)))` shares the
       pixels. (`ExposureF(bbox)` then `setImage` does *not* share -- that route
@@ -946,10 +689,9 @@ def ingested_exposures(source, n_workers: int | None = None):
     them, and every view onto it has to be released before it can be closed.
     The caller must therefore be done with the exposures when the `with` exits.
 
-    Unlike `encoded_blob` there is no serial fallback. The caller is the
-    coordinator, which has no second way to get pixels, so a failure here is a
-    failed job -- `ParallelEncodeUnavailable` propagates and the command replies
-    with it.
+    There is no serial fallback. The caller is the coordinator, which has no
+    second way to get pixels, so a failure here is a failed job --
+    `ParallelEncodeUnavailable` propagates and the command replies with it.
     """
     import numpy as np
 
@@ -985,7 +727,6 @@ def ingested_exposures(source, n_workers: int | None = None):
         cursor += sizes[det_id]
     block_size = cursor
 
-    # Same check, same reason, as the parallel encoder's above.
     tmpfs.require_free(block_size, "this exposure", ParallelEncodeUnavailable)
 
     try:
@@ -1005,7 +746,7 @@ def ingested_exposures(source, n_workers: int | None = None):
                 for det_id in det_ids
             },
         )
-        _fan_out(det_ids, n_workers, worker=_assemble_one)
+        _fan_out(det_ids, n_workers)
 
         view = memoryview(block.buf)
         for det_id in det_ids:
@@ -1186,10 +927,5 @@ def resolve_exposure_dir(
         load=load_raw,
         boresight=boresight,
         calib_time=calib_time,
-        # This path, and only this path, can encode in parallel: `load_raw` is
-        # ours, so the work is known to be fork-safe and the image size is
-        # known from cameraGeom before any pixel is read. The butler and
-        # assembled-file sources keep the serial encoder.
-        encoded_blob=encoded_blob,
     )
     return source, image_type

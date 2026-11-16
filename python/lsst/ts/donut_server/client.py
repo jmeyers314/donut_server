@@ -8,7 +8,6 @@ which is how you drive the service from a host that has many raws.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import glob
 import ipaddress
 import os
@@ -113,15 +112,6 @@ class RawSource:
     # read it off a raw's VisitInfo, which `read_exposure_time` does alongside
     # the boresight so the two share one open.
     calib_time: str | None = None
-    # A faster way to build this source's push body, when it has one: a context
-    # manager taking (source, n_workers) and yielding a buffer to POST. None
-    # means use `build_raw_parts` plus `pack_blob`, the serial path.
-    #
-    # An optional capability on the source rather than a branch in `run_once`,
-    # for the same reason `boresight` and `calib_time` are: the sources differ
-    # in what they can do cheaply, and the send path should not have to know
-    # which kind it was handed. Only `daq.resolve_exposure_dir` sets this.
-    encoded_blob: Callable | None = None
 
 
 def discover_exposures(raw_dir: str) -> dict[int, tuple[str, dict[int, str]]]:
@@ -298,29 +288,21 @@ def build_raw_parts(source: RawSource) -> dict[str, bytes]:
     return parts
 
 
-@contextlib.contextmanager
-def _encoded_blob(source: RawSource, num_workers: int | None):
-    """The push body for `source`, however this source builds one.
+def _encoded_blob(source: RawSource) -> bytes:
+    """The push body for `source`: every raw read, encoded and framed.
 
-    Reports the same `encode -> ...` line either way, so the two paths are
-    comparable in a log and `--loop` output does not change shape.
+    Reads each exposure in turn, so the whole blob is in this process's heap
+    before the POST starts. That is affordable because the two sources that
+    push are a butler and a directory of already-assembled raws, neither of
+    which is on a latency path.
     """
     t0 = time.monotonic()
-    if source.encoded_blob is not None:
-        with source.encoded_blob(source, num_workers) as blob:
-            print(
-                f"encode -> {len(source.handles)} sensors, blob_bytes={len(blob)} "
-                f"({time.monotonic() - t0:.3f}s)"
-            )
-            yield blob
-        return
-
     blob = protocol.pack_blob(build_raw_parts(source))
     print(
         f"encode -> {len(source.handles)} sensors, blob_bytes={len(blob)} "
         f"({time.monotonic() - t0:.3f}s)"
     )
-    yield blob
+    return blob
 
 
 def run_once(
@@ -372,18 +354,15 @@ def run_once(
     if applied := describe_overrides(prepare_data.get("config_overrides")):
         print(f"  config: {applied}")
 
-    # The push happens *inside* this block. When the source encoded into shared
-    # memory, the buffer being sent is a view onto a block that only stays
-    # mapped until the manager exits -- so the POST cannot be hoisted out of it.
-    with _encoded_blob(source, num_workers) as blob:
-        t0 = time.monotonic()
-        resp = requests.post(
-            f"{host}/push/{job_id}",
-            data=blob,
-            params={"num_workers": num_workers} if num_workers is not None else None,
-            headers={**headers, "Content-Type": "application/octet-stream"},
-            timeout=300,
-        )
+    blob = _encoded_blob(source)
+    t0 = time.monotonic()
+    resp = requests.post(
+        f"{host}/push/{job_id}",
+        data=blob,
+        params={"num_workers": num_workers} if num_workers is not None else None,
+        headers={**headers, "Content-Type": "application/octet-stream"},
+        timeout=300,
+    )
     raise_for_status(resp)
     push_data = resp.json()
     print(f"push -> state={push_data['state']} ({time.monotonic() - t0:.3f}s)")

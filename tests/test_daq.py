@@ -43,7 +43,7 @@ except RuntimeError as exc:
 needs_fork = pytest.mark.skipif(
     _UNCLAMPED is not None,
     reason=(
-        f"{_UNCLAMPED}; the parallel encoder declines to fork here. Re-run with "
+        f"{_UNCLAMPED}; the assembly fan-out declines to fork here. Re-run with "
         "OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 "
         "VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 to exercise it"
     ),
@@ -172,102 +172,13 @@ def _suicidal_worker(det_id):
     os.kill(os.getpid(), signal.SIGKILL)
 
 
-def _parts(blob):
-    from lsst.ts.donut_server import protocol
-
-    view = memoryview(blob)
-    return {
-        part.name: bytes(view[part.offset : part.offset + part.byte_count])
-        for part in protocol.parse_layout(view)
-    }
-
-
-@pytest.fixture(scope="module")
-def both_blobs(paired):
-    """The same exposure encoded serially and in parallel."""
-    from lsst.ts.donut_server import client, protocol
-
-    source, _ = paired
-    serial = protocol.pack_blob(client.build_raw_parts(source))
-    with daq.encoded_blob(source) as view:
-        return serial, bytes(view)
-
-
-@needs_fork
-def test_parallel_and_serial_agree_on_the_images(both_blobs):
-    """The pixels are the whole payload, and they must be identical."""
-    serial, parallel = both_blobs
-    assert len(serial) == len(parallel)
-
-    got, want = _parts(parallel), _parts(serial)
-    assert sorted(got) == sorted(want)
-    for name in sorted(want):
-        if name.endswith(":img"):
-            assert got[name] == want[name], name
-
-
-@needs_fork
-def test_parallel_and_serial_decode_to_the_same_exposures(both_blobs):
-    """The meta parts, compared by what they rebuild rather than byte-wise.
-
-    The two paths' meta pickles are *not* byte-identical, and deliberately so:
-    the serial one slices its 1x1 stub out of a whole exposure so the stub
-    carries a real pixel, while the parallel one builds the stub fresh and
-    leaves it zero. `decode_exposure` never reads that pixel -- it fills every
-    pixel from the image blob -- so this compares the decoded result, which is
-    what actually crosses the wire.
-    """
-    from lsst.ts.donut_server import exposure_codec, protocol
-
-    serial, parallel = both_blobs
-    got, want = _parts(parallel), _parts(serial)
-
-    for sensor, (img, meta) in protocol.split_parts(want).items():
-        reference = exposure_codec.decode_exposure(img, meta)
-        mine = exposure_codec.decode_exposure(
-            got[protocol.part_name(sensor, protocol.IMG_SUFFIX)],
-            got[protocol.part_name(sensor, protocol.META_SUFFIX)],
-        )
-
-        assert mine.getBBox() == reference.getBBox(), sensor
-        assert np.array_equal(
-            mine.getImage().getArray(), reference.getImage().getArray()
-        ), sensor
-        assert mine.getFilter() == reference.getFilter(), sensor
-        assert mine.getWcs() == reference.getWcs(), sensor
-        assert mine.getInfo().getVisitInfo() == reference.getInfo().getVisitInfo(), (
-            sensor
-        )
-        assert mine.getInfo().getId() == reference.getInfo().getId(), sensor
-        assert mine.getDetector().getName() == reference.getDetector().getName(), sensor
-        assert [a.getRawBBox() for a in mine.getDetector()] == [
-            a.getRawBBox() for a in reference.getDetector()
-        ], sensor
-        assert mine.getMetadata().toDict() == reference.getMetadata().toDict(), sensor
-
-
-def test_serial_fallback_is_used_when_forced(paired, monkeypatch):
-    """`DONUT_SERVER_SERIAL_ENCODE` is the A/B control and the escape hatch."""
-    from lsst.ts.donut_server import client, protocol
-
-    source, _ = paired
-    monkeypatch.setenv(daq.SERIAL_ENCODE_VAR, "1")
-
-    with pytest.raises(daq.ParallelEncodeUnavailable, match=daq.SERIAL_ENCODE_VAR):
-        daq.build_parts_parallel(source)
-
-    # And the manager degrades rather than propagating.
-    with daq.encoded_blob(source) as view:
-        assert bytes(view) == protocol.pack_blob(client.build_raw_parts(source))
-
-
 @needs_fork
 def test_a_failing_worker_names_its_detector(paired):
     """One unreadable sensor must not surface as a bare multiprocessing trace.
 
-    Only the naming is asserted, not a fallback: an unreadable file fails the
-    serial encoder too, and should. What matters is that the error says which
-    detector, since a worker traceback carries no detector at all.
+    What matters is that the error says which detector: a worker traceback
+    carries none, so without `_assemble_one` reporting the failure as a value
+    an unreadable sensor would be a traceback with nothing to act on.
     """
     import dataclasses
 
@@ -278,7 +189,8 @@ def test_a_failing_worker_names_its_detector(paired):
     bad = dataclasses.replace(source, handles=broken)
 
     with pytest.raises(daq.ParallelEncodeUnavailable, match=f"detector {first}"):
-        daq.build_parts_parallel(bad)
+        with daq.ingested_exposures(bad):
+            pass
 
 
 @needs_fork
@@ -289,35 +201,20 @@ def test_a_worker_that_dies_without_reporting_times_out(paired, monkeypatch):
     killer, segfault in cfitsio, stray killpg -- never posts a result and the
     parent blocks indefinitely (verified: a SIGKILLed worker hangs `map` with
     no timeout). An *exception* in a worker is harmless by comparison, since
-    `_encode_one` turns those into return values. The coordinator's command
+    `_assemble_one` turns those into return values. The coordinator's command
     loop is serial, so a hang here stalls every later command on that flight.
     """
     source, _ = paired
-    monkeypatch.setattr(daq, "_encode_one", _suicidal_worker)
+    monkeypatch.setattr(daq, "_assemble_one", _suicidal_worker)
     monkeypatch.setattr(daq, "FAN_OUT_TIMEOUT_S", 8.0)
 
     with pytest.raises(daq.ParallelEncodeUnavailable, match="did not return"):
-        daq.build_parts_parallel(source)
+        with daq.ingested_exposures(source):
+            pass
 
 
 @needs_fork
-def test_an_unwritable_block_falls_back_to_serial(paired, monkeypatch):
-    """The real fallback case: the work is fine, the shared memory is not."""
-    from lsst.ts.donut_server import client, protocol
-
-    source, _ = paired
-
-    def refuse(*args, **kwargs):
-        raise OSError("no space left on device")
-
-    monkeypatch.setattr(daq.shared_memory, "SharedMemory", refuse)
-
-    with daq.encoded_blob(source) as view:
-        assert bytes(view) == protocol.pack_blob(client.build_raw_parts(source))
-
-
-@needs_fork
-def test_a_small_shm_mount_falls_back_rather_than_risking_sigbus(paired, monkeypatch):
+def test_a_small_shm_mount_is_refused_rather_than_risking_sigbus(paired, monkeypatch):
     """An undersized /dev/shm kills the process with SIGBUS on *write*, so the
     shortfall has to be caught before the block is written."""
     from lsst.ts.donut_server import tmpfs
@@ -326,19 +223,8 @@ def test_a_small_shm_mount_falls_back_rather_than_risking_sigbus(paired, monkeyp
     monkeypatch.setattr(tmpfs, "shm_free_bytes", lambda *a, **k: 1024)
 
     with pytest.raises(daq.ParallelEncodeUnavailable, match="free"):
-        daq.build_parts_parallel(source)
-
-
-@needs_fork
-def test_the_parallel_path_leaves_no_shared_blocks_behind(paired):
-    """The creator unlinks; a leak per exposure would fill /dev/shm overnight."""
-    import glob as _glob
-
-    source, _ = paired
-    before = set(_glob.glob("/dev/shm/psm_*"))
-    with daq.encoded_blob(source) as view:
-        assert len(view) > 0
-    assert set(_glob.glob("/dev/shm/psm_*")) <= before
+        with daq.ingested_exposures(source):
+            pass
 
 
 @needs_fork
